@@ -1,0 +1,17329 @@
+"""
+Main GameTextReader class - handles OCR, TTS, hotkeys, and GUI
+"""
+import asyncio
+import datetime
+import io
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import webbrowser
+import winreg
+from functools import partial
+from tkinter import filedialog, messagebox, simpledialog, ttk, font as tkfont
+
+import keyboard
+import mouse
+import pyttsx3
+import pytesseract
+import requests
+import tkinter as tk
+import win32api
+import win32com.client
+import win32con
+import win32gui
+import win32ui
+import win32process
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageGrab, ImageTk
+import ctypes
+import winsound
+import queue
+
+# Try to import tkinterdnd2 for drag and drop functionality
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    TKDND_AVAILABLE = True
+except ImportError:
+    TKDND_AVAILABLE = False
+    print("Warning: tkinterdnd2 not available. Drag and drop functionality will be disabled.")
+
+from ..constants import (
+    APP_NAME, APP_VERSION, APP_DOCUMENTS_DIR, APP_LAYOUTS_DIR,
+    APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_BACKUP_FILENAME,
+    GITHUB_REPO
+)
+from ..utils import (
+    _ensure_uwp_available, UWP_TTS_AVAILABLE,
+    get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
+    is_special_character, suggest_alternative_key, InputManager
+)
+from ..image_processing import preprocess_image
+from ..screen_capture import capture_screen_area, get_primary_monitor_info
+from ..update_checker import check_for_update
+from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
+from ..windows.console_window import ConsoleWindow
+from ..windows.image_processing_window import ImageProcessingWindow
+from ..windows.game_units_edit_window import GameUnitsEditWindow
+from ..windows.text_log_window import TextLogWindow
+from ..windows.automations_window import AutomationsWindow
+
+# Maximum buffer size to prevent memory issues (10MB)
+MAX_LOG_BUFFER_SIZE = 10 * 1024 * 1024
+
+
+def show_thinkr_warning(game_reader, area_name):
+    # Disable all hotkeys when dialog is shown
+    InputManager.block()
+    try:
+        keyboard.unhook_all()
+        mouse.unhook_all()
+    except Exception as e:
+        print(f"Error disabling hotkeys for warning dialog: {e}")
+
+    # Close editor if open (with freeze screen) so popup is visible
+    if hasattr(game_reader, '_close_editor_if_open'):
+        game_reader._close_editor_if_open()
+
+    win = tk.Toplevel(game_reader.root)
+    win.title("Hotkey Conflict Detected!")
+    win.geometry("370x170")
+    win.resizable(False, False)
+    win.grab_set()
+    win.transient(game_reader.root)
+    
+    # Set the window icon
+    try:
+        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+        if os.path.exists(icon_path):
+            win.iconbitmap(icon_path)
+    except Exception as e:
+        print(f"Error setting warning dialog icon: {e}")
+
+    # Center the dialog
+    win.update_idletasks()
+    x = game_reader.root.winfo_rootx() + game_reader.root.winfo_width() // 2 - 185
+    y = game_reader.root.winfo_rooty() + game_reader.root.winfo_height() // 2 - 85
+    win.geometry(f"370x170+{x}+{y}")
+
+    # Remove the warning icon (if any)
+    for child in win.winfo_children():
+        if isinstance(child, tk.Label) and child.cget("image"):
+            child.destroy()
+
+    # Add a message label
+    msg = tk.Label(win, text=f"This key is already used by area:\n'{area_name}'.\n\nPlease choose a different hotkey.", font=("Helvetica", 12), wraplength=340, justify="center")
+    msg.pack(pady=(28, 6))
+
+    # Add OK button
+    btn = tk.Button(win, text="OK", width=12, height=1, font=("Helvetica", 11, "bold"), relief="raised", bd=2)
+    btn.pack(pady=(6, 10))
+
+    # Focus the button for keyboard users
+    btn.focus_set()
+
+    # Bind Enter key to OK
+    win.bind("<Return>", lambda e: win.destroy())
+
+    # Disable all hotkeys while the dialog is open
+    try:
+        keyboard.unhook_all()
+        mouse.unhook_all()
+    except Exception as e:
+        print(f"Error disabling hotkeys: {e}")
+
+    # Restore hotkeys when dialog is closed
+    def on_close():
+        try:
+            game_reader.restore_all_hotkeys()
+        except Exception as e:
+            print(f"Error restoring hotkeys: {e}")
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+    # Also patch the OK button and <Return> binding to use on_close
+    btn.config(command=on_close)
+    win.bind("<Return>", lambda e: on_close())
+
+
+def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
+    """Show a popup when a hotkey is used in multiple places"""
+    # Disable all hotkeys when dialog is shown
+    InputManager.block()
+    try:
+        keyboard.unhook_all()
+        mouse.unhook_all()
+    except Exception as e:
+        print(f"Error disabling hotkeys for conflict dialog: {e}")
+
+    # Close editor if open (with freeze screen) so popup is visible
+    if hasattr(game_reader, '_close_editor_if_open'):
+        game_reader._close_editor_if_open()
+
+    win = tk.Toplevel(game_reader.root)
+    win.title("Hotkey Conflict Detected!")
+    win.geometry("400x200")
+    win.resizable(False, False)
+    win.grab_set()
+    win.transient(game_reader.root)
+    
+    # Set the window icon
+    try:
+        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+        if os.path.exists(icon_path):
+            win.iconbitmap(icon_path)
+    except Exception as e:
+        print(f"Error setting conflict dialog icon: {e}")
+
+    # Center the dialog
+    win.update_idletasks()
+    x = game_reader.root.winfo_rootx() + game_reader.root.winfo_width() // 2 - 200
+    y = game_reader.root.winfo_rooty() + game_reader.root.winfo_height() // 2 - 100
+    win.geometry(f"400x200+{x}+{y}")
+
+    # Build the message
+    locations_text = "\n".join(conflict_locations)
+    message = f"Hotkey conflict detected.\n\nKey: {hotkey}\n\nis used in:\n{locations_text}\n\nThis hotkey will be ignored as long as it's used in multiple places."
+    
+    # Add a message label
+    msg = tk.Label(win, text=message, font=("Helvetica", 11), wraplength=380, justify="left")
+    msg.pack(pady=(20, 10), padx=10)
+
+    # Add OK button
+    btn = tk.Button(win, text="OK", width=12, height=1, font=("Helvetica", 11, "bold"), relief="raised", bd=2)
+    btn.pack(pady=(10, 15))
+
+    # Focus the button for keyboard users
+    btn.focus_set()
+
+    # Restore hotkeys when dialog is closed
+    def on_close():
+        try:
+            game_reader.restore_all_hotkeys()
+        except Exception as e:
+            print(f"Error restoring hotkeys: {e}")
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", on_close)
+    # Also patch the OK button and <Return> binding to use on_close
+    btn.config(command=on_close)
+    win.bind("<Return>", lambda e: on_close())
+
+
+class GameTextReader:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        
+        # Don't set initial geometry here - let it be calculated after GUI setup
+        # self.root.geometry("1115x260")  # Initial window size (height reduced for less vertical tallness)
+        
+        self.layout_file = tk.StringVar()
+        self.latest_images = {}  # Use a dictionary to store images for each area
+        self.latest_images_max_per_area = 3  # Maximum images to keep per area (prevent memory leak)
+        self.latest_area_name = tk.StringVar()  # Ensure this is defined
+        self.areas = []
+        self.stop_hotkey = None  # Variable to store the STOP hotkey
+        self.pause_hotkey = None  # Variable to store the PAUSE/PLAY hotkey
+        self.is_paused = False  # Flag to track if speech is paused
+        self.paused_text = None  # Text that was paused
+        self.paused_position = 0  # Estimated character position where pause occurred
+        self.speech_start_time = None  # When current speech started
+        self.current_speech_text = None  # Current text being spoken
+        # Initialize text-to-speech engine with error handling
+        self.engine = None
+        self.engine_lock = threading.Lock()  # Lock for the text-to-speech engine
+        try:
+            self.engine = pyttsx3.init()
+            # Test if engine is working by trying to get a property
+            _ = self.engine.getProperty('rate')
+        except Exception as e:
+            print(f"Warning: Could not initialize text-to-speech engine: {e}")
+            print("Text-to-speech functionality will be disabled.")
+            self.engine = None
+        self.bad_word_list = tk.StringVar()  # StringVar for the bad word list
+        self.hotkeys = set()  # Track registered hotkeys
+        self.is_speaking = False  # Flag to track if the engine is speaking
+        self.processing_settings = {}  # Dictionary to store processing settings for each area
+        self.processing_settings_widgets = {}  # Dictionary to store processing settings widgets for each area
+        self.volume = tk.StringVar(value="100")  # Default volume 100%
+        self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        self.speaker.Volume = int(self.volume.get())  # Set initial volume
+        self.is_speaking = False
+        self._speech_monitor_active = False  # Flag to track if speech monitor thread is running
+        self._speech_monitor_thread = None  # Thread that monitors speech completion
+        
+        # Wake up Online SAPI5 voices on program start to prevent first-call delays
+        self._wake_up_online_voices()
+
+        # Initialize all checkbox variables
+        self.ignore_usernames_var = tk.BooleanVar(value=False)
+        self.ignore_previous_var = tk.BooleanVar(value=False)
+        self.ignore_gibberish_var = tk.BooleanVar(value=False)
+        self.pause_at_punctuation_var = tk.BooleanVar(value=False)
+        self.fullscreen_mode_var = tk.BooleanVar(value=False)
+
+        # Hotkey management
+        self.hotkey_scancodes = {}  # Dictionary to store scan codes for hotkeys
+        self.setting_hotkey = False  # Flag to track if we're in hotkey setting mode
+        self.unhook_timer = None  # Timer for hotkey unhooking
+        self.keyboard_hooks = []  # List to track keyboard hooks
+        self.mouse_hooks = []  # List to track mouse hooks
+        # Timer tracking for memory leak prevention
+        self._active_timers = set()  # Track all active timers for cleanup
+        self.info_window_open = False  # Flag to track if info window is open
+        self.additional_options_window = None  # Reference to additional options window
+        self.text_log_window = None  # Reference to text log window
+        
+        # Debouncing for hotkeys to prevent double triggering
+        self.last_hotkey_trigger = {}  # Dictionary to track last trigger time for each hotkey
+        self.hotkey_debounce_time = 0.1  # 100ms debounce time
+        self.shown_conflicts = set()  # Track which hotkey conflicts have been shown to avoid spam
+        
+        # Controller support
+        self.controller_handler = ControllerHandler()
+        with self.controller_handler._lock:
+            self.controller_handler.game_reader = self  # Set reference to main class (thread-safe)
+        
+        # List all input devices at startup
+        print("\n=== Input Devices Detected ===")
+        try:
+            devices = self.controller_handler.list_input_devices()
+            for device in devices:
+                print(device)
+        except Exception as e:
+            print(f"Error listing input devices: {e}")
+        print("==============================\n")
+        
+        # Setup Tesseract command path if it's not in your PATH
+        # First try to load custom path from settings
+        custom_tesseract_path = self.load_custom_tesseract_path()
+        if custom_tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = custom_tesseract_path
+        else:
+            pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+        self.numpad_scan_codes = {
+            82: '0',     # Numpad 0
+            79: '1',     # Numpad 1
+            80: '2',     # Numpad 2
+            81: '3',     # Numpad 3
+            75: '4',     # Numpad 4
+            76: '5',     # Numpad 5
+            77: '6',     # Numpad 6
+            71: '7',     # Numpad 7
+            72: '8',     # Numpad 8
+            73: '9',     # Numpad 9
+            55: 'multiply',  # Numpad * (changed from '*' to 'multiply')
+            78: 'add',       # Numpad + (changed from '+' to 'add')
+            74: 'subtract',  # Numpad - (changed from '-' to 'subtract')
+            83: '.',         # Numpad .
+            53: 'divide',    # Numpad / (changed from '/' to 'divide')
+            28: 'enter'      # Numpad Enter
+        }
+
+        # Scan codes for regular keyboard numbers (above QWERTY keys)
+        self.keyboard_number_scan_codes = {
+            11: '0',     # Regular keyboard 0
+            2: '1',      # Regular keyboard 1
+            3: '2',      # Regular keyboard 2
+            4: '3',      # Regular keyboard 3
+            5: '4',      # Regular keyboard 4
+            6: '5',      # Regular keyboard 5
+            7: '6',      # Regular keyboard 6
+            8: '7',      # Regular keyboard 7
+            9: '8',      # Regular keyboard 8
+            10: '9'      # Regular keyboard 9
+        }
+
+        # Enhanced scan code mappings for arrow keys and special keys
+        # These help distinguish between keys that share scan codes
+        self.arrow_key_scan_codes = {
+            72: 'up',       # Up Arrow
+            80: 'down',     # Down Arrow  
+            75: 'left',     # Left Arrow
+            77: 'right'     # Right Arrow
+        }
+        
+        # Special function keys and navigation keys
+        self.special_key_scan_codes = {
+            59: 'f1',       # F1
+            60: 'f2',       # F2
+            61: 'f3',       # F3
+            62: 'f4',       # F4
+            63: 'f5',       # F5
+            64: 'f6',       # F6
+            65: 'f7',       # F7
+            66: 'f8',       # F8
+            67: 'f9',       # F9
+            68: 'f10',      # F10
+            87: 'f11',      # F11
+            88: 'f12',      # F12
+            100: 'f13',     # F13
+            101: 'f14',     # F14
+            102: 'f15',     # F15
+            103: 'f16',     # F16
+            104: 'f17',     # F17
+            105: 'f18',     # F18
+            106: 'f19',     # F19
+            107: 'f20',     # F20
+            108: 'f21',     # F21
+            109: 'f22',     # F22
+            110: 'f23',     # F23
+            111: 'f24',     # F24
+            69: 'num lock', # Num Lock
+            70: 'scroll lock', # Scroll Lock
+            83: 'insert',   # Insert
+            71: 'home',     # Home
+            79: 'end',      # End
+            73: 'page up',  # Page Up
+            81: 'page down', # Page Down
+            82: 'delete',   # Delete
+            15: 'tab',      # Tab
+            28: 'enter',    # Enter (main keyboard)
+            14: 'backspace', # Backspace
+            57: 'space',    # Space
+            1: 'escape'     # Escape
+        }
+        
+        # VK codes for numpad keys, used for fullscreen fallback polling
+        # Reference: https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes
+        self.numpad_vk_codes = {
+            '0': 0x60,  # VK_NUMPAD0
+            '1': 0x61,  # VK_NUMPAD1
+            '2': 0x62,  # VK_NUMPAD2
+            '3': 0x63,  # VK_NUMPAD3
+            '4': 0x64,  # VK_NUMPAD4
+            '5': 0x65,  # VK_NUMPAD5
+            '6': 0x66,  # VK_NUMPAD6
+            '7': 0x67,  # VK_NUMPAD7
+            '8': 0x68,  # VK_NUMPAD8
+            '9': 0x69,  # VK_NUMPAD9
+            '*': 0x6A,  # VK_MULTIPLY
+            '+': 0x6B,  # VK_ADD
+            '-': 0x6D,  # VK_SUBTRACT
+            '.': 0x6E,  # VK_DECIMAL
+            '/': 0x6F,  # VK_DIVIDE
+            'enter': 0x0D  # VK_RETURN (cannot distinguish main vs numpad)
+        }
+
+        self.text_histories = {}  # Dictionary to store text history for each area
+        self.text_log_history = []  # List to store last 20 converted texts with area name and voice info
+        self.repeat_latest_hotkey = None  # Store the hotkey for repeating the latest area text
+        # Create a persistent button object for the repeat latest hotkey (so it works even when window is closed)
+        # This button persists even when the TextLogWindow is closed, allowing the hotkey to work globally
+        self.repeat_latest_hotkey_button = type('Button', (), {})()
+        self.repeat_latest_hotkey_button.hotkey = None
+        self.repeat_latest_hotkey_button.is_repeat_latest_button = True
+        self.repeat_latest_hotkey_button._display_button = None  # Will be set when window opens
+        # Dummy config method that will be overridden when window opens
+        self.repeat_latest_hotkey_button.config = lambda **kwargs: None
+        self.ignore_previous_var = tk.BooleanVar(value=False)  # Variable for the checkbox
+        self.ignore_gibberish_var = tk.BooleanVar(value=False)  # Variable for the gibberish checkbox
+        self.pause_at_punctuation_var = tk.BooleanVar(value=False)  # Variable for punctuation pauses
+        self.fullscreen_mode_var = tk.BooleanVar(value=False)  # Variable for fullscreen mode
+        # Add variable for better measurement unit detection
+        self.better_unit_detection_var = tk.BooleanVar(value=False)
+        # Add variable for read game units
+        self.read_game_units_var = tk.BooleanVar(value=False)
+        # Add variable for allowing mouse buttons as hotkeys
+        self.allow_mouse_buttons_var = tk.BooleanVar(value=False)
+        # Add variable for applying image processing to freeze screen
+        self.process_freeze_screen_var = tk.BooleanVar(value=False)
+        
+        # Add variable for interrupt on new scan
+        self.interrupt_on_new_scan_var = tk.BooleanVar(value=True)
+
+        # UWP TTS concurrency control
+        self._uwp_lock = threading.Lock()
+        self._uwp_player = None
+        self._uwp_queue = queue.Queue()
+        self._uwp_thread_stop = threading.Event()
+        self._uwp_interrupt = threading.Event()
+        self._uwp_thread = threading.Thread(target=self._uwp_worker, daemon=True)
+        self._uwp_thread.start()
+        
+        # Track all threads for cleanup
+        self._active_threads = set()
+        self._active_threads.add(self._uwp_thread)
+
+        # Numpad fallback polling is always enabled when a numpad hotkey is set
+
+        # Load game units from JSON file
+        self.game_units = self.load_game_units()
+
+        # Initialize edit view settings variables
+        self.edit_area_hotkey = None
+        self.edit_area_screenshot_bg = False
+        self.edit_area_alpha = 0.95  # Default value
+        self.edit_area_hotkey_mock_button = None  # Reference to mock button for hotkey registration
+        
+        # Initialize log buffer for console window
+        self.log_buffer = io.StringIO()
+
+        # Ensure InputManager is enabled at startup
+        InputManager.allow()
+        
+        self.setup_gui()
+        
+        # Load edit view settings from the settings file at startup
+        self.load_edit_view_settings()
+        
+        # Set up repeat latest hotkey at startup if it exists
+        if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey:
+            if hasattr(self, 'repeat_latest_hotkey_button'):
+                # Ensure the button's hotkey attribute is set (setup_hotkey requires button.hotkey)
+                if not hasattr(self.repeat_latest_hotkey_button, 'hotkey') or not self.repeat_latest_hotkey_button.hotkey:
+                    self.repeat_latest_hotkey_button.hotkey = self.repeat_latest_hotkey
+                self.setup_hotkey(self.repeat_latest_hotkey_button, None)
+        
+        # Set up edit area hotkey at startup if it exists
+        if self.edit_area_hotkey:
+            try:
+                # Create mock button for edit area hotkey (similar to what's done in set_area)
+                self.edit_area_hotkey_mock_button = type('MockButton', (), {'hotkey': self.edit_area_hotkey, 'is_edit_area_button': True})
+                self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                print(f"Edit area hotkey registered at startup: {self.edit_area_hotkey}")
+            except Exception as e:
+                print(f"Error setting up edit area hotkey at startup: {e}")
+        
+        # Get available voices using SAPI instead of pyttsx3
+        try:
+            # Research-based solution: Force Windows to load ALL installed voices
+            all_voices = []
+            # Disable heavy/side-effect discovery steps by default (no service restarts or PowerShell)
+            enable_heavy_discovery = False
+            
+            # Method 1: Enumerate SAPI voices (quiet)
+            try:
+                # Create a new SAPI object specifically for enumeration
+                enum_voice = win32com.client.Dispatch("SAPI.SpVoice")
+                
+                voices = enum_voice.GetVoices()
+                for i, voice in enumerate(voices):
+                    try:
+                        all_voices.append(voice)
+                    except Exception:
+                        pass
+                        
+            except Exception as e1:
+                print(f"Method 1 failed: {e1}")
+            
+
+            
+            # Method 2: Try to force Windows to register all voices (disabled by default to avoid console popups)
+            if enable_heavy_discovery:
+                try:
+                    import subprocess
+                    try:
+                        # Hide any console window
+                        si = subprocess.STARTUPINFO()
+                        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        creationflags = subprocess.CREATE_NO_WINDOW
+                        subprocess.run(['net', 'stop', 'audiosrv'], capture_output=True, startupinfo=si, creationflags=creationflags)
+                        subprocess.run(['net', 'start', 'audiosrv'], capture_output=True, startupinfo=si, creationflags=creationflags)
+                    except Exception:
+                        pass
+                    # Re-enumerate voices
+                    try:
+                        enum_voice2 = win32com.client.Dispatch("SAPI.SpVoice")
+                        voices2 = enum_voice2.GetVoices()
+                        for i, voice in enumerate(voices2):
+                            try:
+                                if not any(v.GetDescription() == voice.GetDescription() for v in all_voices):
+                                    all_voices.append(voice)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            
+            # Method 3: Check Speech_OneCore registry locations (quiet)
+            
+            # Method 3.5: Try to force Windows to register OneCore voices (quiet)
+            try:
+                # Try to create a voice object and enumerate with different filters
+                force_voice = win32com.client.Dispatch("SAPI.SpVoice")
+                # Try to get voices with different enumeration methods
+                try:
+                    # Try to enumerate with a filter that might include OneCore voices
+                    voices_force = force_voice.GetVoices("", "")
+                    for i in range(voices_force.Count):
+                        try:
+                            voice = voices_force.Item(i)
+                            if not any(v.GetDescription() == voice.GetDescription() for v in all_voices):
+                                all_voices.append(voice)
+                        except Exception:
+                            pass
+                except Exception as force_e:
+                    print(f"  Force enumeration failed: {force_e}")
+            except Exception as e3_5:
+                print(f"Method 3.5 failed: {e3_5}")
+            
+            # Method 4: Try to force Windows to load OneCore voices by accessing them directly
+            # Method 4: Try to force Windows to load OneCore voices directly (quiet mode)
+            try:
+                # Ensure OneCore registry locations are defined
+                try:
+                    import winreg
+                    onecore_locations = [
+                        r"SOFTWARE\\Microsoft\\Speech_OneCore\\Voices\\Tokens",
+                        r"SOFTWARE\\WOW6432Node\\Microsoft\\Speech_OneCore\\Voices\\Tokens"
+                    ]
+                except Exception:
+                    onecore_locations = []
+                
+                # Try to create voice objects for each OneCore token we found
+                onecore_tokens = []
+                for location in onecore_locations:
+                    key = None
+                    try:
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, location)
+                        i = 0
+                        while True:
+                            try:
+                                voice_token = winreg.EnumKey(key, i)
+                                onecore_tokens.append(voice_token)
+                                i += 1
+                            except WindowsError:
+                                break
+                    except Exception:
+                        pass
+                    finally:
+                        # Always close registry key to prevent leak
+                        if key is not None:
+                            try:
+                                winreg.CloseKey(key)
+                            except Exception:
+                                pass
+                
+                for token in onecore_tokens:
+                    try:
+                        # Try to create a voice object using the token directly
+                        voice_obj = win32com.client.Dispatch("SAPI.SpVoice")
+                        
+                        # Try to set the voice using the token
+                        try:
+                            # Try to create voice using token as a filter
+                            voices_enum = voice_obj.GetVoices()
+                            for j in range(voices_enum.Count):
+                                voice = voices_enum.Item(j)
+                                desc = voice.GetDescription()
+                                # Check if this voice matches our token
+                                if (token in desc or 
+                                    token.replace('MSTTS_V110_', '').replace('M', '') in desc or
+                                    any(part in desc for part in token.split('_')[2:4])):
+                                    if not any(v.GetDescription() == desc for v in all_voices):
+                                        all_voices.append(voice)
+                                    break
+                        except Exception as enum_e:
+                            pass
+                        
+                        # Try alternative method: Create voice using token category
+                        try:
+                            token_cat = win32com.client.Dispatch("SAPI.SpObjectTokenCategory")
+                            token_cat.SetId("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices", False)
+                            tokens_enum = token_cat.EnumTokens()
+                            for k in range(tokens_enum.Count):
+                                token_obj = tokens_enum.Item(k)
+                                if token in token_obj.GetId():
+                                    # Try to create voice from this token
+                                    try:
+                                        new_voice = win32com.client.Dispatch("SAPI.SpVoice")
+                                        new_voice.Voice = token_obj
+                                        desc = new_voice.Voice.GetDescription()
+                                        if not any(v.GetDescription() == desc for v in all_voices):
+                                            all_voices.append(new_voice.Voice)
+                                    except Exception as create_e:
+                                        pass
+                                    break
+                        except Exception as token_e:
+                            # Silently ignore token category access errors to reduce console noise
+                            pass
+                            
+                    except Exception as token_voice_e:
+                        print(f"    -> Error processing token {token}: {token_voice_e}")
+                        
+            except Exception as e4:
+                print(f"Method 4 failed: {e4}")
+            
+            # Method 5: Try to force Windows to register OneCore voices by accessing Windows Speech settings
+            # Method 5: Skipped opening Windows Speech settings to avoid UI interruptions
+            
+            # Method 6: Try to create working voice objects for OneCore voices
+            # Method 6: Create working voice objects for OneCore voices (quiet mode)
+            try:
+                # For each OneCore token, try to create a working voice object
+                for token in onecore_tokens:
+                    try:
+                        # Quiet: create working voice entries for UI selection
+                        
+                        # Try to create a voice object that can actually be used
+                        class WorkingOneCoreVoice:
+                            def __init__(self, token):
+                                self._token = token
+                                # Convert token to readable name
+                                parts = token.split('_')
+                                if len(parts) >= 4:
+                                    lang = parts[2]
+                                    name = parts[3].replace('M', '')
+                                    self._desc = f"Microsoft {name} - {lang}"
+                                else:
+                                    self._desc = token
+                                # Store the token for later use
+                                self._voice_token = token
+                            
+                            def GetDescription(self):
+                                return self._desc
+                            
+                            def GetId(self):
+                                return self._token
+                            
+                            def GetToken(self):
+                                return self._voice_token
+                        
+                        working_voice = WorkingOneCoreVoice(token)
+                        if not any(v.GetDescription() == working_voice.GetDescription() for v in all_voices):
+                            all_voices.append(working_voice)
+                            # Quiet log
+                        
+                    except Exception as working_e:
+                        print(f"    -> Error creating working voice for {token}: {working_e}")
+                        
+            except Exception as e6:
+                print(f"Method 6 failed: {e6}")
+            
+            # Method 7: Try to force Windows to register OneCore voices by using Windows Speech API directly
+            # Method 7: PowerShell forcing (disabled by default to avoid flashing a console window)
+            if enable_heavy_discovery:
+                try:
+                    import subprocess
+                    try:
+                        ps_command = (
+                            "Add-Type -AssemblyName System.Speech;"
+                            "$synthesizer = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+                            "$voices = $synthesizer.GetInstalledVoices();"
+                            "$voices | ForEach-Object { $_.VoiceInfo.Name }"
+                        )
+                        si = subprocess.STARTUPINFO()
+                        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        creationflags = subprocess.CREATE_NO_WINDOW
+                        result = subprocess.run(['powershell', '-NoProfile', '-Command', ps_command],
+                                                capture_output=True, text=True, startupinfo=si, creationflags=creationflags)
+                        if result.returncode == 0:
+                            try:
+                                enum_voice4 = win32com.client.Dispatch("SAPI.SpVoice")
+                                voices4 = enum_voice4.GetVoices()
+                                for i in range(voices4.Count):
+                                    try:
+                                        voice = voices4.Item(i)
+                                        if not any(v.GetDescription() == voice.GetDescription() for v in all_voices):
+                                            all_voices.append(voice)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                import winreg
+                
+                # Check Speech_OneCore registry locations
+                onecore_locations = [
+                    r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens",
+                    r"SOFTWARE\WOW6432Node\Microsoft\Speech_OneCore\Voices\Tokens"
+                ]
+                
+                for location in onecore_locations:
+                    key = None
+                    try:
+                        # Quiet: skip registry location logging
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, location)
+                        i = 0
+                        while True:
+                            try:
+                                voice_token = winreg.EnumKey(key, i)
+                                # Quiet: skip per-token logging
+                                
+                                # Try to create voice object from OneCore token
+                                try:
+                                    voice_obj = win32com.client.Dispatch("SAPI.SpVoice")
+                                    # Try to enumerate and find this specific voice
+                                    voices = voice_obj.GetVoices()
+                                    for j in range(voices.Count):
+                                        voice = voices.Item(j)
+                                        desc = voice.GetDescription()
+                                        # Try different matching strategies
+                                        if (voice_token in desc or 
+                                            voice_token.replace('MSTTS_V110_', '').replace('M', '') in desc or
+                                            any(part in desc for part in voice_token.split('_')[2:4])):
+                                            print(f"      -> Matched: {desc}")
+                                            if not any(v.GetDescription() == desc for v in all_voices):
+                                                all_voices.append(voice)
+                                            break
+                                    else:
+                                        # If no match found, try to create a real SAPI voice object
+                                        # Quiet
+                                        try:
+                                            # Try to create voice object directly using the token
+                                            real_voice = win32com.client.Dispatch("SAPI.SpVoice")
+                                            # Try to set the voice by token
+                                            voices_enum = real_voice.GetVoices()
+                                            for k in range(voices_enum.Count):
+                                                voice_obj = voices_enum.Item(k)
+                                                if voice_token in voice_obj.GetDescription():
+                                                    print(f"        -> Found real voice: {voice_obj.GetDescription()}")
+                                                    if not any(v.GetDescription() == voice_obj.GetDescription() for v in all_voices):
+                                                        all_voices.append(voice_obj)
+                                                    break
+                                            else:
+                                                # Try alternative method: Create voice object using token directly
+                                                # Quiet
+                                                try:
+                                                    # Try to create voice using the token as a filter
+                                                    voice_enum = win32com.client.Dispatch("SAPI.SpObjectTokenCategory")
+                                                    voice_enum.SetId("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices", False)
+                                                    tokens = voice_enum.EnumTokens()
+                                                    for token_idx in range(tokens.Count):
+                                                        token = tokens.Item(token_idx)
+                                                        if voice_token in token.GetId():
+                                                        # Quiet
+                                                            # Try to create voice from this token
+                                                            try:
+                                                                voice_obj = win32com.client.Dispatch("SAPI.SpVoice")
+                                                                voice_obj.Voice = token
+                                                                desc = voice_obj.Voice.GetDescription()
+                                                                # Quiet
+                                                                if not any(v.GetDescription() == desc for v in all_voices):
+                                                                    all_voices.append(voice_obj.Voice)
+                                                                break
+                                                            except Exception as token_e:
+                                                                # Quiet
+                                                                pass
+                                                except Exception as alt_e:
+                                                    # Quiet
+                                                    pass
+                                                
+                                                # If still no match, create a mock voice
+                                                if not any(v.GetDescription().startswith(f"Microsoft {voice_token.split('_')[3].replace('M', '')}") for v in all_voices):
+                                                    print(f"        -> Creating mock voice for: {voice_token}")
+                                                    class MockOneCoreVoice:
+                                                        def __init__(self, token):
+                                                            self._token = token
+                                                            # Convert token to readable name
+                                                            parts = token.split('_')
+                                                            if len(parts) >= 4:
+                                                                lang = parts[2]
+                                                                name = parts[3].replace('M', '')
+                                                                self._desc = f"Microsoft {name} - {lang}"
+                                                            else:
+                                                                self._desc = token
+                                                        def GetDescription(self):
+                                                            return self._desc
+                                                    mock_voice = MockOneCoreVoice(voice_token)
+                                                    if not any(v.GetDescription() == mock_voice.GetDescription() for v in all_voices):
+                                                        all_voices.append(mock_voice)
+                                        except Exception as real_voice_e:
+                                            # Quiet
+                                            # Fall back to mock voice
+                                            class MockOneCoreVoice:
+                                                def __init__(self, token):
+                                                    self._token = token
+                                                    # Convert token to readable name
+                                                    parts = token.split('_')
+                                                    if len(parts) >= 4:
+                                                        lang = parts[2]
+                                                        name = parts[3].replace('M', '')
+                                                        self._desc = f"Microsoft {name} - {lang}"
+                                                    else:
+                                                        self._desc = token
+                                                def GetDescription(self):
+                                                    return self._desc
+                                            mock_voice = MockOneCoreVoice(voice_token)
+                                            if not any(v.GetDescription() == mock_voice.GetDescription() for v in all_voices):
+                                                all_voices.append(mock_voice)
+                                except Exception as voice_e:
+                                    print(f"      -> Could not create voice: {voice_e}")
+                                
+                                i += 1
+                            except WindowsError:
+                                break
+                    except Exception as loc_e:
+                        print(f"    Could not access {location}: {loc_e}")
+                    finally:
+                        # Always close registry key to prevent leak
+                        if key is not None:
+                            try:
+                                winreg.CloseKey(key)
+                            except Exception:
+                                pass
+                        
+            except ImportError:
+                print("winreg not available")
+            
+            # Use the combined list
+            self.voices = all_voices
+            print(f"\nFinal combined voice list: {len(self.voices)} voices")
+                
+        except Exception as e:
+            print(f"Warning: Could not get SAPI voices: {e}")
+            self.voices = []
+        
+        self.stop_keyboard_hook = None
+        self.stop_mouse_hook = None
+        self.setting_hotkey_mouse_hook = None
+        self.unhook_timer = None
+        
+        # Track if there are unsaved changes
+        self._has_unsaved_changes = False
+        # Track specific changes made
+        self._unsaved_changes = {
+            'added_areas': set(),  # Area names that were added
+            'removed_areas': set(),  # Area names that were removed
+            'hotkey_changes': set(),  # Hotkey names that were changed (e.g., "Area: X", "Stop Hotkey", "Pause Hotkey", "Editor Toggle Hotkey")
+            'additional_options': False,  # Whether additional options were changed
+            'area_settings': set(),  # Area names with changed settings (voice, speed, PSM, freeze screen, preprocess, area name)
+        }
+        # Flag to prevent trace callbacks from marking changes during loading
+        self._is_loading_layout = False
+        # Flag to track if a layout was just loaded (for edit view undo stack)
+        self._layout_just_loaded = False
+        
+        # Add this line to handle window closing with unsaved changes check
+        root.protocol("WM_DELETE_WINDOW", self.on_window_close)
+        
+        # Enable drag and drop using TkinterDnD2 when available
+        if hasattr(root, 'drop_target_register'):
+            try:
+                root.drop_target_register(DND_FILES)
+                root.dnd_bind('<<Drop>>', self.on_drop)
+                root.dnd_bind('<<DropEnter>>', lambda e: 'break')
+                root.dnd_bind('<<DropPosition>>', lambda e: 'break')
+            except Exception as dnd_error:
+                print(f"Warning: drag-and-drop could not be initialized: {dnd_error}")
+        else:
+            print("Info: TkinterDnD not available; drag-and-drop is disabled.")
+
+        # Controller support disabled - pygame removed to reduce Windows security flags
+        self.controller = None
+
+    def speak_text(self, text):
+        """Speak text using win32com.client (SAPI.SpVoice)."""
+        # Check if TTS is available; if not, try UWP fallback
+        if not hasattr(self, 'speaker') or self.speaker is None:
+            if _ensure_uwp_available():
+                loop = None
+                old_loop = None
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        old_loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        old_loop = None
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self._speak_with_uwp(text))
+                    return
+                except Exception as _e:
+                    pass
+                finally:
+                    # Restore previous event loop
+                    if old_loop is not None:
+                        try:
+                            asyncio.set_event_loop(old_loop)
+                        except Exception:
+                            pass
+                    # Only close loop if it was created and run successfully
+                    if loop is not None:
+                        try:
+                            # Only close if loop was actually started (run_until_complete was called)
+                            if not loop.is_closed():
+                                try:
+                                    loop.close()
+                                except RuntimeError as e:
+                                    if "run loop not started" not in str(e).lower():
+                                        raise
+                        except Exception:
+                            pass
+            print("Warning: Text-to-speech is not available. Please check your system's speech settings.")
+            return
+            
+        # Always check and stop speech if interrupt is enabled
+        if hasattr(self, 'interrupt_on_new_scan_var') and self.interrupt_on_new_scan_var.get():
+            # Stop SAPI and also stop any ongoing UWP playback to prevent crashes when switching voices
+            self.stop_speaking()
+            if hasattr(self, '_uwp_lock'):
+                try:
+                    with self._uwp_lock:
+                        if hasattr(self, '_uwp_player') and self._uwp_player is not None:
+                            try:
+                                self._uwp_player.pause()
+                            except Exception:
+                                pass
+                            self._uwp_player = None
+                except Exception:
+                    pass
+        elif self.is_speaking:
+            print("Already speaking. Please stop the current speech first.")
+            return
+            
+        # Track text and start time for pause/resume functionality
+        self.current_speech_text = text
+        import time
+        self.speech_start_time = time.time()
+        self.paused_text = None
+        self.paused_position = 0
+        
+        # Track text and start time for pause/resume functionality
+        self.current_speech_text = text
+        import time
+        self.speech_start_time = time.time()
+        self.paused_text = None
+        self.paused_position = 0
+        
+        self.is_speaking = True
+        try:
+            # Use a lower priority for speaking
+            self.speaker.Speak(text, 1)  # 1 is SVSFlagsAsync
+            print("Speech started.\n--------------------------")
+        except Exception as e:
+            print(f"Error during speech: {e}")
+            self.is_speaking = False
+            # Try UWP fallback if available
+            if _ensure_uwp_available():
+                try:
+                    # Ensure previous UWP playback is stopped before starting new
+                    if hasattr(self, '_uwp_lock'):
+                        try:
+                            with self._uwp_lock:
+                                if hasattr(self, '_uwp_player') and self._uwp_player is not None:
+                                    try:
+                                        self._uwp_player.pause()
+                                    except Exception:
+                                        pass
+                                    self._uwp_player = None
+                        except Exception:
+                            pass
+                    loop = asyncio.new_event_loop()
+                    old_loop = None
+                    try:
+                        old_loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        old_loop = None
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self._speak_with_uwp(text))
+                    return
+                except Exception as _e:
+                    pass
+                finally:
+                    # Restore previous event loop
+                    if 'old_loop' in locals() and old_loop is not None:
+                        try:
+                            asyncio.set_event_loop(old_loop)
+                        except Exception:
+                            pass
+                    # Only close loop if it was created and run successfully
+                    if 'loop' in locals() and loop is not None:
+                        try:
+                            # Only close if loop was actually started (run_until_complete was called)
+                            if not loop.is_closed():
+                                try:
+                                    loop.close()
+                                except RuntimeError as e:
+                                    if "run loop not started" not in str(e).lower():
+                                        raise
+                        except Exception:
+                            pass
+
+    def pause_speaking(self):
+        """Pause the ongoing speech by stopping and saving position for resume."""
+        try:
+            if not hasattr(self, 'speaker') or not self.speaker or not self.is_speaking:
+                return
+            
+            # Stop speech immediately (this is fast)
+            try:
+                self.speaker.Speak("", 2)  # 2 = SVSFPurgeBeforeSpeak - immediate stop
+            except Exception:
+                pass
+            
+            # Calculate estimated position based on elapsed time
+            if self.current_speech_text and self.speech_start_time:
+                import time
+                elapsed_time = time.time() - self.speech_start_time
+                
+                # Estimate characters spoken based on speech rate
+                # Average speaking rate: ~150 words/min = ~750 chars/min = ~12.5 chars/sec
+                # Adjust based on SAPI rate setting
+                try:
+                    rate = self.speaker.Rate  # -10 to 10
+                    # Convert rate to multiplier: -10 = 0.5x, 0 = 1x, 10 = 2x
+                    rate_multiplier = 1.0 + (rate / 10.0)  # 0.5 to 2.0
+                    chars_per_second = 12.5 * rate_multiplier
+                except Exception:
+                    chars_per_second = 12.5  # Default
+                
+                estimated_chars = int(elapsed_time * chars_per_second)
+                # Subtract 0.5 seconds worth of characters to compensate for stop delay
+                # This ensures we don't miss words when resuming
+                backtrack_chars = int(0.9 * chars_per_second)
+                self.paused_position = max(0, min(estimated_chars - backtrack_chars, len(self.current_speech_text)))
+                self.paused_text = self.current_speech_text
+                
+                print(f"Paused at estimated position: {self.paused_position}/{len(self.current_speech_text)} chars (backtracked by {backtrack_chars} chars to compensate for delay)")
+            elif self.current_speech_text:
+                # Fallback: if we have text but no timing info, save text and restart from beginning
+                self.paused_text = self.current_speech_text
+                self.paused_position = 0
+                print(f"Paused: Saved text but no timing info, will restart from beginning when resumed")
+            else:
+                # Fallback: if we don't have text tracking, just mark as paused
+                self.paused_text = None
+                self.paused_position = 0
+            
+            self.is_paused = True
+            self.is_speaking = False
+            self._stop_speech_monitor()
+
+            print("Speech paused.\n--------------------------")
+            # Update status label if it exists
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Speech paused", fg="orange")
+        except Exception as e:
+            print(f"Error in pause_speaking: {e}")
+    
+    def resume_speaking(self):
+        """Resume the paused speech from saved position."""
+        try:
+            if not self.is_paused:
+                return
+            
+            if not self.paused_text:
+                # No saved text, can't resume
+                print("Cannot resume: No saved text")
+                self.is_paused = False
+                return
+            
+            # Get remaining text from paused position
+            remaining_text = self.paused_text[self.paused_position:]
+            
+            if not remaining_text.strip():
+                # Nothing left to speak
+                print("Resume: No remaining text to speak")
+                self.is_paused = False
+                return
+            
+            # Speak the remaining text
+            if hasattr(self, 'speaker') and self.speaker:
+                # Update tracking variables
+                self.current_speech_text = remaining_text
+                import time
+                self.speech_start_time = time.time()
+                
+                # Speak remaining text
+                self.is_speaking = True
+                self.is_paused = False
+                self.speaker.Speak(remaining_text, 1)  # 1 = SVSFlagsAsync
+                
+                print(f"Resumed from position {self.paused_position}, speaking {len(remaining_text)} remaining chars")
+                print("Speech resumed.\n--------------------------")
+                
+                # Start monitoring speech completion again
+                self._start_speech_monitor()
+                
+                # Clear paused data
+                self.paused_text = None
+                self.paused_position = 0
+                
+                # Update status label if it exists
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text="", fg="black")
+        except Exception as e:
+            print(f"Error in resume_speaking: {e}")
+            self.is_paused = False
+    
+    def toggle_pause_resume(self):
+        """Toggle between pause and resume."""
+        if self.is_paused:
+            self.resume_speaking()
+        elif self.is_speaking:
+            self.pause_speaking()
+        # If not speaking and not paused, do nothing
+    
+    def stop_speaking(self):
+        """Stop the ongoing speech immediately."""
+        # Stop both SAPI and UWP playback
+        try:
+            if hasattr(self, 'speaker') and self.speaker:
+                try:
+                    self.speaker.Speak("", 2)
+                except Exception:
+                    pass
+            self.is_speaking = False
+            self.is_paused = False  # Reset pause state when stopping
+            # Clear pause/resume tracking
+            self.current_speech_text = None
+            self.speech_start_time = None
+            self.paused_text = None
+            self.paused_position = 0
+            # Signal UWP worker to stop current playback
+            try:
+                self._uwp_queue.put_nowait(("STOP", None, None))
+            except Exception:
+                pass
+            # Reinitialize SAPI speaker
+            try:
+                self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                self.speaker.Volume = int(self.volume.get())
+            except Exception:
+                self.speaker = None
+            print("Speech stopped.\n--------------------------")
+            # Stop speech monitor
+            self._stop_speech_monitor()
+            # Update status label if it exists
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="", fg="black")
+        except Exception as e:
+            print(f"Error stopping speech: {e}")
+            self.is_speaking = False
+            self.is_paused = False
+            self._stop_speech_monitor()
+
+    def _start_speech_monitor(self):
+        """Start a background thread to monitor when speech finishes"""
+        if self._speech_monitor_active:
+            return  # Already monitoring
+        
+        self._speech_monitor_active = True
+        
+        def monitor_speech():
+            """Monitor speech completion in background"""
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                while self._speech_monitor_active and self.is_speaking:
+                    try:
+                        # Check if speech is done using WaitUntilDone with 0 timeout (non-blocking)
+                        if hasattr(self, 'speaker') and self.speaker:
+                            is_done = self.speaker.WaitUntilDone(0)
+                            if is_done:
+                                # Speech is complete
+                                if self.is_speaking:  # Only log if we still think we're speaking
+                                    self.is_speaking = False
+                                    elapsed_time = time.time() - self.speech_start_time if self.speech_start_time else 0
+                                    print(f"Speech finished. (Duration: {elapsed_time:.2f}s)\n--------------------------")
+                                self._speech_monitor_active = False
+                                break
+                    except Exception as e:
+                        # If check fails, wait a bit and try again
+                        pass
+                    
+                    # Check every 100ms
+                    time.sleep(0.1)
+            finally:
+                pythoncom.CoUninitialize()
+                self._speech_monitor_active = False
+        
+        self._speech_monitor_thread = threading.Thread(target=monitor_speech, daemon=True)
+        self._speech_monitor_thread.start()
+    
+    def _stop_speech_monitor(self):
+        """Stop the speech monitoring thread"""
+        self._speech_monitor_active = False
+
+    def controller_listener(self):
+        """Controller support disabled - pygame removed to reduce Windows security flags"""
+        pass
+            
+
+
+    def get_controller_button_name(self, button_number):
+        """Controller support disabled - pygame removed to reduce Windows security flags"""
+        return f"btn:{button_number}"
+    
+    def get_controller_hat_name(self, hat_number, hat_value):
+        """Controller support disabled - pygame removed to reduce Windows security flags"""
+        return f"hat{hat_number}_{hat_value[0]}_{hat_value[1]}"
+
+    def detect_controllers(self):
+        """Controller support disabled - pygame removed to reduce Windows security flags"""
+        return []
+
+
+
+    async def _speak_with_uwp(self, text: str, preferred_desc: str = None):
+        """Speak using UWP Narrator (OneCore) via Windows.Media.SpeechSynthesis.
+        This plays audio directly and does not integrate with SAPI voices. Used as a fallback
+        to get OneCore/Narrator voices speaking when SAPI can't set them.
+        """
+        if not UWP_TTS_AVAILABLE:
+            return
+        # Import lazily to avoid hard dependency at import time
+        try:
+            from winsdk.windows.media.speechsynthesis import SpeechSynthesizer  # type: ignore
+        except Exception:
+            try:
+                from winsdk.windows.media.speechsynthesis import SpeechSynthesizer  # type: ignore
+            except Exception:
+                return
+        try:
+            from winsdk.windows.media.playback import MediaPlayer  # type: ignore
+            from winsdk.windows.media.core import MediaSource  # type: ignore
+        except Exception:
+            try:
+                from winsdk.windows.media.playback import MediaPlayer  # type: ignore
+                from winsdk.windows.media.core import MediaSource  # type: ignore
+            except Exception:
+                return
+
+        synth = SpeechSynthesizer()
+        # Try to map preferred voice to UWP voice list (match by name and normalized language)
+        try:
+            if preferred_desc:
+                voices = list(SpeechSynthesizer.all_voices)
+                name_part = preferred_desc
+                lang_part = None
+                if ' - ' in preferred_desc:
+                    name_part, lang_part = [p.strip() for p in preferred_desc.split(' - ', 1)]
+                # Remove vendor prefix
+                name_key = name_part.replace('Microsoft', '').strip().lower()
+                # Normalize language like enAU -> en-AU
+                def norm_lang(code: str) -> str:
+                    if not code:
+                        return ''
+                    code = code.strip()
+                    if '-' in code:
+                        return code
+                    if len(code) == 4:
+                        return f"{code[:2].lower()}-{code[2:].upper()}"
+                    return code
+                target_lang = norm_lang(lang_part) if lang_part else ''
+
+                # First pass: match both name and language
+                chosen = None
+                for v in voices:
+                    v_name = getattr(v, 'display_name', '')
+                    v_lang = getattr(v, 'language', '')
+                    if name_key and name_key in v_name.lower():
+                        if not target_lang or v_lang.lower() == target_lang.lower():
+                            chosen = v
+                            break
+                # Second pass: fuzzy language match (prefix)
+                if not chosen and name_key:
+                    for v in voices:
+                        v_name = getattr(v, 'display_name', '')
+                        v_lang = getattr(v, 'language', '')
+                        if name_key in v_name.lower():
+                            if not target_lang or v_lang.lower().startswith(target_lang.split('-')[0].lower()):
+                                chosen = v
+                                break
+                # Third pass: fallback by language only
+                if not chosen and target_lang:
+                    for v in voices:
+                        if getattr(v, 'language', '').lower() == target_lang.lower():
+                            chosen = v
+                            break
+                if chosen is not None:
+                    synth.voice = chosen
+        except Exception as _e:
+            pass
+        stream = await synth.synthesize_text_to_stream_async(text)
+        # Enqueue for worker playback to serialize and avoid crashes
+        try:
+            interrupt_flag = True
+            try:
+                if hasattr(self, 'interrupt_on_new_scan_var'):
+                    interrupt_flag = bool(self.interrupt_on_new_scan_var.get())
+            except Exception:
+                pass
+            # If not interrupting, queue the stream; if interrupting, signal to cut current
+            if interrupt_flag:
+                try:
+                    self._uwp_interrupt.set()
+                except Exception:
+                    pass
+            self._uwp_queue.put(("PLAY", stream, interrupt_flag))
+        except Exception:
+            pass
+
+    def _uwp_worker(self):
+        # Lazy imports inside worker
+        try:
+            try:
+                from winsdk.windows.media.playback import MediaPlayer
+                from winsdk.windows.media.core import MediaSource
+            except Exception:
+                from winsdk.windows.media.playback import MediaPlayer  # type: ignore
+                from winsdk.windows.media.core import MediaSource  # type: ignore
+        except Exception:
+            MediaPlayer = None
+            MediaSource = None
+        player = None
+        while not getattr(self, '_uwp_thread_stop', threading.Event()).is_set():
+            try:
+                cmd, payload, interrupt_flag = self._uwp_queue.get(timeout=0.1)
+            except Exception:
+                continue
+            if cmd == "STOP":
+                try:
+                    if player is not None:
+                        try:
+                            player.pause()
+                        except Exception:
+                            pass
+                        player = None
+                except Exception:
+                    pass
+                continue
+            if cmd == "PLAY" and MediaPlayer is not None and MediaSource is not None:
+                stream = payload
+                try:
+                    # If not interrupting and player is active, wait for it to finish before playing next
+                    if player is not None and not interrupt_flag:
+                        try:
+                            try:
+                                from winsdk.windows.media.playback import MediaPlaybackState  # type: ignore
+                            except Exception:
+                                try:
+                                    from winsdk.windows.media.playback import MediaPlaybackState  # type: ignore
+                                except Exception:
+                                    MediaPlaybackState = None
+                            if MediaPlaybackState is not None:
+                                # Add timeout and exit condition to prevent infinite loop
+                                max_wait_time = 300.0  # Maximum 5 minutes wait
+                                wait_start = time.time()
+                                max_iterations = 30000  # Safety limit (300 seconds * 100 iterations/sec)
+                                iteration_count = 0
+                                
+                                while iteration_count < max_iterations:
+                                    # Check if thread should stop
+                                    if self._uwp_thread_stop.is_set():
+                                        break
+                                    
+                                    # Check timeout
+                                    if time.time() - wait_start > max_wait_time:
+                                        print("Warning: UWP playback wait timeout, proceeding anyway")
+                                        break
+                                    
+                                    session = getattr(player, 'playback_session', None)
+                                    current_state = None
+                                    if session is not None:
+                                        try:
+                                            current_state = session.playback_state
+                                        except Exception:
+                                            pass
+                                    
+                                    # proceed when not actively playing or when interrupted
+                                    if current_state is None or int(current_state) != int(MediaPlaybackState.PLAYING) or self._uwp_interrupt.is_set():
+                                        break
+                                    
+                                    time.sleep(0.01)
+                                    iteration_count += 1
+                                
+                                if iteration_count >= max_iterations:
+                                    print("Warning: UWP playback wait reached iteration limit")
+                        except Exception:
+                            # If we can't read state, just fall through without long waits
+                            pass
+                    # If interrupt flag set or interrupt event set, stop current
+                    if player is not None and (interrupt_flag or self._uwp_interrupt.is_set()):
+                        try:
+                            player.pause()
+                        except Exception:
+                            pass
+                        player = None
+                        try:
+                            self._uwp_interrupt.clear()
+                        except Exception:
+                            pass
+                    # Start new
+                    player = MediaPlayer()
+                    try:
+                        vol = float(self.volume.get()) if hasattr(self, 'volume') else 100.0
+                        player.volume = max(0.0, min(1.0, vol / 100.0))
+                    except Exception:
+                        pass
+                    player.source = MediaSource.create_from_stream(stream, 'audio/wav')
+                    player.play()
+                except Exception:
+                    # swallow and continue
+                    pass
+            
+    def check_tesseract_installed(self):
+        """Check if Tesseract OCR is properly installed and accessible."""
+        try:
+            # Try to get Tesseract version
+            version = pytesseract.get_tesseract_version()
+            return True, f"Tesseract {version} - Installed"
+        except Exception as e:
+            # Check if there's a custom path saved
+            custom_path = self.load_custom_tesseract_path()
+            if custom_path and os.path.exists(custom_path):
+                try:
+                    # Test the custom path
+                    original_cmd = pytesseract.pytesseract.tesseract_cmd
+                    pytesseract.pytesseract.tesseract_cmd = custom_path
+                    version = pytesseract.get_tesseract_version()
+                    pytesseract.pytesseract.tesseract_cmd = original_cmd
+                    return True, f"Tesseract {version} - Installed (Custom Path)"
+                except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError, Exception) as e:
+                    return False, f"Custom Tesseract path found but not working properly: {e}"
+            
+            # Check if the default path exists
+            default_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+            if os.path.exists(default_path):
+                return False, "Tesseract found but not working properly"
+            else:
+                return False, "Tesseract Not found or not installed in default path: C:\Program Files\Tesseract-OCR"
+    
+    def locate_tesseract_executable(self):
+        """Open file dialog to locate Tesseract executable and save the path."""
+        try:
+            # Open file dialog to select Tesseract executable
+            file_path = filedialog.askopenfilename(
+                title="Select Tesseract Executable",
+                filetypes=[("Executable files", "*.exe"), ("All files", "*.*")],
+                initialdir="C:\\Program Files\\Tesseract-OCR"
+            )
+            
+            if file_path:
+                # Validate that the selected file is actually tesseract.exe
+                if os.path.basename(file_path).lower() == 'tesseract.exe':
+                    # Test if the selected executable works
+                    try:
+                        # Temporarily set the path and test
+                        original_cmd = pytesseract.pytesseract.tesseract_cmd
+                        pytesseract.pytesseract.tesseract_cmd = file_path
+                        version = pytesseract.get_tesseract_version()
+                        pytesseract.pytesseract.tesseract_cmd = original_cmd
+                        
+                        # Save the custom path to settings
+                        self.save_custom_tesseract_path(file_path)
+                        
+                        # Update the Tesseract command path
+                        pytesseract.pytesseract.tesseract_cmd = file_path
+                        
+                        # Show success message
+                        messagebox.showinfo(
+                            "Success", 
+                            f"Tesseract executable located successfully!\n\nPath: {file_path}\nVersion: {version}\n\n Paths saved to program settings."
+                        )
+                        
+                        # Refresh the info window to show updated status
+                        if hasattr(self, 'info_window') and self.info_window.winfo_exists():
+                            self.info_window.destroy()
+                            self.show_info_window()
+                            
+                    except Exception as e:
+                        messagebox.showerror(
+                            "Error", 
+                            f"The selected file doesn't appear to be a valid Tesseract executable.\n\nError: {str(e)}\n\nPlease select the correct tesseract.exe file."
+                        )
+                else:
+                    messagebox.showerror(
+                        "Error", 
+                        "Please select the 'tesseract.exe' file, not a different executable."
+                    )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to locate Tesseract executable: {str(e)}")
+    
+    def save_custom_tesseract_path(self, tesseract_path):
+        """Save custom Tesseract path to the settings file."""
+        try:
+            import tempfile, os, json
+            
+            # Create app subdirectory in Documents if it doesn't exist
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    settings = {}
+            
+            # Add or update the custom Tesseract path
+            settings['custom_tesseract_path'] = tesseract_path
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+                
+        except Exception as e:
+            print(f"Error saving custom Tesseract path: {e}")
+    
+    def load_custom_tesseract_path(self):
+        """Load custom Tesseract path from the settings file."""
+        try:
+            import tempfile, os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except json.JSONDecodeError as e:
+                    print(f"Error: Settings file is corrupted (JSON parse error): {e}")
+                    print(f"  File: {temp_path}")
+                    print(f"  Common issues: trailing commas, missing quotes, or invalid syntax.")
+                    return None
+                
+                custom_path = settings.get('custom_tesseract_path')
+                if custom_path and os.path.exists(custom_path):
+                    return custom_path
+                    
+        except Exception as e:
+            print(f"Error loading custom Tesseract path: {e}")
+        
+        return None
+    
+    def save_last_layout_path(self, layout_path):
+        """Save the last loaded layout path to the settings file."""
+        try:
+            import tempfile, os, json
+            
+            # Create app subdirectory in Documents if it doesn't exist
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    settings = {}
+            
+            # Add or update the last layout path
+            settings['last_layout_path'] = layout_path
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+                
+        except Exception as e:
+            print(f"Error saving last layout path: {e}")
+    
+    def load_last_layout_path(self):
+        """Load the last used layout path from the settings file."""
+        try:
+            import tempfile, os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except json.JSONDecodeError as e:
+                    print(f"Error: Settings file is corrupted (JSON parse error): {e}")
+                    print(f"  File: {temp_path}")
+                    print(f"  Common issues: trailing commas, missing quotes, or invalid syntax.")
+                    return None
+                
+                last_layout_path = settings.get('last_layout_path')
+                if last_layout_path and os.path.exists(last_layout_path):
+                    return last_layout_path
+                    
+        except Exception as e:
+            print(f"Error loading last layout path: {e}")
+        
+        return None
+    
+    def save_update_info(self, version, changelog, update_available, download_url=None):
+        """Save update information to the settings file."""
+        try:
+            import os, json, shutil
+            
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            settings_loaded = False
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read().strip()
+                        # Only try to parse if file has content
+                        if file_content:
+                            settings = json.loads(file_content)
+                            settings_loaded = True
+                        else:
+                            # Empty file - start with empty dict
+                            settings = {}
+                            settings_loaded = True
+                except json.JSONDecodeError as e:
+                    # JSON is corrupted - make a backup before overwriting (hidden file)
+                    backup_path = os.path.join(game_reader_dir, APP_SETTINGS_BACKUP_FILENAME)
+                    try:
+                        shutil.copy2(temp_path, backup_path)
+                        # Set as hidden on Windows
+                        if os.name == 'nt':
+                            try:
+                                import ctypes
+                                ctypes.windll.kernel32.SetFileAttributesW(backup_path, 2)  # FILE_ATTRIBUTE_HIDDEN = 2
+                            except:
+                                pass
+                        print(f"Warning: Settings file is corrupted. Backup created at {backup_path}")
+                    except:
+                        pass
+                    print(f"Error parsing settings JSON: {e}")
+                    # Start with empty dict - we'll save update info but other settings will be lost
+                    # User can recover from backup if needed
+                    settings = {}
+                    settings_loaded = True
+                except (FileNotFoundError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    # File might have been deleted - continue with empty dict
+                    settings_loaded = True
+            
+            # Ensure settings is a dictionary
+            if not isinstance(settings, dict):
+                print(f"Warning: Settings is not a dictionary (type: {type(settings)}). Resetting to empty dict.")
+                settings = {}
+            
+            # Add or update update information
+            settings['last_update_check'] = {
+                'version': version,
+                'changelog': changelog,
+                'update_available': update_available,
+                'download_url': download_url
+            }
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+            
+            print(f"Update info saved successfully to: {temp_path}")
+            print(f"  - version={version}, update_available={update_available}")
+            print(f"  - Settings keys: {list(settings.keys())}")
+                
+        except Exception as e:
+            print(f"Error saving update info: {e}")
+    
+    def load_update_info(self):
+        """Load update information from the settings file.
+        
+        Returns:
+            dict: Update info with keys: version, changelog, update_available, download_url, or None if not found
+        """
+        try:
+            import os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read().strip()
+                        if file_content:
+                            settings = json.loads(file_content)
+                        else:
+                            print(f"Settings file is empty: {temp_path}")
+                            return None
+                except json.JSONDecodeError as e:
+                    print(f"Error: Settings file is corrupted (JSON parse error): {e}")
+                    print(f"  File: {temp_path}")
+                    print(f"  The file may need to be fixed manually, or you can delete it to start fresh.")
+                    return None
+                
+                update_info = settings.get('last_update_check')
+                if update_info and isinstance(update_info, dict):
+                    print(f"Update info loaded successfully from: {temp_path}")
+                    print(f"  - version={update_info.get('version')}, update_available={update_info.get('update_available')}")
+                    return update_info
+                else:
+                    print(f"Update info not found in settings file: {temp_path}")
+            else:
+                print(f"Settings file does not exist: {temp_path}")
+                    
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Error reading settings file: {e}")
+        except Exception as e:
+            print(f"Unexpected error loading update info: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return None
+    
+    def save_auto_check_updates_setting(self, enabled):
+        """Save the auto-check for updates setting to the settings file."""
+        try:
+            import os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new dict
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read().strip()
+                        if file_content:
+                            settings = json.loads(file_content)
+                        if not isinstance(settings, dict):
+                            settings = {}
+                except (json.JSONDecodeError, IOError, OSError):
+                    settings = {}
+            
+            # Update the setting
+            settings['auto_check_updates'] = enabled
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+            
+            print(f"Auto-check updates setting saved: {enabled}")
+                
+        except Exception as e:
+            print(f"Error saving auto-check updates setting: {e}")
+    
+    def load_auto_check_updates_setting(self):
+        """Load the auto-check for updates setting from the settings file.
+        
+        Returns:
+            bool: True if auto-check is enabled, False otherwise (default: False)
+        """
+        try:
+            import os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read().strip()
+                        if file_content:
+                            settings = json.loads(file_content)
+                            if isinstance(settings, dict):
+                                return settings.get('auto_check_updates', False)
+                except (json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error reading auto-check updates setting: {e}")
+        except Exception as e:
+            print(f"Error loading auto-check updates setting: {e}")
+        
+        return False  # Default to False if not found or error
+    
+    def display_changelog(self, text_widget, changelog, version, update_available, update_title_label=None, download_url=None):
+        """Display changelog in the text widget with image support."""
+        text_widget.config(state='normal')
+        text_widget.delete('1.0', tk.END)
+        
+        # Initialize images list for garbage collection
+        if not hasattr(text_widget, '_images'):
+            text_widget._images = []
+        
+        # Update the "News / Updates:" title label
+        if update_title_label:
+            update_title_label.config(
+                text="News / Updates:",
+                font=("Helvetica", 13, "bold")
+            )
+        
+        # Show/hide download button based on update availability
+        download_button = getattr(text_widget, '_download_button', None)
+        status_label = getattr(text_widget, '_status_label', None)
+        if download_button:
+            if update_available and download_url:
+                # Pack before status label to maintain correct order: Check -> Download -> Status
+                if status_label:
+                    download_button.pack(side='left', padx=(0, 10), before=status_label)
+                else:
+                    download_button.pack(side='left', padx=(0, 10))
+            else:
+                download_button.pack_forget()
+        
+        if changelog:
+            # Use the same image insertion logic as update popup
+            self.insert_changelog_with_images(text_widget, changelog)
+        else:
+            text_widget.insert('end', "No changelog available.")
+        
+        # Keep widget in 'normal' state to allow text selection and copying
+        # The widget is already configured to be read-only via event bindings
+    
+    def insert_changelog_with_images(self, text_widget, changelog_text):
+        """Insert changelog text and replace image markers with actual images."""
+        import re
+        import threading
+        import io
+        
+        # Pattern to match [IMAGE:url] or ![alt](url) markdown-style
+        # Supports: [IMAGE:url], [IMAGE:url:width], ![alt](url)
+        image_pattern = r'\[IMAGE:([^\]]+)\]|!\[([^\]]*)\]\(([^\)]+)\)'
+        
+        parts = []
+        last_end = 0
+        
+        for match in re.finditer(image_pattern, changelog_text):
+            # Add text before the image marker
+            if match.start() > last_end:
+                parts.append(('text', changelog_text[last_end:match.start()]))
+            
+            # Extract image URL
+            if match.group(1):  # [IMAGE:url] format
+                url_part = match.group(1)
+                # Check if width is specified: [IMAGE:url:width]
+                if ':' in url_part:
+                    url, width = url_part.rsplit(':', 1)
+                    try:
+                        width = int(width)
+                    except ValueError:
+                        width = 400  # Default width
+                else:
+                    url = url_part
+                    width = 400  # Default width
+            else:  # ![alt](url) markdown format
+                url = match.group(3)
+                width = 400  # Default width
+            
+            parts.append(('image', url, width))
+            last_end = match.end()
+        
+        # Add remaining text
+        if last_end < len(changelog_text):
+            parts.append(('text', changelog_text[last_end:]))
+        
+        # Helper function to insert text with font formatting
+        def insert_text_with_fonts(text_widget, text):
+            """Insert text and apply font tags like [FONT:FontName]text[/FONT] or [FONT:FontName:Size]text[/FONT]"""
+            # Pattern to match [FONT:name]text[/FONT] or [FONT:name:size]text[/FONT]
+            # Pattern to match [FONT:name]text[/FONT] or [FONT:name:size]text[/FONT]
+            # Allow optional whitespace around colons for flexibility
+            # Pattern supports: [FONT:name], [FONT:name:size], [FONT:name:size:bold], [FONT:name::bold]
+            font_pattern = r'\[FONT\s*:\s*([^:\]]+?)(?:\s*:\s*(\d+))?(?:\s*:\s*(bold|normal))?\s*\](.*?)\[/FONT\]'
+            
+            # Test the pattern on a simple example
+            test_text = "[FONT:Helvetica:18]Test[/FONT]"
+            test_match = re.search(font_pattern, test_text, re.DOTALL | re.IGNORECASE)
+            if not test_match:
+                print(f"WARNING: Font regex pattern failed on test! Trying simpler pattern...")
+                # Try simpler pattern without optional whitespace
+                font_pattern = r'\[FONT:([^:\]]+?)(?::(\d+))?(?::(bold|normal))?\](.*?)\[/FONT\]'
+            
+            last_end = 0
+            
+            # Ensure text widget is enabled for tag operations
+            current_state = text_widget.cget('state')
+            if current_state == 'disabled':
+                text_widget.config(state='normal')
+            
+            matches = list(re.finditer(font_pattern, text, re.DOTALL | re.IGNORECASE))
+            
+            # Debug: print if we found matches
+            if matches:
+                print(f"Found {len(matches)} font tag(s) in text")
+                for i, match in enumerate(matches):
+                    print(f"  Match {i+1}: font='{match.group(1)}', size='{match.group(2)}', weight='{match.group(3)}', text='{match.group(4)[:50]}...'")
+            else:
+                print(f"No font tags found in text. Text length: {len(text)}, First 200 chars: {repr(text[:200])}")
+                # Try to find any FONT tags at all
+                if '[FONT' in text.upper():
+                    print(f"  WARNING: Found '[FONT' in text but regex didn't match!")
+                    # Show the context around FONT tags
+                    font_context = re.findall(r'.{0,30}\[FONT.{0,50}\].{0,30}', text, re.DOTALL)
+                    for ctx in font_context[:3]:  # Show first 3 matches
+                        print(f"    Context: {repr(ctx)}")
+            
+            if not matches:
+                # No font tags found, just insert the text as-is
+                text_widget.insert('end', text)
+                if current_state == 'disabled':
+                    text_widget.config(state='disabled')
+                return
+            
+            for match in matches:
+                # Insert text before the font tag
+                if match.start() > last_end:
+                    text_widget.insert('end', text[last_end:match.start()])
+                
+                # Get font name, optional size, and optional weight (bold/normal)
+                font_name = match.group(1).strip()
+                font_size = match.group(2)
+                font_weight = match.group(3)  # 'bold' or 'normal' or None
+                font_text = match.group(4)
+                
+                # Create a unique tag name for this font
+                weight_suffix = f"_{font_weight}" if font_weight else ""
+                tag_name = f"font_{font_name}_{font_size or 'default'}{weight_suffix}"
+                
+                # Configure the tag
+                try:
+                    # Build font tuple: (name, size, weight) or (name, size) or (name,)
+                    if font_size:
+                        size = int(font_size)
+                        if font_weight and font_weight.lower() == 'bold':
+                            font_tuple = (font_name, size, 'bold')
+                        else:
+                            font_tuple = (font_name, size)
+                    else:
+                        # When no size specified, use default size from widget or 12
+                        default_font = text_widget.cget('font')
+                        if isinstance(default_font, tuple) and len(default_font) >= 2:
+                            default_size = default_font[1]
+                        else:
+                            default_size = 12
+                        if font_weight and font_weight.lower() == 'bold':
+                            font_tuple = (font_name, default_size, 'bold')
+                        else:
+                            font_tuple = (font_name, default_size)
+                    
+                    text_widget.tag_config(tag_name, font=font_tuple)
+                    print(f"Configured tag '{tag_name}' with font {font_tuple}")
+                except Exception as e:
+                    print(f"Warning: Could not configure font tag {tag_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fallback: insert without formatting
+                    text_widget.insert('end', font_text)
+                    last_end = match.end()
+                    continue
+                
+                # Insert text with the tag
+                # Get position before insertion (end always has trailing newline, so use end-1c to get actual end)
+                start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+                # Insert the text
+                text_widget.insert('end', font_text)
+                # Get position after insertion (end-1c to exclude the trailing newline that Tkinter adds)
+                end_pos = text_widget.index('end-1c')
+                # Apply the tag to the inserted text
+                if start_pos != end_pos:  # Only apply if there's actual text
+                    text_widget.tag_add(tag_name, start_pos, end_pos)
+                    weight_info = f", weight={font_weight}" if font_weight else ""
+                    print(f"Applied tag '{tag_name}' (font={font_name}, size={font_size or 'default'}{weight_info}) from {start_pos} to {end_pos}")
+                else:
+                    print(f"Warning: start_pos == end_pos, skipping tag application")
+                
+                last_end = match.end()
+            
+            # Insert remaining text
+            if last_end < len(text):
+                text_widget.insert('end', text[last_end:])
+            
+            # Restore original state
+            if current_state == 'disabled':
+                text_widget.config(state='disabled')
+        
+        # Insert parts into text widget
+        for part in parts:
+            if part[0] == 'text':
+                if part[1]:  # Only insert if text is not empty
+                    insert_text_with_fonts(text_widget, part[1])
+            elif part[0] == 'image':
+                url, width = part[1], part[2]
+                # Insert placeholder text
+                placeholder = f"\n[Loading image from {url}...]\n"
+                text_widget.insert('end', placeholder)
+                image_start = text_widget.index(f'end-{len(placeholder)}c')
+                
+                # Load image in background (non-blocking)
+                def load_and_insert_image(img_url, img_width, start_pos, placeholder_text):
+                    try:
+                        print(f"Loading image from: {img_url}")
+                        # Download image with proper headers to avoid rate limiting
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Referer': 'https://www.google.com/'
+                        }
+                        img_resp = requests.get(img_url, timeout=10, stream=True, headers=headers)
+                        print(f"Image response status: {img_resp.status_code}")
+                        if img_resp.status_code == 200:
+                            # Load image
+                            img_data = img_resp.content
+                            img = Image.open(io.BytesIO(img_data))
+                            print(f"Image loaded: {img.size}")
+                            
+                            # Resize if needed (maintain aspect ratio)
+                            img_width_px = img_width
+                            aspect_ratio = img.height / img.width
+                            img_height_px = int(img_width_px * aspect_ratio)
+                            
+                            # Limit max dimensions
+                            max_width, max_height = 600, 400
+                            if img_width_px > max_width:
+                                img_width_px = max_width
+                                img_height_px = int(max_width * aspect_ratio)
+                            if img_height_px > max_height:
+                                img_height_px = max_height
+                                img_width_px = int(max_height / aspect_ratio)
+                            
+                            img = img.resize((img_width_px, img_height_px), Image.Resampling.LANCZOS)
+                            photo = ImageTk.PhotoImage(img)
+                            
+                            # Replace placeholder with image (must be on main thread)
+                            def insert_image():
+                                try:
+                                    text_widget.config(state='normal')  # Enable to modify
+                                    # Find the placeholder text
+                                    content = text_widget.get('1.0', 'end')
+                                    placeholder_idx = content.find(placeholder_text)
+                                    if placeholder_idx >= 0:
+                                        # Calculate line and column
+                                        lines_before = content[:placeholder_idx].count('\n')
+                                        line_start = content[:placeholder_idx].rfind('\n') + 1
+                                        col_start = placeholder_idx - line_start
+                                        start_index = f"{lines_before + 1}.{col_start}"
+                                        end_index = f"{start_index}+{len(placeholder_text)}c"
+                                        
+                                        text_widget.delete(start_index, end_index)
+                                        text_widget.image_create(start_index, image=photo)
+                                        text_widget.insert(start_index, "\n\n")
+                                        # Keep reference to prevent garbage collection
+                                        if not hasattr(text_widget, '_images'):
+                                            text_widget._images = []
+                                        text_widget._images.append(photo)
+                                    text_widget.config(state='disabled')  # Disable again
+                                except Exception as e:
+                                    print(f"Error inserting image: {e}")
+                                    text_widget.config(state='normal')
+                                    content = text_widget.get('1.0', 'end')
+                                    placeholder_idx = content.find(placeholder_text)
+                                    if placeholder_idx >= 0:
+                                        lines_before = content[:placeholder_idx].count('\n')
+                                        line_start = content[:placeholder_idx].rfind('\n') + 1
+                                        col_start = placeholder_idx - line_start
+                                        start_index = f"{lines_before + 1}.{col_start}"
+                                        end_index = f"{start_index}+{len(placeholder_text)}c"
+                                        text_widget.delete(start_index, end_index)
+                                        text_widget.insert(start_index, f"\n[Image loaded but failed to display: {str(e)[:50]}]\n\n")
+                                    text_widget.config(state='disabled')
+                            
+                            self.root.after(0, insert_image)
+                        else:
+                            # Replace placeholder with error message
+                            def show_error():
+                                text_widget.config(state='normal')
+                                content = text_widget.get('1.0', 'end')
+                                placeholder_idx = content.find(placeholder_text)
+                                if placeholder_idx >= 0:
+                                    lines_before = content[:placeholder_idx].count('\n')
+                                    line_start = content[:placeholder_idx].rfind('\n') + 1
+                                    col_start = placeholder_idx - line_start
+                                    start_index = f"{lines_before + 1}.{col_start}"
+                                    end_index = f"{start_index}+{len(placeholder_text)}c"
+                                    text_widget.delete(start_index, end_index)
+                                    text_widget.insert(start_index, f"\n[Image failed to load (HTTP {img_resp.status_code}): {img_url}]\n\n")
+                                text_widget.config(state='disabled')
+                            self.root.after(0, show_error)
+                    except Exception as e:
+                        print(f"Exception loading image: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Replace placeholder with error message
+                        def show_error():
+                            text_widget.config(state='normal')
+                            content = text_widget.get('1.0', 'end')
+                            placeholder_idx = content.find(placeholder_text)
+                            if placeholder_idx >= 0:
+                                lines_before = content[:placeholder_idx].count('\n')
+                                line_start = content[:placeholder_idx].rfind('\n') + 1
+                                col_start = placeholder_idx - line_start
+                                start_index = f"{lines_before + 1}.{col_start}"
+                                end_index = f"{start_index}+{len(placeholder_text)}c"
+                                text_widget.delete(start_index, end_index)
+                                text_widget.insert(start_index, f"\n[Image error: {str(e)[:100]}]\n\n")
+                            text_widget.config(state='disabled')
+                        self.root.after(0, show_error)
+                
+                # Start loading image in background thread
+                threading.Thread(target=load_and_insert_image, args=(url, width, image_start, placeholder), daemon=True).start()
+        
+        # If no image markers found, still parse and insert text with font formatting
+        if not parts:
+            insert_text_with_fonts(text_widget, changelog_text)
+    
+    def check_and_save_update(self, local_version, changelog_text_widget):
+        """Check for updates and save/display the result."""
+        # This will be called from a background thread
+        # We need to fetch the update info and then update the UI on the main thread
+        # Import constants and functions from their modules
+        import sys
+        import re
+        from ..constants import UPDATE_SERVER_URL, GITHUB_REPO, APP_NAME, APP_VERSION
+        from ..update_checker import version_tuple
+        
+        # Update status label to show checking (with simple animation)
+        status_label = getattr(changelog_text_widget, '_status_label', None)
+        animation_frames = [
+            "Checking for updates .",
+            "Checking for updates   .",
+            "Checking for updates     .",
+        ]
+        animation_state = {"running": False, "job": None, "index": 0}
+
+        def _stop_status_animation():
+            """Cancel any pending status animation frame."""
+            animation_state["running"] = False
+            job = animation_state.get("job")
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                animation_state["job"] = None
+
+        def _animate_status_label():
+            """Cycle through frames while an update check is in progress."""
+            if not animation_state["running"] or not status_label:
+                return
+            frame = animation_frames[animation_state["index"] % len(animation_frames)]
+            animation_state["index"] += 1
+            status_label.config(text=frame, foreground="blue")
+            animation_state["job"] = self.root.after(300, _animate_status_label)
+
+        def start_status_animation():
+            if not status_label:
+                return
+            def _start():
+                _stop_status_animation()
+                animation_state["index"] = 0
+                animation_state["running"] = True
+                _animate_status_label()
+            self.root.after(0, _start)
+
+        def set_status(text, color):
+            """Stop animation and update the status label text/color."""
+            if not status_label:
+                return
+            def _set():
+                _stop_status_animation()
+                status_label.config(text=text, foreground=color)
+            self.root.after(0, _set)
+
+        if status_label:
+            start_status_animation()
+        
+        # Fetch update info from Google Script
+        if UPDATE_SERVER_URL and "YOUR_SCRIPT_ID" not in UPDATE_SERVER_URL:
+            try:
+                headers = {
+                    'User-Agent': f'{APP_NAME}/{APP_VERSION}',
+                    'Accept': 'application/json'
+                }
+                resp = requests.get(UPDATE_SERVER_URL, timeout=10, allow_redirects=True, headers=headers)
+                
+                if resp.status_code == 200:
+                    try:
+                        response_text = resp.text
+                        if response_text.startswith('\ufeff'):
+                            response_text = response_text[1:]
+                        response_text = response_text.strip()
+                        
+                        if '<html' in response_text.lower() or '<!doctype' in response_text.lower():
+                            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+                            if json_match:
+                                response_text = json_match.group(0)
+                        
+                        if not response_text.startswith('{'):
+                            json_start = response_text.find('{')
+                            if json_start > 0:
+                                response_text = response_text[json_start:]
+                        
+                        try:
+                            update_info = resp.json()
+                        except (ValueError, json.JSONDecodeError):
+                            update_info = json.loads(response_text)
+                        
+                        if not isinstance(update_info, dict):
+                            raise ValueError("Response is not a JSON object")
+                        
+                        remote_version = update_info.get('version')
+                        remote_changelog = update_info.get('changelog', '')
+                        # Always use GITHUB_REPO for download URL, ignore download_url from Google Script
+                        download_url = f'https://github.com/{GITHUB_REPO}/releases'
+                        
+                        # Check if update is available using version_tuple
+                        update_available = remote_version and version_tuple(remote_version) > version_tuple(local_version)
+                        
+                        # Load previous update info to check if changelog changed
+                        previous_update_info = self.load_update_info()
+                        previous_changelog = previous_update_info.get('changelog', '') if previous_update_info else ''
+                        # Only consider changelog changed if we had a previous changelog and it's different
+                        changelog_changed = (previous_changelog and 
+                                           remote_changelog.strip() != previous_changelog.strip())
+                        
+                        # Save to settings
+                        self.save_update_info(remote_version or "Unknown", remote_changelog, update_available, download_url)
+                        
+                        # Update UI on main thread - get update_title from stored reference
+                        update_title_ref = getattr(changelog_text_widget, '_update_title', None)
+                        # Store download_url on widget for button access
+                        changelog_text_widget._download_url = download_url
+                        
+                        # Update status label based on result
+                        if status_label:
+                            if update_available:
+                                status_text = "Update available!"
+                                status_color = "green"
+                            elif changelog_changed and not update_available:
+                                status_text = "News Update!"
+                                status_color = "green"
+                            else:
+                                status_text = "No update available"
+                                status_color = "gray"
+                            set_status(status_text, status_color)
+                        
+                        self.root.after(0, lambda: self.display_changelog(changelog_text_widget, remote_changelog, remote_version or "Unknown", update_available, update_title_ref, download_url))
+                        
+                    except Exception as e:
+                        error_msg = f"Error checking for updates: {str(e)[:100]}"
+                        self.save_update_info("Unknown", error_msg, False)
+                        update_title_ref = getattr(changelog_text_widget, '_update_title', None)
+                        changelog_text_widget._download_url = None
+                        
+                        # Update status label to show error
+                        if status_label:
+                            set_status("Error checking for updates", "red")
+                        
+                        self.root.after(0, lambda: self.display_changelog(changelog_text_widget, error_msg, "Unknown", False, update_title_ref, None))
+                else:
+                    # Non-200 status code
+                    error_msg = f"Server returned status code {resp.status_code}"
+                    self.save_update_info("Unknown", error_msg, False)
+                    update_title_ref = getattr(changelog_text_widget, '_update_title', None)
+                    changelog_text_widget._download_url = None
+                    
+                    # Update status label to show error
+                    if status_label:
+                        set_status("Error checking for updates", "red")
+                    
+                    self.root.after(0, lambda: self.display_changelog(changelog_text_widget, error_msg, "Unknown", False, update_title_ref, None))
+            except Exception as e:
+                error_msg = f"Unable to fetch update information: {str(e)[:100]}"
+                self.save_update_info("Unknown", error_msg, False)
+                update_title_ref = getattr(changelog_text_widget, '_update_title', None)
+                changelog_text_widget._download_url = None
+                
+                # Update status label to show error
+                if status_label:
+                    set_status("Error checking for updates", "red")
+                
+                self.root.after(0, lambda: self.display_changelog(changelog_text_widget, error_msg, "Unknown", False, update_title_ref, None))
+        else:
+            # If update checking is disabled/misconfigured, stop animation to avoid a stuck label
+            set_status("Update check not configured", "gray")
+
+    def check_for_updates_on_startup(self):
+        """Check for updates on startup if auto-check is enabled. Show popup if update or news is available."""
+        # Check if auto-check is enabled
+        if not self.load_auto_check_updates_setting():
+            return
+        
+        # Import update checker
+        from ..update_checker import check_for_update, show_update_popup, version_tuple
+        from ..constants import APP_VERSION, UPDATE_SERVER_URL, GITHUB_REPO, APP_NAME, SHOW_UPDATE_POPUP_FOR_TESTING
+        import requests
+        import json
+        import re
+        
+        def check_in_background():
+            """Check for updates in background thread."""
+            # Fetch update info from Google Script
+            if UPDATE_SERVER_URL and "YOUR_SCRIPT_ID" not in UPDATE_SERVER_URL:
+                try:
+                    headers = {
+                        'User-Agent': f'{APP_NAME}/{APP_VERSION}',
+                        'Accept': 'application/json'
+                    }
+                    resp = requests.get(UPDATE_SERVER_URL, timeout=10, allow_redirects=True, headers=headers)
+                    
+                    if resp.status_code == 200:
+                        try:
+                            response_text = resp.text
+                            if response_text.startswith('\ufeff'):
+                                response_text = response_text[1:]
+                            response_text = response_text.strip()
+                            
+                            if '<html' in response_text.lower() or '<!doctype' in response_text.lower():
+                                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
+                                if json_match:
+                                    response_text = json_match.group(0)
+                            
+                            if not response_text.startswith('{'):
+                                json_start = response_text.find('{')
+                                if json_start > 0:
+                                    response_text = response_text[json_start:]
+                            
+                            try:
+                                update_info = resp.json()
+                            except (ValueError, json.JSONDecodeError):
+                                update_info = json.loads(response_text)
+                            
+                            if not isinstance(update_info, dict):
+                                return
+                            
+                            remote_version = update_info.get('version')
+                            remote_changelog = update_info.get('changelog', '')
+                            # Always use GITHUB_REPO for download URL, ignore download_url from Google Script
+                            download_url = f'https://github.com/{GITHUB_REPO}/releases'
+                            
+                            # Check if update is available
+                            update_available = remote_version and version_tuple(remote_version) > version_tuple(APP_VERSION)
+                            
+                            # Load previous update info to check if changelog changed
+                            previous_update_info = self.load_update_info()
+                            previous_changelog = previous_update_info.get('changelog', '') if previous_update_info else ''
+                            
+                            # Check if changelog changed (news update)
+                            changelog_changed = (previous_changelog and 
+                                               remote_changelog.strip() != previous_changelog.strip())
+                            
+                            # Save the update info
+                            self.save_update_info(remote_version or "Unknown", remote_changelog, update_available, download_url)
+                            
+                            # Show popup if there's an update, news, OR testing flag is enabled
+                            if update_available or changelog_changed or SHOW_UPDATE_POPUP_FOR_TESTING:
+                                # Schedule popup on main thread
+                                is_news = changelog_changed and not update_available
+                                self.root.after(100, lambda: show_update_popup(
+                                    self.root, APP_VERSION, remote_version or "Unknown", remote_changelog, download_url, is_news_update=is_news
+                                ))
+                        except Exception as e:
+                            print(f"Error checking for updates on startup: {e}")
+                except Exception as e:
+                    print(f"Error checking for updates on startup: {e}")
+        
+        # Start check in background thread
+        import threading
+        threading.Thread(target=check_in_background, daemon=True).start()
+    
+    def load_edit_view_settings(self):
+        """Load edit view settings (hotkey, screenshot background, alpha) from the settings file."""
+        try:
+            import tempfile, os, json
+            
+            temp_path = APP_SETTINGS_PATH
+            
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except json.JSONDecodeError as e:
+                    print(f"Error: Settings file is corrupted (JSON parse error): {e}")
+                    print(f"  File: {temp_path}")
+                    print(f"  Common issues: trailing commas, missing quotes, or invalid syntax.")
+                    print(f"  The file may need to be fixed manually, or you can delete it to start fresh.")
+                    return
+                
+                # Load edit area hotkey
+                saved_hotkey = settings.get('edit_area_hotkey')
+                if saved_hotkey:
+                    self.edit_area_hotkey = saved_hotkey
+                
+                # Load screenshot background setting
+                saved_screenshot_bg = settings.get('edit_area_screenshot_bg', False)
+                self.edit_area_screenshot_bg = saved_screenshot_bg
+                
+                # Load alpha value
+                saved_alpha = settings.get('edit_area_alpha')
+                if saved_alpha is not None:
+                    self.edit_area_alpha = float(saved_alpha)
+                
+                # Load repeat latest hotkey
+                saved_repeat_latest_hotkey = settings.get('repeat_latest_hotkey')
+                if saved_repeat_latest_hotkey:
+                    self.repeat_latest_hotkey = saved_repeat_latest_hotkey
+                    # Set it on the persistent button
+                    if hasattr(self, 'repeat_latest_hotkey_button'):
+                        self.repeat_latest_hotkey_button.hotkey = saved_repeat_latest_hotkey
+                
+                # Load pause/play hotkey
+                saved_pause_hotkey = settings.get('pause_hotkey')
+                if saved_pause_hotkey:
+                    self.pause_hotkey = saved_pause_hotkey
+                    # Update button text
+                    if hasattr(self, 'pause_hotkey_button'):
+                        display_name = self._hotkey_to_display_name(saved_pause_hotkey)
+                        self.pause_hotkey_button.config(text=f"Pause/Play Hotkey: [ {display_name} ]")
+                    # Register the hotkey
+                    if hasattr(self, 'pause_hotkey_button'):
+                        mock_button = type('MockButton', (), {'hotkey': saved_pause_hotkey, 'is_pause_button': True})
+                        self.pause_hotkey_button.mock_button = mock_button
+                        self.setup_hotkey(self.pause_hotkey_button.mock_button, None)
+                
+                # Load stop hotkey
+                saved_stop_hotkey = settings.get('stop_hotkey')
+                if saved_stop_hotkey:
+                    self.stop_hotkey = saved_stop_hotkey
+                    # Update button text
+                    if hasattr(self, 'stop_hotkey_button'):
+                        display_name = self._hotkey_to_display_name(saved_stop_hotkey)
+                        self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name} ]")
+                    # Register the hotkey
+                    if hasattr(self, 'stop_hotkey_button'):
+                        mock_button = type('MockButton', (), {'hotkey': saved_stop_hotkey, 'is_stop_button': True})
+                        self.stop_hotkey_button.mock_button = mock_button
+                        self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+                    
+        except Exception as e:
+            print(f"Error loading edit view settings: {e}")
+            import traceback
+            traceback.print_exc()
+
+    
+    def restart_tesseract(self):
+        """Forcefully stop the speech and reinitialize the system."""
+        print("Forcing stop...")
+        try:
+            self.stop_speaking()  # Stop the speech
+            print("System reinitialized. Audio stopped.")
+        except Exception as e:
+            print(f"Error during forced stop: {e}")
+
+
+    
+    def _ensure_speech_ready(self):
+        """Ensure the speech engine is ready before speaking."""
+        try:
+            # Check if we need to prime the voice for this speech session
+            if not hasattr(self, '_voice_primed') or not self._voice_primed:
+                print("Priming voice for first speech call...")
+                
+                # Make a silent priming call to ensure the voice engine is ready
+                self.speaker.Speak("", 1)  # Silent priming call
+                time.sleep(0.1)  # Brief pause for engine initialization
+                
+                # Mark as primed for this session
+                self._voice_primed = True
+                print("Voice priming completed")
+                
+        except Exception as prime_error:
+            print(f"Warning: Voice priming failed (non-critical): {prime_error}")
+            # Don't fail speech if priming fails
+    
+    def _wake_up_online_voices(self):
+        """Special initialization for Online SAPI5 voices that require network initialization."""
+        try:
+            print("Initializing Online voices...")
+            
+            # Get all voices and identify online ones
+            voices = self.speaker.GetVoices()
+            online_voices = []
+            
+            for i in range(voices.Count):
+                try:
+                    voice = voices.Item(i)
+                    voice_desc = voice.GetDescription() if hasattr(voice, 'GetDescription') else ""
+                    
+                    # Check if this is an online voice (Microsoft Online voices typically contain "Online")
+                    if "Online" in voice_desc and "Microsoft" in voice_desc:
+                        online_voices.append((i, voice, voice_desc))
+                except Exception as voice_error:
+                    continue
+            
+            if not online_voices:
+                print("No online voices found")
+                return
+            
+            print(f"Found {len(online_voices)} online voices, initializing...")
+            
+            # Initialize each online voice with a longer warm-up
+            for idx, voice, desc in online_voices[:2]:  # Limit to first 2 online voices
+                try:
+                    # Select this online voice
+                    self.speaker.Voice = voice
+                    
+                    # Make a longer warm-up call for online voices
+                    self.speaker.Speak("", 1)  # Use "Initializing" text
+                    time.sleep(0.5)  # Longer wait for online voice initialization
+                    
+                except Exception as online_error:
+                    print(f"Warning: Failed to initialize online voice: {online_error}")
+                    continue
+            
+            # Restore the first voice as default
+            if voices.Count > 0:
+                try:
+                    self.speaker.Voice = voices.Item(0)
+                    print("Restored default voice selection after online voice initialization")
+                except (AttributeError, IndexError, Exception):
+                    # Voice may not be available or setting may fail
+                    pass
+            
+            print("Online voice initialization completed")
+            
+        except Exception as e:
+            print(f"Warning: Online voice initialization failed (non-critical): {e}")
+            # Don't fail the program if online voice initialization fails
+    
+    def setup_gui(self):
+        # Line 1: Top frame - Name, Volume, Program Saves, Debug, Info
+        top_frame = tk.Frame(self.root)
+        top_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Top frame contents - Title
+        title_label = tk.Label(top_frame, text=f"{APP_NAME} v{APP_VERSION}", font=("Helvetica", 12, "bold"))
+        title_label.pack(side='left', padx=(0, 20))
+        
+        # Volume control in top frame
+        volume_frame = tk.Frame(top_frame)
+        volume_frame.pack(side='left', padx=10)
+        
+        tk.Label(volume_frame, text="Volume %:").pack(side='left')
+        vcmd = (self.root.register(lambda P: self.validate_numeric_input(P, is_speed=False)), '%P')
+        volume_entry = tk.Entry(volume_frame, textvariable=self.volume, width=4, validate='all', validatecommand=vcmd)
+        volume_entry.pack(side='left', padx=5)
+        # Track volume changes to mark as unsaved
+        self.volume.trace('w', lambda *args: self._set_unsaved_changes('additional_options'))
+        
+        # Add Set Volume button
+        set_volume_button = tk.Button(volume_frame, text="Set", command=lambda: self.set_volume())
+        set_volume_button.pack(side='left', padx=5)
+        
+        # Right-aligned buttons in top frame: Save Layout, Load Layout, Program Saves, Debug, Info
+        buttons_frame = tk.Frame(top_frame)
+        buttons_frame.pack(side='right')
+        
+        save_button = tk.Button(buttons_frame, text="💾 Save Layout", command=self.save_layout)
+        save_button.pack(side='left', padx=5)
+        
+        load_button = tk.Button(buttons_frame, text="📁 Load Layout..", command=self.load_layout)
+        load_button.pack(side='left', padx=5)
+        
+        program_saves_button = tk.Button(buttons_frame, text="📁 Program Saves...", 
+                                       command=self.open_game_reader_folder)
+        program_saves_button.pack(side='left', padx=5)
+        
+        debug_button = tk.Button(buttons_frame, text="🔧 Debug Window", command=self.show_debug)
+        debug_button.pack(side='left', padx=5)
+        
+        info_button = tk.Button(buttons_frame, text="ℹ️Info/Help", command=self.show_info)
+        info_button.pack(side='left', padx=5)
+        
+        # Line 2: Buttons frame
+        buttons_right_frame = tk.Frame(self.root)
+        buttons_right_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Loaded Layout on the left side of this line
+        layout_frame = tk.Frame(buttons_right_frame)
+        layout_frame.pack(side='left', padx=(0, 10))
+        
+        tk.Label(layout_frame, text="Loaded Layout:").pack(side='left')
+        # Show 'n/a' when no layout is loaded, without changing the underlying value used by logic
+        self.layout_label = tk.Label(layout_frame, text="n/a", font=("Helvetica", 10, "bold"))
+        self.layout_label.pack(side='left', padx=5)
+
+        def _refresh_layout_label(*_):
+            value = self.layout_file.get()
+            if value:
+                layout_name = os.path.basename(value)
+                if len(layout_name) > 35:
+                    layout_name = layout_name[:35] + "..."
+                self.layout_label.config(text=layout_name)
+            else:
+                self.layout_label.config(text="n/a")
+
+        # Update label whenever layout changes
+        try:
+            self.layout_file.trace_add('write', _refresh_layout_label)
+        except Exception:
+            # Fallback for older Tk versions
+            self.layout_file.trace('w', _refresh_layout_label)
+        _refresh_layout_label()
+        
+        # Additional Options button
+        additional_options_button = tk.Button(buttons_right_frame, text="⚙ Additional Options", 
+                                             command=self.open_additional_options)
+        additional_options_button.pack(side='right', padx=5)
+        
+        # Text Log button
+        text_log_button = tk.Button(buttons_right_frame, text="📝 Scan History", 
+                                   command=self.open_text_log)
+        text_log_button.pack(side='right', padx=5)
+        
+        # Set Stop Hotkey button
+        self.stop_hotkey_button = tk.Button(buttons_right_frame, text="Set STOP Hotkey", 
+                                          command=self.set_stop_hotkey)
+        self.stop_hotkey_button.pack(side='right', padx=5)
+        
+        # Set Pause/Play Hotkey button
+        self.pause_hotkey_button = tk.Button(buttons_right_frame, text="Set Pause/Play Hotkey", 
+                                          command=self.set_pause_hotkey)
+        self.pause_hotkey_button.pack(side='right', padx=5)
+        
+        # Status label - centered between pause button and loaded layout name, on same line as Stop Hotkey button
+        self.status_label = tk.Label(buttons_right_frame, text="", 
+                                    font=("Helvetica", 10, "bold"),  # Changed font and size
+                                    fg="black")  # Optional: added color for better visibility
+        
+        def _center_status_label():
+            """Center the status label between the layout name and pause button."""
+            try:
+                # Update the frame to get accurate positions
+                buttons_right_frame.update_idletasks()
+                
+                # Get the right edge of the layout frame
+                layout_right = layout_frame.winfo_x() + layout_frame.winfo_width()
+                
+                # Get the left edge of the pause button
+                pause_left = self.pause_hotkey_button.winfo_x()
+                
+                # Calculate center position
+                center_x = (layout_right + pause_left) / 2
+                
+                # Position the status label at the center
+                self.status_label.place(x=center_x, rely=0.5, anchor='center')
+            except Exception:
+                # Fallback to relative positioning if calculation fails
+                self.status_label.place(relx=0.4, rely=0.5, anchor='center')
+        
+        # Center the label after initial render and on window updates
+        buttons_right_frame.after_idle(_center_status_label)
+        buttons_right_frame.bind('<Configure>', lambda e: _center_status_label())
+        
+        # Separator line above Auto Read Area
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=10, pady=(2, 2))
+        
+        # Line 4: Auto Read Area controls
+        auto_read_controls_frame = tk.Frame(self.root)
+        auto_read_controls_frame.pack(fill='x', padx=10, pady=5)
+        
+        # Add Auto Read Area button
+        add_auto_read_button = tk.Button(auto_read_controls_frame, text="➕ Auto Read Area", 
+                                        command=self.add_auto_read_area,
+                                        font=("Helvetica", 10))
+        add_auto_read_button.pack(side='left')
+        
+        # Stop Read on new Select checkbox (after Add button, Save button removed)
+        self.interrupt_on_new_scan_var = tk.BooleanVar(value=True)
+        stop_read_checkbox = tk.Checkbutton(auto_read_controls_frame, text="Stop read on new selection", 
+                                            variable=self.interrupt_on_new_scan_var)
+        stop_read_checkbox.pack(side='left', padx=(10, 0))
+        
+        # Line 5: Container for the Auto Read row - now with scrollable canvas
+        self.auto_read_outer_frame = tk.Frame(self.root)
+        self.auto_read_outer_frame.pack(fill='x', padx=10, pady=(4, 2))
+        
+        self.auto_read_canvas = tk.Canvas(self.auto_read_outer_frame, highlightthickness=0)
+        self.auto_read_canvas.pack(side='left', fill='both', expand=True)
+        self.auto_read_scrollbar = tk.Scrollbar(self.auto_read_outer_frame, orient='vertical', command=self.auto_read_canvas.yview)
+        self.auto_read_scrollbar.pack(side='right', fill='y')
+        
+        # Enable mouse wheel scrolling for the Auto Read canvas only when mouse is over it
+        def _on_auto_read_mousewheel(event):
+            if self.auto_read_canvas.bbox('all') and self.auto_read_canvas.winfo_height() < (self.auto_read_canvas.bbox('all')[3] - self.auto_read_canvas.bbox('all')[1]):
+                self.auto_read_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+            return "break"
+        def _bind_auto_read_mousewheel(event):
+            self.auto_read_canvas.bind_all('<MouseWheel>', _on_auto_read_mousewheel)
+        def _unbind_auto_read_mousewheel(event):
+            self.auto_read_canvas.unbind_all('<MouseWheel>')
+        self.auto_read_canvas.bind('<Enter>', _bind_auto_read_mousewheel)
+        self.auto_read_canvas.bind('<Leave>', _unbind_auto_read_mousewheel)
+        
+        # Create a frame inside the canvas for Auto Read area frames
+        self.auto_read_frame = tk.Frame(self.auto_read_canvas)
+        self.auto_read_window = self.auto_read_canvas.create_window((0, 0), window=self.auto_read_frame, anchor='nw')
+        self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
+        
+        # Bind resizing for Auto Read canvas
+        def on_auto_read_frame_configure(event):
+            self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
+            # Center the inner frame by setting its width to the canvas width
+            canvas_width = self.auto_read_canvas.winfo_width()
+            if canvas_width > 1:  # Only update if canvas has been rendered
+                self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+        self.auto_read_frame.bind('<Configure>', on_auto_read_frame_configure)
+        self.auto_read_canvas.bind('<Configure>', on_auto_read_frame_configure)
+        
+        # Only show scrollbar if needed (handled in resize_window)
+        self.auto_read_scrollbar.pack_forget()
+
+        # Line 6: Thin separator line under Auto Read
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=10, pady=(2, 2))
+        
+        # Line 7: Regular read areas section
+        # Add Read Area button
+        add_area_frame = tk.Frame(self.root)
+        add_area_frame.pack(fill='x', padx=10, pady=5)
+        
+        # + Read Area button is now hidden
+        # add_area_button = tk.Button(add_area_frame, text="➕ Read Area", 
+        #                           command=self.add_read_area,
+        #                           font=("Helvetica", 10))
+        # add_area_button.pack(side='left')
+        
+        # Edit/Add Areas button
+        edit_areas_button = tk.Button(add_area_frame, text="➕ Add / Edit Areas", 
+                                     command=self.edit_areas,
+                                     font=("Helvetica", 10))
+        edit_areas_button.pack(side='left', padx=(10, 0))
+        
+        # Automations button
+        automations_button = tk.Button(add_area_frame, text="⚙️ Automations", 
+                                      command=self.open_automations_window,
+                                      font=("Helvetica", 10))
+        automations_button.pack(side='left', padx=(10, 0))
+        
+        # Screenshot background checkbox (for area editor)
+        self.screenshot_bg_var = tk.BooleanVar(value=False)
+        
+        def on_screenshot_bg_change():
+            """Save screenshot background setting when checkbox is toggled"""
+            try:
+                import tempfile, json
+                game_reader_dir = APP_DOCUMENTS_DIR
+                os.makedirs(game_reader_dir, exist_ok=True)
+                temp_path = APP_SETTINGS_PATH
+                
+                # Load existing settings or create new ones
+                settings = {}
+                if os.path.exists(temp_path):
+                    try:
+                        with open(temp_path, 'r', encoding='utf-8') as f:
+                            settings = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                        print(f"Error loading settings: {e}")
+                        settings = {}
+                
+                # Update the setting
+                settings['edit_area_screenshot_bg'] = self.screenshot_bg_var.get()
+                # Update instance variable to keep in sync
+                self.edit_area_screenshot_bg = self.screenshot_bg_var.get()
+                
+                # Save the updated settings
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, indent=4)
+            except Exception as e:
+                print(f"Error saving screenshot background setting: {e}")
+        
+        screenshot_bg_checkbox = tk.Checkbutton(
+            add_area_frame,
+            text="Freeze screen when editor opens",
+            variable=self.screenshot_bg_var,
+            command=on_screenshot_bg_change,
+            font=("Helvetica", 9)
+        )
+        screenshot_bg_checkbox.pack(side='left', padx=10)
+        
+        # Frame for the areas - now with scrollable canvas
+        self.area_outer_frame = tk.Frame(self.root)
+        self.area_outer_frame.pack(fill='both', expand=True, pady=5)
+
+        self.area_canvas = tk.Canvas(self.area_outer_frame, highlightthickness=0)
+        self.area_canvas.pack(side='left', fill='both', expand=True)
+        self.area_scrollbar = tk.Scrollbar(self.area_outer_frame, orient='vertical', command=self.area_canvas.yview)
+        self.area_scrollbar.pack(side='right', fill='y')
+
+        # Enable mouse wheel scrolling for the canvas only when mouse is over it
+        def _on_mousewheel(event):
+            if self.area_canvas.bbox('all') and self.area_canvas.winfo_height() < (self.area_canvas.bbox('all')[3] - self.area_canvas.bbox('all')[1]):
+                self.area_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+            return "break"
+        def _bind_mousewheel(event):
+            self.area_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        def _unbind_mousewheel(event):
+            self.area_canvas.unbind_all('<MouseWheel>')
+        self.area_canvas.bind('<Enter>', _bind_mousewheel)
+        self.area_canvas.bind('<Leave>', _unbind_mousewheel)
+        # If you want to support Linux (Button-4/5), add similar binds for those events.
+        
+        # Create a frame inside the canvas for area frames
+        self.area_frame = tk.Frame(self.area_canvas)
+        self.area_window = self.area_canvas.create_window((0, 0), window=self.area_frame, anchor='nw')
+        self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
+        
+        # Bind resizing
+        def on_frame_configure(event):
+            self.area_canvas.configure(scrollregion=self.area_canvas.bbox('all'))
+            # Center the inner frame by setting its width to the canvas width
+            canvas_width = self.area_canvas.winfo_width()
+            self.area_canvas.itemconfig(self.area_window, width=canvas_width)
+        self.area_frame.bind('<Configure>', on_frame_configure)
+        self.area_canvas.bind('<Configure>', on_frame_configure)
+        
+        # Only show scrollbar if needed (handled in resize_window)
+        self.area_scrollbar.pack_forget()
+        
+        # Separator line under the canvas for Read area
+        self.area_separator = ttk.Separator(self.root, orient='horizontal')
+        self.area_separator.pack(fill='x', padx=10, pady=(2, 15))
+        
+        # Bind click event to root to remove focus from entry fields
+        self.root.bind("<Button-1>", self.remove_focus)
+        
+        # Bind window resize event to ensure buttons stay visible
+        def on_window_configure(event):
+            # Only check position if this is a size change (not just a move)
+            if event.widget == self.root:
+                # Use after to debounce rapid resize events
+                if hasattr(self, '_position_check_job'):
+                    self.root.after_cancel(self._position_check_job)
+                self._position_check_job = self.root.after(100, self._ensure_window_position)
+        self.root.bind("<Configure>", on_window_configure)
+        
+
+        
+        print("GUI setup complete.")
+        
+        # Check Tesseract installation and update status label if not installed
+        tesseract_installed, tesseract_message = self.check_tesseract_installed()
+        if not tesseract_installed:
+            self.status_label.config(
+                text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                fg="red",
+                font=("Helvetica", 10, "bold")
+            )
+        
+
+
+    def create_checkbox(self, parent, text, variable, side='top', padx=0, pady=2):
+        """Helper method to create consistent checkboxes"""
+        frame = tk.Frame(parent)
+        frame.pack(side=side, padx=padx, pady=pady)
+        
+        checkbox = tk.Checkbutton(frame, variable=variable)
+        checkbox.pack(side='right')
+        
+        label = tk.Label(frame, text=text)
+        label.pack(side='right')
+
+    def open_additional_options(self):
+        """Open a window with additional checkbox options and descriptions"""
+        # Check if window already exists and is still valid
+        if self.additional_options_window is not None:
+            try:
+                # Check if window still exists
+                if self.additional_options_window.winfo_exists():
+                    # Window exists, bring it to front
+                    self.additional_options_window.lift()
+                    self.additional_options_window.focus()
+                    return
+            except tk.TclError:
+                # Window was destroyed, clear reference
+                self.additional_options_window = None
+        
+        # Create new window
+        options_window = tk.Toplevel(self.root)
+        options_window.title("Additional Options")
+        options_window.geometry("580x520")
+        options_window.resizable(True, True)
+        
+        # Store reference to the window
+        self.additional_options_window = options_window
+        
+        # Store original values to detect actual changes
+        original_bad_word_list = self.bad_word_list.get().strip()
+        
+        # Set the window icon
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                options_window.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting additional options window icon: {e}")
+        
+        # Create main frame for the options
+        main_frame = tk.Frame(options_window)
+        main_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Ignored Word List section (at the top - fixed, not scrollable)
+        ignored_words_label = tk.Label(
+            main_frame,
+            text="Ignored Word List:",
+            font=("Helvetica", 10, "bold")
+        )
+        ignored_words_label.pack(anchor='w', pady=(0, 5))
+        
+        # Description for ignored words
+        ignored_words_desc = tk.Label(
+            main_frame,
+            text="Enter words or phrases to ignore (comma-separated). These will be filtered out from the text before reading.",
+            wraplength=500,
+            justify='left',
+            font=("Helvetica", 9),
+            fg="#555555"
+        )
+        ignored_words_desc.pack(anchor='w', padx=(0, 0), pady=(0, 5))
+        
+        # Text widget for ignored words (multi-line field)
+        ignored_words_frame = tk.Frame(main_frame)
+        ignored_words_frame.pack(fill='both', expand=False, pady=(0, 10))
+        
+        # Add scrollbar for the text widget
+        ignored_words_scrollbar = tk.Scrollbar(ignored_words_frame)
+        ignored_words_scrollbar.pack(side='right', fill='y')
+        
+        ignored_words_text = tk.Text(
+            ignored_words_frame,
+            height=3,
+            wrap=tk.WORD,
+            font=("Helvetica", 9),
+            yscrollcommand=ignored_words_scrollbar.set
+        )
+        ignored_words_text.pack(side='left', fill='both', expand=True)
+        
+        # Configure scrollbar to control text widget
+        ignored_words_scrollbar.config(command=ignored_words_text.yview)
+        
+        # Example placeholder text
+        example_text = "Example: word1, word2, phrase with spaces, hi"
+        
+        # Load current value from StringVar or show example
+        current_value = self.bad_word_list.get().strip()
+        if current_value:
+            ignored_words_text.insert('1.0', current_value)
+            ignored_words_text.config(fg="black")
+        else:
+            ignored_words_text.insert('1.0', example_text)
+            ignored_words_text.config(fg="gray")
+        
+        # Function to handle focus in - clear example if it's the placeholder
+        def on_focus_in(event):
+            content = ignored_words_text.get('1.0', tk.END).strip()
+            if content == example_text:
+                ignored_words_text.delete('1.0', tk.END)
+                ignored_words_text.config(fg="black")
+        
+        # Function to handle focus out - show example if empty, sync otherwise
+        def on_focus_out(event):
+            content = ignored_words_text.get('1.0', tk.END).strip()
+            if not content:
+                ignored_words_text.insert('1.0', example_text)
+                ignored_words_text.config(fg="gray")
+            else:
+                sync_ignored_words()
+        
+        # Function to sync Text widget with StringVar
+        def sync_ignored_words():
+            content = ignored_words_text.get('1.0', tk.END).strip()
+            # Don't save the example text
+            if content != example_text:
+                # Only mark as unsaved if the value actually changed
+                if content != original_bad_word_list:
+                    self.bad_word_list.set(content)
+                    self._set_unsaved_changes('additional_options')
+                else:
+                    # Value didn't change, just sync it without marking as unsaved
+                    self.bad_word_list.set(content)
+        
+        # Function to handle key release
+        def on_key_release(event):
+            content = ignored_words_text.get('1.0', tk.END).strip()
+            if content == example_text:
+                ignored_words_text.delete('1.0', tk.END)
+                ignored_words_text.config(fg="black")
+            else:
+                sync_ignored_words()
+        
+        # Bind events
+        ignored_words_text.bind('<FocusIn>', on_focus_in)
+        ignored_words_text.bind('<FocusOut>', on_focus_out)
+        ignored_words_text.bind('<KeyRelease>', on_key_release)
+        
+        # Create scrollable frame for checkboxes only
+        # Create a container frame for the scrollable area
+        scroll_container = tk.Frame(main_frame)
+        scroll_container.pack(fill='both', expand=True, pady=(10, 0))
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(scroll_container)
+        scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas)
+        
+        # Configure scrollable frame
+        def configure_scroll_region(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        scrollable_frame.bind("<Configure>", configure_scroll_region)
+        
+        # Create window in canvas for scrollable frame
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Update canvas window width when canvas is resized
+        def on_canvas_configure(event):
+            canvas_width = event.width
+            canvas.itemconfig(canvas_window, width=canvas_width)
+        
+        canvas.bind("<Configure>", on_canvas_configure)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bind mousewheel for scrolling - use bind_all to catch events anywhere
+        def on_mousewheel(event):
+            # Check if the widget that received the event is within the canvas area
+            # by checking if it's the canvas, scrollable_frame, or any child widget
+            widget = event.widget
+            try:
+                # Walk up the widget hierarchy to see if we're in the canvas area
+                current = widget
+                while current:
+                    if current == canvas or current == scrollable_frame or current == scroll_container:
+                        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                        return
+                    try:
+                        current = current.master
+                    except:
+                        break
+                
+                # Also check by coordinates as fallback
+                try:
+                    canvas_x = canvas.winfo_rootx()
+                    canvas_y = canvas.winfo_rooty()
+                    canvas_width = canvas.winfo_width()
+                    canvas_height = canvas.winfo_height()
+                    
+                    if (canvas_width > 0 and canvas_height > 0 and
+                        canvas_x <= event.x_root <= canvas_x + canvas_width and
+                        canvas_y <= event.y_root <= canvas_y + canvas_height):
+                        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                except:
+                    pass
+            except:
+                pass
+        
+        # Bind to the options window so it catches mousewheel events when hovering over canvas area
+        options_window.bind_all("<MouseWheel>", on_mousewheel)
+        
+        # Define checkbox options with descriptions
+        checkbox_options = [
+            {
+                "var": self.ignore_usernames_var,
+                "label": "Ignore usernames *EXPERIMENTAL*:",
+                "description": "This option filters out usernames from the text before reading. It looks for patterns like \"Username:\" at the start of lines."
+            },
+            {
+                "var": self.ignore_previous_var,
+                "label": "Ignore previous spoken words:",
+                "description": "This prevents the same text from being read multiple times. Useful for chat windows where messages might persist."
+            },
+            {
+                "var": self.ignore_gibberish_var,
+                "label": "Ignore gibberish *EXPERIMENTAL*:",
+                "description": "Advanced filter that detects and removes gibberish text using multiple heuristics:\n• Repeated character patterns (e.g., 'aaaa', 'xxxx')\n• Alternating patterns (e.g., 'ababab')\n• Excessive consecutive consonants\n• Unrealistic vowel/consonant ratios\n• Random character sequences\nHelps prevent reading of rendered artifacts, OCR errors, and non-meaningful text while preserving valid words."
+            },
+            {
+                "var": self.better_unit_detection_var,
+                "label": "Better unit detection:",
+                "description": "Enhances the detection and recognition of measurement units (like kg, m, km, etc.) in the text. Improves accuracy for technical or game-related content."
+            },
+            {
+                "var": self.read_game_units_var,
+                "label": "Read gamer units:",
+                "description": "Enables reading of custom game-specific units. Use the Edit button to configure which units should be recognized and how they should be spoken."
+            },
+            {
+                "var": self.fullscreen_mode_var,
+                "label": "Fullscreen mode *EXPERIMENTAL*:",
+                "description": "NOTE: Might work better with Freeze Screen enabled.\n Feature for capturing text from fullscreen applications. May cause brief screen flicker during capture for the program to take an updated screenshot."
+            },
+            {
+                "var": self.process_freeze_screen_var,
+                "label": "Apply image processing to freeze screen:",
+                "description": "When enabled, image processing settings from Auto Read will be applied to the frozen screenshot before reading. This allows you to use the same image enhancements on the captured freeze screen."
+            },
+            {
+                "var": self.allow_mouse_buttons_var,
+                "label": "Allow mouse left/right as a hotkey:",
+                "description": "Enables the use of left and right mouse buttons as hotkeys for triggering read actions. Provides additional input options beyond keyboard shortcuts."
+            }
+        ]
+        
+        # Store original checkbox values in each option dictionary
+        for option in checkbox_options:
+            option["original_value"] = option["var"].get()
+        
+        # Store trace callback IDs so we can manage them
+        trace_callbacks = []
+        
+        # Create checkboxes with descriptions
+        for i, option in enumerate(checkbox_options):
+            # Create frame for each checkbox option
+            option_frame = tk.Frame(scrollable_frame)
+            option_frame.pack(fill='x', pady=1)
+            
+            # Create a frame for checkbox and Edit button (if needed) to be side by side
+            checkbox_row_frame = tk.Frame(option_frame)
+            checkbox_row_frame.pack(fill='x', anchor='w')
+            
+            # Create checkbox
+            checkbox = tk.Checkbutton(checkbox_row_frame, variable=option["var"], text=option["label"], font=("Helvetica", 10))
+            checkbox.pack(side='left')
+            
+            # Track changes to mark as unsaved only if value actually changed
+            def make_trace_callback(var, original_val):
+                def trace_callback(*args):
+                    # Only mark as unsaved if the value actually changed from the original
+                    if var.get() != original_val:
+                        self._set_unsaved_changes('additional_options')
+                return trace_callback
+            
+            # Store the trace callback ID
+            trace_id = option["var"].trace('w', make_trace_callback(option["var"], option["original_value"]))
+            trace_callbacks.append((option["var"], trace_id))
+            
+            # Add Edit button for "Read gamer units" option next to the checkbox
+            if option["var"] == self.read_game_units_var:
+                edit_button = tk.Button(
+                    checkbox_row_frame,
+                    text="Edit",
+                    command=self.open_game_units_editor,
+                    width=6
+                )
+                edit_button.pack(side='left', padx=(10, 0))
+            
+            # Create description label
+            desc_label = tk.Label(
+                option_frame,
+                text=option["description"],
+                wraplength=500,
+                justify='left',
+                font=("Helvetica", 10),
+                fg="#555555"
+            )
+            desc_label.pack(anchor='w', padx=(20, 0), pady=(1, 0))
+            
+            # Add separator line between options (except after the last one)
+            if i < len(checkbox_options) - 1:
+                option_separator = tk.Frame(scrollable_frame, height=1, bg="#cccccc")
+                option_separator.pack(fill='x', pady=(5, 5))
+        
+        # Bind mousewheel to all widgets in scrollable frame after checkboxes are created
+        def bind_mousewheel_recursive(widget):
+            try:
+                widget.bind("<MouseWheel>", on_mousewheel)
+                for child in widget.winfo_children():
+                    bind_mousewheel_recursive(child)
+            except:
+                pass
+        
+        bind_mousewheel_recursive(scrollable_frame)
+        
+        # Add close button at the bottom
+        def on_close():
+            # Make sure we don't save the example text
+            content = ignored_words_text.get('1.0', tk.END).strip()
+            if content != example_text:
+                sync_ignored_words()
+            
+            # Clean up trace callbacks
+            for var, trace_id in trace_callbacks:
+                try:
+                    var.trace_vdelete('w', trace_id)
+                except (tk.TclError, AttributeError, Exception):
+                    # Trace may already be deleted or variable doesn't exist
+                    pass
+            
+            # Clear the reference when window is closed
+            self.additional_options_window = None
+            options_window.destroy()
+        
+        # Set up protocol handler to clear reference when window is closed
+        options_window.protocol("WM_DELETE_WINDOW", on_close)
+        
+        # Update canvas scroll region after all widgets are added
+        canvas.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        # Save button directly under the scroll frame
+        close_button = tk.Button(
+            main_frame,
+            text="Save",
+            command=on_close,
+            width=15
+        )
+        close_button.pack(pady=(10, 0))
+
+    def open_text_log(self):
+        """Open the Scan History window showing last 20 converted texts"""
+        # Check if window already exists and is still valid
+        if self.text_log_window is not None:
+            try:
+                # Check if window still exists
+                if self.text_log_window.window.winfo_exists():
+                    # Window exists, bring it to front and refresh
+                    self.text_log_window.window.lift()
+                    self.text_log_window.window.focus()
+                    self.text_log_window.update_display()
+                    return
+            except tk.TclError:
+                # Window was destroyed, clear reference
+                self.text_log_window = None
+        
+        # Create new window
+        self.text_log_window = TextLogWindow(self.root, self)
+
+    def set_volume(self):
+        """Helper method to set volume"""
+        try:
+            vol = int(self.volume.get())
+            if 0 <= vol <= 100:
+                self.speaker.Volume = vol
+                print(f"Program volume set to {vol}%\n--------------------------")
+            else:
+                self.volume.set("100")
+                self.speaker.Volume = 100
+                print("Volume out of range, set to 100")
+        except ValueError:
+            self.volume.set("100")
+            self.speaker.Volume = 100
+            print("Invalid volume value, set to 100")
+
+    def remove_focus(self, event):
+        widget = event.widget
+        if not isinstance(widget, tk.Entry):
+            self.root.focus()
+    
+    def show_info(self):
+        # Create Tkinter window with a modern look
+        info_window = tk.Toplevel(self.root)
+        info_window.title(f"{APP_NAME} - Information")
+        info_window.geometry("810x600")  # Slightly taller for better spacing
+
+        # --- Set flag to prevent hotkeys from interfering with info window ---
+        self.info_window_open = True
+        
+        # On close, clear the flag
+        def on_info_close():
+            self.info_window_open = False
+            info_window.destroy()
+
+        info_window.protocol("WM_DELETE_WINDOW", on_info_close)
+        info_window.bind('<Escape>', lambda e: on_info_close())
+        
+        # Set window icon if available
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                info_window.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting info window icon: {e}")
+        
+        # Main container with reduced padding
+        main_frame = ttk.Frame(info_window, padding="15 10 15 5")
+        main_frame.pack(fill='both', expand=True)
+        
+        # Top-left title label (no surrounding frame to avoid covering banners)
+        title_label = ttk.Label(
+            main_frame,
+            text=f"{APP_NAME} v{APP_VERSION}",
+            font=("Helvetica", 16, "bold")
+        )
+        title_label.pack(anchor='w', pady=(0, 10))
+        
+        # Icon will be added near the banners (not within the title)
+        
+        # Main content area - single column layout (more free-form)
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        # Banner data will be stored and banners created later when banners_frame is ready
+        
+        # Calculate wraplength for text - now we have more space since banners are above scroll window
+        text_wraplength = 800  # More space available without right column
+
+        # Resolve Assets paths
+        assets_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets')
+        assets_dir = os.path.abspath(assets_dir)  # Normalize the path
+        coffee_path = os.path.join(assets_dir, 'Coffe_info.png')
+        google_form_path = os.path.join(assets_dir, 'Google_form_info.png')
+        github_path = os.path.join(assets_dir, 'Github_info.png')
+
+        # Load images and keep references on the window to avoid garbage collection
+        try:
+            coffee_img = Image.open(coffee_path)
+            google_img = Image.open(google_form_path)
+            github_img = Image.open(github_path)
+
+            # Store PIL images
+            info_window.coffee_pil = coffee_img
+            info_window.google_pil = google_img
+            info_window.github_pil = github_img
+
+            # Calculate scale for images in a column - set to 0.75 size
+            info_window.update_idletasks()
+            hover_scale = 1.08
+            base_scale = 0.78  # Images at 75% of original size
+
+            # Create normal and hover-sized images with scaling applied
+            def make_photos(pil_img):
+                w, h = pil_img.size
+                w_norm = max(1, int(w * base_scale))
+                h_norm = max(1, int(h * base_scale))
+                w_hover = max(1, int(w * base_scale * hover_scale))
+                h_hover = max(1, int(h * base_scale * hover_scale))
+                normal = ImageTk.PhotoImage(pil_img.resize((w_norm, h_norm), Image.LANCZOS))
+                hover = ImageTk.PhotoImage(pil_img.resize((w_hover, h_hover), Image.LANCZOS))
+                return normal, hover
+
+            info_window.coffee_photo, info_window.coffee_photo_hover = make_photos(info_window.coffee_pil)
+            info_window.google_photo, info_window.google_photo_hover = make_photos(info_window.google_pil)
+            info_window.github_photo, info_window.github_photo_hover = make_photos(info_window.github_pil)
+
+            # Smooth animations for hover effects
+            def _cancel_anim(c):
+                if hasattr(c, "_anim_job") and c._anim_job:
+                    try:
+                        c.after_cancel(c._anim_job)
+                    except Exception:
+                        pass
+                    c._anim_job = None
+
+            def animate_to_hover(canvas, image_id, pil_img):
+                duration_ms = 100
+                steps = 12
+                _cancel_anim(canvas)
+                frames = []
+
+                def step(i):
+                    t = i / steps
+                    scale = base_scale + (base_scale * hover_scale - base_scale) * t
+                    w = max(1, int(pil_img.size[0] * scale))
+                    h = max(1, int(pil_img.size[1] * scale))
+                    frame = ImageTk.PhotoImage(pil_img.resize((w, h), Image.LANCZOS))
+                    frames.append(frame)
+                    canvas.itemconfig(image_id, image=frame)
+                    if i < steps:
+                        canvas._anim_job = canvas.after(int(duration_ms / steps), lambda: step(i + 1))
+                    else:
+                        canvas._anim_job = None
+                        canvas._anim_frames = frames  # keep refs
+
+                step(0)
+
+            def animate_to_normal(canvas, image_id, pil_img):
+                duration_ms = 230
+                steps = 15
+                _cancel_anim(canvas)
+                frames = []
+
+                def step(i):
+                    t = i / steps
+                    scale = (base_scale * hover_scale) + (base_scale - base_scale * hover_scale) * t
+                    w = max(1, int(pil_img.size[0] * scale))
+                    h = max(1, int(pil_img.size[1] * scale))
+                    frame = ImageTk.PhotoImage(pil_img.resize((w, h), Image.LANCZOS))
+                    frames.append(frame)
+                    canvas.itemconfig(image_id, image=frame)
+                    if i < steps:
+                        canvas._anim_job = canvas.after(int(duration_ms / steps), lambda: step(i + 1))
+                    else:
+                        canvas._anim_job = None
+                        canvas._anim_frames = frames  # keep refs
+
+                step(0)
+            
+            # Store animation functions for later use when creating banners
+            info_window._animate_to_hover = animate_to_hover
+            info_window._animate_to_normal = animate_to_normal
+            info_window._cancel_anim = _cancel_anim
+
+
+
+            # Store banner creation data for later (banners_frame will be created above changelog)
+            info_window._coffee_data = {
+                'cw': info_window.coffee_photo_hover.width(),
+                'ch': info_window.coffee_photo_hover.height(),
+                'photo': info_window.coffee_photo,
+                'photo_hover': info_window.coffee_photo_hover,
+                'pil': info_window.coffee_pil
+            }
+            
+            # Store banner creation data for later
+            info_window._google_data = {
+                'cw': info_window.google_photo_hover.width(),
+                'ch': info_window.google_photo_hover.height(),
+                'photo': info_window.google_photo,
+                'photo_hover': info_window.google_photo_hover,
+                'pil': info_window.google_pil
+            }
+
+            # Store banner creation data for later
+            info_window._github_data = {
+                'cw': info_window.github_photo_hover.width(),
+                'ch': info_window.github_photo_hover.height(),
+                'photo': info_window.github_photo,
+                'photo_hover': info_window.github_photo_hover,
+                'pil': info_window.github_pil
+            }
+            
+            # Store base_scale and hover_scale for banner creation function
+            info_window._base_scale = base_scale
+            info_window._hover_scale = hover_scale
+            
+            # Program icon and button - positioned next to title
+            def on_how_to_use():
+                self.show_how_to_use()
+            
+            # Program icon with hover animation - positioned to the right of title label
+            # Icon size - adjust this value to scale the icon (default: 64)
+            icon_size = 75  # Change this value to make the icon larger or smaller
+            icon_hover_scale = 1.08  # Scale factor when hovering (same as banners)
+            
+            icon_path = os.path.join(assets_dir, 'icon.ico')
+            if os.path.exists(icon_path):
+                try:
+                    # Load icon image
+                    icon_img = Image.open(icon_path)
+                    info_window.icon_pil = icon_img  # Store PIL image for animation
+                    
+                    # Create normal and hover-sized images
+                    icon_img_normal = icon_img.copy()
+                    icon_img_normal.thumbnail((icon_size, icon_size), Image.LANCZOS)
+                    icon_normal_photo = ImageTk.PhotoImage(icon_img_normal)
+                    
+                    icon_img_hover = icon_img.copy()
+                    hover_size = int(icon_size * icon_hover_scale)
+                    icon_img_hover.thumbnail((hover_size, hover_size), Image.LANCZOS)
+                    icon_hover_photo = ImageTk.PhotoImage(icon_img_hover)
+                    
+                    # Store photos on window to prevent garbage collection
+                    info_window.icon_photo = icon_normal_photo
+                    info_window.icon_photo_hover = icon_hover_photo
+                    
+                    # Store icon data for later creation (will be created in right_side_frame)
+                    info_window._icon_data = {
+                        'cw': icon_hover_photo.width(),
+                        'ch': icon_hover_photo.height(),
+                        'photo': icon_normal_photo,
+                        'photo_hover': icon_hover_photo,
+                        'pil': icon_img,
+                        'size': icon_size,
+                        'hover_scale': icon_hover_scale
+                    }
+                    
+                except Exception as e:
+                    print(f"Error loading program icon: {e}")
+            
+            # How to use button will be created later in right_side_frame (below icon)
+            
+        except Exception as e:
+            # Fallback text if images can't be displayed
+            print(f"Error displaying info images: {e}")
+
+        # Coffee note below the images
+     #   coffee_note = ttk.Label(
+     #       credits_frame,
+     #       text="☕ Note: You don't have to fuel my caffeine addiction… but I wouldn't say no! Every coffee helps me argue with AI until the code finally works. All funds are shared between me and the few helping me bring this project to life.",
+     #       font=("Helvetica", 9, "bold"),
+     #       foreground='#666666',
+     #       wraplength=800,
+     #      justify='center'
+      #  )
+      #  coffee_note.pack(pady=(8, 10), anchor='center')
+
+        
+        # Container for Tesseract Status (left) and Icon/Banners (right)
+        status_container = ttk.Frame(content_frame)
+        status_container.pack(fill='x', pady=(5, 0), padx=(0, 5))
+        
+        # Tesseract Status Indicator (left side)
+        tesseract_status_frame = ttk.Frame(status_container)
+        tesseract_status_frame.pack(side='left', fill='both', expand=True, padx=(0, 0))
+        # Store reference for z-order manipulation
+        info_window.tesseract_status_frame = tesseract_status_frame
+        
+        # Icon/Banners container is attached to the toplevel so it can float above other content
+        icon_and_banners_container = ttk.Frame(info_window)
+        # Position at top-right of the window with a slight upward offset for appearance
+        icon_and_banners_container.place(relx=1.0, x=-15, y=20, anchor='ne')
+        info_window.icon_and_banners_container = icon_and_banners_container
+        icon_and_banners_container.lift()  # ensure it stays on top
+        
+        # Check Tesseract installation status
+        tesseract_installed, tesseract_message = self.check_tesseract_installed()
+        
+        # Status label with appropriate color
+        status_color = 'green' if tesseract_installed else 'red'
+        status_text = "✓ " if tesseract_installed else "✗ "
+        
+        if tesseract_installed:
+            # Simple status when installed - improved layout for narrow width
+            status_row = ttk.Frame(tesseract_status_frame)
+            status_row.pack(anchor='w', pady=(0, 8), fill='x')
+            
+            # Status line
+            status_line = ttk.Frame(status_row)
+            status_line.pack(anchor='w', fill='x')
+            
+            # Black text for main status
+            main_status_label = ttk.Label(
+                status_line,
+                text="Tesseract OCR Status: ",
+                font=("Helvetica", 10, "bold"),
+                foreground='black'
+            )
+            main_status_label.pack(side='left')
+            
+            # Green checkmark
+            checkmark_label = ttk.Label(
+                status_line,
+                text=status_text,
+                font=("Helvetica", 10, "bold"),
+                foreground=status_color
+            )
+            checkmark_label.pack(side='left')
+            
+            # Green text for (Installed)
+            installed_label = ttk.Label(
+                status_line,
+                text="(Installed)",
+                font=("Helvetica", 10, "bold"),
+                foreground='green'
+            )
+            installed_label.pack(side='left')
+            
+            # Add "Locate Tesseract" button on new line if needed
+            locate_button = ttk.Button(
+                status_row,
+                text="Set custom path... ",
+                command=self.locate_tesseract_executable
+            )
+            locate_button.pack(anchor='w', pady=(5, 0))
+        else:
+            # Detailed status when not installed - improved layout for narrow width
+            status_row = ttk.Frame(tesseract_status_frame)
+            status_row.pack(anchor='w', pady=(0, 8), fill='x')
+            
+            # Status line
+            status_line = ttk.Frame(status_row)
+            status_line.pack(anchor='w', fill='x')
+            
+            # Black text for main status
+            main_status_label = ttk.Label(
+                status_line,
+                text="Tesseract OCR Status: ",
+                font=("Helvetica", 10, "bold"),
+                foreground='black'
+            )
+            main_status_label.pack(side='left')
+            
+            # Red X
+            x_label = ttk.Label(
+                status_line,
+                text=status_text,
+                font=("Helvetica", 10, "bold"),
+                foreground=status_color
+            )
+            x_label.pack(side='left')
+            
+            # Required text on new line for better wrapping
+            required_label = ttk.Label(
+                status_row,
+                text=f"(Required for {APP_NAME} to fully function)",
+                font=("Helvetica", 9, "bold"),
+                foreground='red',
+                wraplength=text_wraplength,
+                justify='left'
+            )
+            required_label.pack(anchor='w', pady=(3, 0))
+            
+            # Add "Locate Tesseract" button
+            locate_button_not_installed = ttk.Button(
+                status_row,
+                text="Set custom path...",
+                command=self.locate_tesseract_executable
+            )
+            locate_button_not_installed.pack(anchor='w', pady=(5, 0))
+            
+            # Reason label - wrap text with better formatting
+            reason_label = ttk.Label(
+                tesseract_status_frame,
+                text=f"Reason: {tesseract_message}",
+                font=("Helvetica", 10),
+                foreground='red',
+                wraplength=text_wraplength,
+                justify='left'
+            )
+            reason_label.pack(anchor='w', pady=(0, 8))
+        
+        # Download instruction and clickable URLs - improved formatting for narrow width
+        download_label = ttk.Label(tesseract_status_frame,
+                                   text="Tesseract OCR Download links:",
+                                   font=("Helvetica", 10, "bold"),
+                                   foreground='black',
+                                   wraplength=text_wraplength,
+                                   justify='left')
+        download_label.pack(anchor='w', pady=(0, 5))
+        
+        # Links stacked vertically for better readability in narrow column
+        links_container = ttk.Frame(tesseract_status_frame)
+        links_container.pack(anchor='w', fill='x', pady=(0, 10))
+        
+        # First link to Tesseract releases page
+        releases_frame = ttk.Frame(links_container)
+        releases_frame.pack(anchor='w', pady=(0, 3), fill='x')
+        
+        releases_text = ttk.Label(releases_frame,
+                                   text="Releases page:",
+                                   font=("Helvetica", 9),
+                                   foreground='black')
+        releases_text.pack(side='left')
+        
+        tesseract_link = ttk.Label(releases_frame,
+                                   text="https://github.com/tesseract-ocr/tesseract/releases",
+                                   font=("Helvetica", 9),
+                                   foreground='blue',
+                                   cursor='hand2')
+        tesseract_link.pack(side='left', padx=(5, 0))
+        tesseract_link.bind("<Button-1>", lambda e: open_url("https://github.com/tesseract-ocr/tesseract/releases"))
+        tesseract_link.bind("<Enter>", lambda e: tesseract_link.configure(font=("Helvetica", 9, "underline")))
+        tesseract_link.bind("<Leave>", lambda e: tesseract_link.configure(font=("Helvetica", 9)))
+        
+        # Direct download link for Windows installer
+        installer_frame = ttk.Frame(links_container)
+        installer_frame.pack(anchor='w', pady=(0, 0), fill='x')
+        
+        installer_text = ttk.Label(installer_frame,
+                               text="Direct download link to installer:",
+                               font=("Helvetica", 9),
+                               foreground='black')
+        installer_text.pack(side='left')
+        
+        direct_link = ttk.Label(installer_frame,
+                               text="tesseract-ocr-w64-setup-5.5.0.20241111.exe",
+                               font=("Helvetica", 9),
+                               foreground='blue',
+                               cursor='hand2')
+        direct_link.pack(side='left', padx=(5, 0))
+        direct_link.bind("<Button-1>", lambda e: open_url("https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe"))
+        direct_link.bind("<Enter>", lambda e: direct_link.configure(font=("Helvetica", 9, "underline")))
+        direct_link.bind("<Leave>", lambda e: direct_link.configure(font=("Helvetica", 9)))
+        
+        # Add NaturalVoiceSAPIAdapter information with reduced spacing
+        
+        # NaturalVoiceSAPIAdapter section - improved formatting
+        natural_voice_frame = ttk.Frame(tesseract_status_frame)
+        natural_voice_frame.pack(anchor='w', pady=(20, 0))
+        
+        natural_voice_title = ttk.Label(
+            natural_voice_frame,
+            text="More Voice Options:",
+            font=("Helvetica", 11, "bold"),
+            foreground='black',
+            wraplength=text_wraplength,
+            justify='left'
+        )
+        natural_voice_title.pack(anchor='w', pady=(0, 5))
+        
+        natural_voice_label = ttk.Label(
+            natural_voice_frame,
+            text="NaturalVoiceSAPIAdapter by gexgd0419",
+            font=("Helvetica", 9),
+            foreground='black',
+            wraplength=text_wraplength,
+            justify='left'
+        )
+        natural_voice_label.pack(anchor='w', pady=(0, 5))
+        
+        # Download text and link - on the same line
+        download_frame = ttk.Frame(natural_voice_frame)
+        download_frame.pack(anchor='w', pady=(0, 5), fill='x')
+        
+        download_text_label = ttk.Label(
+            download_frame,
+            text="Download can be found here:",
+            font=("Helvetica", 9),
+            foreground='black'
+        )
+        download_text_label.pack(side='left')
+        
+        natural_voice_link = ttk.Label(
+            download_frame,
+            text="https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases",
+            font=("Helvetica", 9),
+            foreground='blue',
+            cursor='hand2'
+        )
+        natural_voice_link.pack(side='left', padx=(5, 0))
+        natural_voice_link.bind("<Button-1>", lambda e: open_url("https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases"))
+        natural_voice_link.bind("<Enter>", lambda e: natural_voice_link.configure(font=("Helvetica", 9, "underline")))
+        natural_voice_link.bind("<Leave>", lambda e: natural_voice_link.configure(font=("Helvetica", 9)))
+        
+        natural_voice_note = ttk.Label(
+            natural_voice_frame,
+            text="Note! Online voices may take a moment to load when first activated.",
+            font=("Helvetica", 9),
+            foreground='black',
+            wraplength=text_wraplength,
+            justify='left'
+        )
+        natural_voice_note.pack(anchor='w', pady=(0, 0))
+        
+        # "News / Updates:" section (moved into tesseract_status_frame to start higher, alongside banners)
+        update_section_frame = ttk.Frame(tesseract_status_frame)
+        update_section_frame.pack(anchor='w', pady=(5, 0), fill='x')
+        # Don't lift tesseract_status_frame - it would hide the banner container
+        # The banner container should be visible above the text
+        
+        # Title - will be updated when changelog is displayed
+        update_title = ttk.Label(
+            update_section_frame,
+            text="News / Updates:",
+            font=("Helvetica", 11, "bold"),
+            foreground='black',
+            wraplength=text_wraplength,
+            justify='left'
+        )
+        # Add extra top spacing from the note above
+        update_title.pack(anchor='w', pady=(40, 10))
+        
+        # Share checkboxes and Check for Updates button
+        update_controls_frame = ttk.Frame(update_section_frame)
+        update_controls_frame.pack(anchor='w', fill='x', pady=(0, 10))
+        
+        # Check for Updates button - moved before Share checkboxes
+        def on_check_updates():
+            local_version = APP_VERSION
+            # Use force=True to always show result (even if no update, or on error)
+            # Store update_title reference on changelog_text_widget for access in callback
+            changelog_text_widget._update_title = update_title
+            threading.Thread(target=lambda: self.check_and_save_update(local_version, changelog_text_widget), daemon=True).start()
+        
+        check_updates_button = ttk.Button(update_controls_frame, 
+                                         text="Check for Updates",
+                                         command=on_check_updates)
+        check_updates_button.pack(side='left', padx=(0, 10))
+        
+        # Download button (will be shown/hidden based on update availability)
+        def open_download_url():
+            import webbrowser
+            import sys
+            from ..constants import GITHUB_REPO
+            # Always use GITHUB_REPO for download URL, ignore download_url from Google Script
+            url = f'https://github.com/{GITHUB_REPO}/releases'
+            webbrowser.open(url)
+        
+        download_button = ttk.Button(update_controls_frame,
+                                     text="Open Download page",
+                                     command=open_download_url)
+        
+        # Notification label to show update check status
+        status_label = ttk.Label(update_controls_frame,
+                                 text="",
+                                 foreground="gray")
+        # Pack status label first to establish its position
+        status_label.pack(side='left', padx=(10, 0))
+        
+        # Pack download button before status label, then hide it
+        # This establishes the correct order: Check -> Download -> Status
+        download_button.pack(side='left', padx=(0, 10), before=status_label)
+        download_button.pack_forget()  # Initially hidden, will be shown when update is available
+        
+        # Auto-check for updates checkbox (on a new line below the buttons)
+        auto_check_frame = ttk.Frame(update_section_frame)
+        auto_check_frame.pack(anchor='w', fill='x', pady=(0, 10))
+        
+        auto_check_var = tk.BooleanVar()
+        # Load saved setting
+        auto_check_enabled = self.load_auto_check_updates_setting()
+        auto_check_var.set(auto_check_enabled)
+        
+        def on_auto_check_toggle():
+            """Save the auto-check setting when checkbox is toggled."""
+            self.save_auto_check_updates_setting(auto_check_var.get())
+        
+        auto_check_checkbox = ttk.Checkbutton(
+            auto_check_frame,
+            text="Automatically check for updates when the program starts",
+            variable=auto_check_var,
+            command=on_auto_check_toggle
+        )
+        auto_check_checkbox.pack(side='left')
+        
+        # Right side frame for icon, button, and banners (icon_and_banners_container was moved to status_container above)
+        right_side_frame = ttk.Frame(icon_and_banners_container)
+        right_side_frame.pack(side='top', fill='y')
+        
+        # Create icon if icon data is available (centered relative to banners)
+        if hasattr(info_window, '_icon_data'):
+            icon_data = info_window._icon_data
+            icon_canvas = tk.Canvas(
+                right_side_frame,
+                width=icon_data['cw'],
+                height=icon_data['ch'],
+                highlightthickness=0,
+                bd=0,
+                cursor='hand2',
+                takefocus=1
+            )
+            icon_canvas.pack(side='top', pady=(0, 5))
+            icon_img_id = icon_canvas.create_image(icon_data['cw'] // 2, icon_data['ch'] // 2, image=icon_data['photo'])
+            icon_canvas._was_hovered = False
+            icon_canvas._is_hovered = False
+            
+            # Icon animation functions
+            def animate_icon_to_hover():
+                duration_ms = 100
+                steps = 12
+                if hasattr(info_window, '_cancel_anim'):
+                    info_window._cancel_anim(icon_canvas)
+                frames = []
+                
+                def step(i):
+                    t = i / steps
+                    scale = 1.0 + (icon_data['hover_scale'] - 1.0) * t
+                    w = max(1, int(icon_data['size'] * scale))
+                    h = max(1, int(icon_data['size'] * scale))
+                    frame_img = icon_data['pil'].copy()
+                    frame_img.thumbnail((w, h), Image.LANCZOS)
+                    frame = ImageTk.PhotoImage(frame_img)
+                    frames.append(frame)
+                    icon_canvas.itemconfig(icon_img_id, image=frame)
+                    if i < steps:
+                        icon_canvas._anim_job = icon_canvas.after(int(duration_ms / steps), lambda: step(i + 1))
+                    else:
+                        icon_canvas._anim_job = None
+                        icon_canvas._anim_frames = frames
+                
+                step(0)
+            
+            def animate_icon_to_normal():
+                duration_ms = 230
+                steps = 15
+                if hasattr(info_window, '_cancel_anim'):
+                    info_window._cancel_anim(icon_canvas)
+                frames = []
+                
+                def step(i):
+                    t = i / steps
+                    scale = icon_data['hover_scale'] + (1.0 - icon_data['hover_scale']) * t
+                    w = max(1, int(icon_data['size'] * scale))
+                    h = max(1, int(icon_data['size'] * scale))
+                    frame_img = icon_data['pil'].copy()
+                    frame_img.thumbnail((w, h), Image.LANCZOS)
+                    frame = ImageTk.PhotoImage(frame_img)
+                    frames.append(frame)
+                    icon_canvas.itemconfig(icon_img_id, image=frame)
+                    if i < steps:
+                        icon_canvas._anim_job = icon_canvas.after(int(duration_ms / steps), lambda: step(i + 1))
+                    else:
+                        icon_canvas._anim_job = None
+                        icon_canvas._anim_frames = frames
+                
+                step(0)
+            
+            def icon_click_start(e):
+                icon_canvas._was_hovered = getattr(icon_canvas, '_is_hovered', False)
+                if hasattr(info_window, '_cancel_anim'):
+                    info_window._cancel_anim(icon_canvas)
+                normal_img = icon_data['pil'].copy()
+                normal_img.thumbnail((icon_data['size'], icon_data['size']), Image.LANCZOS)
+                normal_photo = ImageTk.PhotoImage(normal_img)
+                icon_canvas.itemconfig(icon_img_id, image=normal_photo)
+                icon_canvas._click_photo = normal_photo
+            
+            def icon_click_end(e):
+                if icon_canvas._was_hovered:
+                    animate_icon_to_hover()
+                on_how_to_use()
+            
+            icon_canvas.bind("<ButtonPress-1>", icon_click_start)
+            icon_canvas.bind("<ButtonRelease-1>", icon_click_end)
+            icon_canvas.bind("<Enter>", lambda e: (setattr(icon_canvas, '_is_hovered', True), animate_icon_to_hover()))
+            icon_canvas.bind("<Leave>", lambda e: (setattr(icon_canvas, '_is_hovered', False), animate_icon_to_normal()))
+        
+        # How to use button - positioned below icon
+        def on_how_to_use():
+            self.show_how_to_use()
+        
+        how_to_use_button = ttk.Button(right_side_frame, 
+                                      text="How to use the program",
+                                      command=on_how_to_use)
+        # Add extra bottom padding to separate the button from the first banner
+        how_to_use_button.pack(side='top', pady=(0, 30))
+        
+        # Banners frame (will be populated below)
+        info_window.banners_frame = ttk.Frame(right_side_frame)
+        info_window.banners_frame.pack(side='top')
+        
+        # Create banners if image data is available
+        if hasattr(info_window, '_coffee_data'):
+            base_scale = info_window._base_scale
+            hover_scale = info_window._hover_scale
+            animate_to_hover = info_window._animate_to_hover
+            animate_to_normal = info_window._animate_to_normal
+            _cancel_anim = info_window._cancel_anim
+            
+            # Coffee banner
+            coffee_data = info_window._coffee_data
+            coffee_canvas = tk.Canvas(
+                info_window.banners_frame,
+                width=coffee_data['cw'],
+                height=coffee_data['ch'],
+                highlightthickness=0,
+                bd=0,
+                cursor='hand2',
+                takefocus=1
+            )
+            coffee_canvas.pack(side='top', padx=10, pady=(0, 15))
+            coffee_img_id = coffee_canvas.create_image(coffee_data['cw'] // 2, coffee_data['ch'] // 2, image=coffee_data['photo'])
+            coffee_canvas._was_hovered = False
+            
+            def coffee_click_start(e):
+                coffee_canvas._was_hovered = getattr(coffee_canvas, '_is_hovered', False)
+                _cancel_anim(coffee_canvas)
+                w, h = coffee_data['pil'].size
+                w_norm = max(1, int(w * base_scale))
+                h_norm = max(1, int(h * base_scale))
+                normal_photo = ImageTk.PhotoImage(coffee_data['pil'].resize((w_norm, h_norm), Image.LANCZOS))
+                coffee_canvas.itemconfig(coffee_img_id, image=normal_photo)
+                coffee_canvas._click_photo = normal_photo
+            
+            def coffee_click_end(e):
+                if coffee_canvas._was_hovered:
+                    animate_to_hover(coffee_canvas, coffee_img_id, coffee_data['pil'])
+                open_url("https://buymeacoffee.com/mertennor")
+            
+            coffee_canvas.bind("<ButtonPress-1>", coffee_click_start)
+            coffee_canvas.bind("<ButtonRelease-1>", coffee_click_end)
+            coffee_canvas.bind("<Enter>", lambda e, c=coffee_canvas, iid=coffee_img_id: (setattr(c, '_is_hovered', True), animate_to_hover(c, iid, coffee_data['pil'])))
+            coffee_canvas.bind("<Leave>", lambda e, c=coffee_canvas, iid=coffee_img_id: (setattr(c, '_is_hovered', False), animate_to_normal(c, iid, coffee_data['pil'])))
+            
+            # Google Form banner
+            google_data = info_window._google_data
+            google_canvas = tk.Canvas(
+                info_window.banners_frame,
+                width=google_data['cw'],
+                height=google_data['ch'],
+                highlightthickness=0,
+                bd=0,
+                cursor='hand2',
+                takefocus=1
+            )
+            google_canvas.pack(side='top', padx=10, pady=(0, 15))
+            google_img_id = google_canvas.create_image(google_data['cw'] // 2, google_data['ch'] // 2, image=google_data['photo'])
+            google_canvas._was_hovered = False
+            
+            def google_click_start(e):
+                google_canvas._was_hovered = getattr(google_canvas, '_is_hovered', False)
+                _cancel_anim(google_canvas)
+                w, h = google_data['pil'].size
+                w_norm = max(1, int(w * base_scale))
+                h_norm = max(1, int(h * base_scale))
+                normal_photo = ImageTk.PhotoImage(google_data['pil'].resize((w_norm, h_norm), Image.LANCZOS))
+                google_canvas.itemconfig(google_img_id, image=normal_photo)
+                google_canvas._click_photo = normal_photo
+            
+            def google_click_end(e):
+                if google_canvas._was_hovered:
+                    animate_to_hover(google_canvas, google_img_id, google_data['pil'])
+                open_url("https://forms.gle/8YBU8atkgwjyzdM79")
+            
+            google_canvas.bind("<ButtonPress-1>", google_click_start)
+            google_canvas.bind("<ButtonRelease-1>", google_click_end)
+            google_canvas.bind("<Enter>", lambda e, c=google_canvas, iid=google_img_id: (setattr(c, '_is_hovered', True), animate_to_hover(c, iid, google_data['pil'])))
+            google_canvas.bind("<Leave>", lambda e, c=google_canvas, iid=google_img_id: (setattr(c, '_is_hovered', False), animate_to_normal(c, iid, google_data['pil'])))
+            
+            # GitHub banner
+            github_data = info_window._github_data
+            github_canvas = tk.Canvas(
+                info_window.banners_frame,
+                width=github_data['cw'],
+                height=github_data['ch'],
+                highlightthickness=0,
+                bd=0,
+                cursor='hand2',
+                takefocus=1
+            )
+            github_canvas.pack(side='top', padx=10, pady=(0, 15))
+            github_img_id = github_canvas.create_image(github_data['cw'] // 2, github_data['ch'] // 2, image=github_data['photo'])
+            github_canvas._was_hovered = False
+            
+            def github_click_start(e):
+                github_canvas._was_hovered = getattr(github_canvas, '_is_hovered', False)
+                _cancel_anim(github_canvas)
+                w, h = github_data['pil'].size
+                w_norm = max(1, int(w * base_scale))
+                h_norm = max(1, int(h * base_scale))
+                normal_photo = ImageTk.PhotoImage(github_data['pil'].resize((w_norm, h_norm), Image.LANCZOS))
+                github_canvas.itemconfig(github_img_id, image=normal_photo)
+                github_canvas._click_photo = normal_photo
+            
+            def github_click_end(e):
+                if github_canvas._was_hovered:
+                    animate_to_hover(github_canvas, github_img_id, github_data['pil'])
+                open_url(f"https://github.com/{GITHUB_REPO}")
+            
+            github_canvas.bind("<ButtonPress-1>", github_click_start)
+            github_canvas.bind("<ButtonRelease-1>", github_click_end)
+            github_canvas.bind("<Enter>", lambda e, c=github_canvas, iid=github_img_id: (setattr(c, '_is_hovered', True), animate_to_hover(c, iid, github_data['pil'])))
+            github_canvas.bind("<Leave>", lambda e, c=github_canvas, iid=github_img_id: (setattr(c, '_is_hovered', False), animate_to_normal(c, iid, github_data['pil'])))
+            
+            # Update container height to match content (cut off after last banner)
+            info_window.update_idletasks()
+            # Get the height of right_side_frame which contains all banners (icon, button, banners)
+            if hasattr(info_window, 'banners_frame') and hasattr(info_window, 'icon_and_banners_container'):
+                right_side_frame.update_idletasks()
+                container_height = right_side_frame.winfo_reqheight()
+                # Trim the visible height slightly so the container cuts off sooner
+                trim_pixels = 0  # adjust this value to show more/less of the banners
+                if container_height > 0:
+                    icon_and_banners_container.place_configure(
+                        height=max(1, container_height - trim_pixels)
+                    )
+        
+        # Changelog scrollable text widget
+        changelog_frame = ttk.Frame(update_section_frame)
+        changelog_frame.pack(anchor='w', fill='both', expand=True, pady=(0, 0))
+        # Note: Z-order is handled by lifting the parent tesseract_status_frame above icon_and_banners_container
+        # (done earlier in the code after update_section_frame is created)
+        
+        changelog_scrollbar = ttk.Scrollbar(changelog_frame)
+        changelog_scrollbar.pack(side='right', fill='y')
+        
+        changelog_text_widget = tk.Text(changelog_frame, 
+                                        wrap=tk.WORD, 
+                                        yscrollcommand=changelog_scrollbar.set,
+                                        font=("Helvetica", 9),
+                                        padx=8,
+                                        pady=6,
+                                        height=15,
+                                        background='#f5f5f5',
+                                        border=1,
+                                        state='normal',
+                                        cursor='xterm',
+                                        selectbackground='#0078d7',
+                                        selectforeground='white')
+        changelog_text_widget.pack(fill='both', expand=True)
+        changelog_scrollbar.config(command=changelog_text_widget.yview)
+        
+        # Make text widget read-only but allow selection and copying
+        def make_readonly(event):
+            """Prevent text editing while allowing selection and navigation."""
+            # Allow navigation keys
+            navigation_keys = ('Up', 'Down', 'Left', 'Right', 'Home', 'End', 
+                             'Prior', 'Next', 'Page_Up', 'Page_Down',
+                             'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 
+                             'Alt_L', 'Alt_R', 'Return', 'KP_Enter')
+            
+            # Allow modifier keys alone
+            if event.keysym in navigation_keys:
+                return
+            
+            # Allow Ctrl+key combinations (Ctrl+C, Ctrl+A, Ctrl+V for paste detection, etc.)
+            if event.state & 0x4:  # Control key pressed
+                return
+            
+            # Allow Shift+key combinations for selection
+            if event.state & 0x1:  # Shift key pressed
+                if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Home', 'End', 
+                                   'Prior', 'Next', 'Page_Up', 'Page_Down'):
+                    return
+            
+            # Block all other key presses that would insert text
+            return "break"
+        
+        # Bind events to prevent editing
+        changelog_text_widget.bind('<Key>', make_readonly)
+        changelog_text_widget.bind('<Button-1>', lambda e: changelog_text_widget.focus_set())
+        
+        # Create right-click context menu
+        context_menu = tk.Menu(changelog_text_widget, tearoff=0)
+        
+        def copy_text():
+            """Copy selected text to clipboard."""
+            try:
+                changelog_text_widget.event_generate("<<Copy>>")
+            except:
+                pass
+        
+        def select_all():
+            """Select all text in the widget."""
+            changelog_text_widget.tag_add("sel", "1.0", "end")
+            changelog_text_widget.mark_set("insert", "end")
+            changelog_text_widget.see("insert")
+        
+        context_menu.add_command(label="Copy", command=copy_text)
+        context_menu.add_command(label="Select All", command=select_all)
+        
+        def show_context_menu(event):
+            """Show context menu on right-click."""
+            try:
+                context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                context_menu.grab_release()
+        
+        changelog_text_widget.bind("<Button-3>", show_context_menu)  # Right-click on Windows/Linux
+        changelog_text_widget.bind("<Button-2>", show_context_menu)  # Right-click on Mac
+        
+        # Store update_title, download_button, and status_label references on changelog_text_widget for later access
+        changelog_text_widget._update_title = update_title
+        changelog_text_widget._download_button = download_button
+        changelog_text_widget._status_label = status_label
+        
+        # Load and display saved update info
+        update_info = self.load_update_info()
+        if update_info and isinstance(update_info, dict):
+            # Always use GITHUB_REPO for download URL, ignore download_url from saved info
+            download_url = f'https://github.com/{GITHUB_REPO}/releases'
+            # Store download_url on widget for button access (though button will use GITHUB_REPO directly)
+            changelog_text_widget._download_url = download_url
+            self.display_changelog(changelog_text_widget, update_info.get('changelog', ''), update_info.get('version', ''), update_info.get('update_available', False), update_title, download_url)
+        else:
+            changelog_text_widget.config(state='normal')
+            changelog_text_widget.insert('1.0', "You haven't checked for any update yet...")
+            # Keep in 'normal' state to allow text selection
+        
+        # Add bottom frame for close button with padding
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill='x', pady=(20, 0))
+        
+
+        
+        # Center window on screen
+        info_window.update_idletasks()
+        width = info_window.winfo_width()
+        height = info_window.winfo_height()
+        x = (info_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (info_window.winfo_screenheight() // 2) - (height // 2)
+        info_window.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Make window modal
+        info_window.transient(self.root)
+        info_window.grab_set()
+    
+    def show_how_to_use(self):
+        # Create Tkinter window for How to Use content
+        how_to_use_window = tk.Toplevel(self.root)
+        how_to_use_window.title(f"{APP_NAME} - How to Use")
+        how_to_use_window.geometry("900x700")
+        
+        # Set window icon if available
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                how_to_use_window.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting how to use window icon: {e}")
+        
+        # Main container
+        main_frame = ttk.Frame(how_to_use_window, padding="15 10 15 5")
+        main_frame.pack(fill='both', expand=True)
+        
+        # Top-left title label (no surrounding frame)
+        title_label = ttk.Label(
+            main_frame,
+            text=f"How to Use {APP_NAME}",
+            font=("Helvetica", 16, "bold")
+        )
+        title_label.pack(anchor='w', pady=(0, 10))
+        
+        # Create a frame with scrollbar for the main content
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill='both', expand=True)
+        
+        # Add fullscreen hotkey warning above the text widget
+        warning_label = ttk.Label(
+            content_frame,
+            text=f"Tip: \n - If hotkeys don't work in fullscreen apps or games, run {APP_NAME} as Administrator.\n",
+            font=("Helvetica", 10, "bold"),
+            foreground='black'
+        )
+        warning_label.pack(anchor='w', pady=(3, 0))
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(content_frame)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Create text widget with custom styling - make it selectable
+        text_widget = tk.Text(content_frame, 
+                             wrap=tk.WORD, 
+                             yscrollcommand=scrollbar.set,
+                             font=("Helvetica", 10),
+                             padx=8,
+                             pady=6,
+                             spacing1=2,  # Space between lines
+                             spacing2=2,  # Space between paragraphs
+                             background='#f5f5f5',  # Light gray background
+                             border=1,
+                             state='normal',  # Make it editable initially to insert text
+                             cursor='xterm',  # Show text cursor
+                             selectbackground='#0078d7',  # Blue selection color
+                             selectforeground='white')  # White text on selection
+        
+        # Add right-click context menu for copy
+        def show_context_menu(event):
+            context_menu = tk.Menu(text_widget, tearoff=0)
+            context_menu.add_command(label="Copy", command=lambda: text_widget.event_generate('<<Copy>>'))
+            context_menu.add_command(label="Select All", command=lambda: text_widget.tag_add('sel', '1.0', 'end'))
+            try:
+                context_menu.tk.call('tk_popup', context_menu, event.x_root, event.y_root)
+            finally:
+                context_menu.grab_release()
+        
+        text_widget.bind("<Button-3>", show_context_menu)
+        
+        text_widget.pack(fill='both', expand=True)
+        
+        # Configure scrollbar and tags
+        scrollbar.config(command=text_widget.yview)
+        text_widget.tag_configure('bold', font=("Helvetica", 10, "bold"))
+        
+        # Info text with improved formatting - split into sections
+        info_text = [
+
+            ("How to Use the Program\n", 'bold'),
+            ("═══════════════════════════════\n", None),
+            ("• Click \"Set Area\": Left-click and drag to select the area you want the program to read. (Area name can be change with right-click)\n\n", None),
+            ("• Click \"Set Hotkey\": Assign a hotkey for the selected area.\n\n", None),
+            ("• Voice Dropdown: Choose a voice from the dropdown menu (defaults to first available voice).\n\n", None),
+            ("• Press the assigned area hotkey to make the program automatically read the text aloud.\n\n", None),
+            ("• Use the stop hotkey (if set) to stop the current reading.\n\n", None),
+            ("• Adjust the program volume by setting the volume percentage in the main window.\n\n", None),
+            ("• The debug console displays the processed image of the last area read and its debug logs.\n\n", None),
+            ("• Make sure to save your loadout once you are happy with your setup.\n\n\n", None),
+
+                    
+            ("BUTTONS AND FEATURES\n", 'bold'),
+            ("═════════════════════\n\n", None),
+
+
+            ("Auto Read\n", 'bold'),
+            ("------------------------\n", None),
+            ("When assigned a hotkey, the program will automatically read the text in the selected area.\n", None),
+            ("The Save button here will save the settings for the AutoRead area only.\n", None),
+            ("Note! This works best with applications in windowed borderless mode.\n", None),
+            ("This save file can be found here: C:\\Users\\<username>\\AppData\\Local\\Temp\nFilename: auto_read_settings.json.\n", None),
+            ("Alternatively, you can locate this save file by clicking the 'Program Saves...' button.\n", None),
+            ("The checkbox 'Stop Read on new Select' determines the behavior when scanning a new area while text is being read.\n", None),
+            ("If checked, the ongoing text will stop immediately, and the newly scanned text will be read.\n", None),
+            ("If unchecked, the newly scanned text will be added to a queue and read after the ongoing text finishes.\n\n", None),
+
+            ("Add Read Area\n", 'bold'),
+            ("------------------------\n", None),
+            ("Creates a new area for text capture. You can define multiple areas on screen for different text sources.\n\n", None),
+            
+            ("Image Processing\n", 'bold'),
+            ("------------------------------\n", None),
+            ("Allows customization of image preprocessing before speaking. Useful for improving text recognition in difficult-to-read areas.\n\n", None),
+
+            ("PSM (Page Segmentation Mode)\n", 'bold'),
+            ("----------------------------------------\n", None),
+            ("PSM controls how Tesseract OCR analyzes and segments the image for text recognition.\n", None),
+            ("Different modes work better for different text layouts:\n", None),
+            ("• 0 (OSD only): Orientation and script detection only, no text recognition.\n", None),
+            ("• 1 (Auto + OSD): Automatic page segmentation with orientation and script detection.\n", None),
+            ("• 2 (Auto, no OSD, no block): Automatic page segmentation but no OSD or block detection.\n", None),
+            ("• 3 (Default - Fully auto, no OSD): Fully automatic page segmentation, works well for most cases.\n", None),
+            ("• 4 (Single column): Best for text arranged in a single column.\n", None),
+            ("• 5 (Single uniform block): For text in a single uniform block without multiple columns.\n", None),
+            ("• 6 (Single uniform block of text): Similar to 5, for a single block of text.\n", None),
+            ("• 7 (Single text line): Use when the area contains only one line of text.\n", None),
+            ("• 8 (Single word): For areas with just one word.\n", None),
+            ("• 9 (Single word in circle): For recognizing a single word in a circle.\n", None),
+            ("• 10 (Single character): For recognizing individual characters.\n", None),
+            ("• 11 (Sparse text): For text with large gaps or scattered text.\n", None),
+            ("• 12 (Sparse text + OSD): Sparse text with orientation and script detection.\n", None),
+            ("• 13 (Raw line - no layout): Raw line, no layout analysis.\n", None),
+            ("Experiment with different PSM modes if the default doesn't recognize your text accurately.\n\n", None),
+
+            ("Debug window\n", 'bold'),
+            ("---------------------------\n", None),
+            ("Shows the captured text and processed images for troubleshooting.\n\n", None),
+
+            ("Automations Window\n", 'bold'),
+            ("--------------------------------\n", None),
+            ("The Automations window allows you to create advanced if-then scenarios based on image detection.\n\n", None),
+            ("Detection Areas:\n", 'bold'),
+            ("• Click \"Add Detection Area\" to create a new detection area that monitors a specific screen region.\n", None),
+            ("• Use \"Set a detection area\" to select the screen area you want to monitor.\n", None),
+            ("• Enable \"Freeze Screen\" to pause the screen while selecting detection areas for easier setup.\n", None),
+            ("Monitoring:\n", 'bold'),
+            ("• Click \"Start Monitor Detections\" to begin continuous monitoring of all detection areas.\n", None),
+            ("• The program will check detection areas periodically and trigger actions when conditions are met.\n", None),
+            ("• Monitoring continues even when the Automations window is closed.\n", None),
+            ("• Click \"Stop Monitoring\" to pause detection monitoring.\n\n", None),
+            ("Automations are saved with your layout file, so they persist across sessions.\n\n", None),
+            ("Hotkey Combos:\n", 'bold'),
+            ("• Click \"Add Area Combo\" to create a hotkey combo that reads multiple areas in sequence with timers.\n", None),
+            ("• Assign a hotkey to the combo, then add areas with individual delay timers.\n", None),
+            ("• When the hotkey is pressed, the program will read each area in order, waiting for the specified delay between each.\n\n", None),
+
+            ("Stop Hotkey\n", 'bold'),
+            ("--------------------\n", None),
+            ("Immediately stops any ongoing speech.\n\n", None),
+
+            ("Ignored Word List\n", 'bold'),
+            ("-------------------------\n", None),
+            ("A list of words, phrases, or sentences (separated by commas) to ignore while reading text. Example: Chocolate, Apple, Banana, I love ice cream\n", None),
+            ("These will then be ignored in all areas.\n\n", None),
+
+            ("CHECKBOX OPTIONS\n", 'bold'),
+            ("════════════════\n\n", None),
+
+            ("Ignore usernames *EXPERIMENTAL*\n", 'bold'),
+            ("--------------------------------\n", None),
+            ("This option filters out usernames from the text before reading. It looks for patterns like \"Username:\" at the start of lines.\n\n", None),
+
+            ("Ignore previous spoken words\n", 'bold'),
+            ("-------------------------------------------------\n", None),
+            ("This prevents the same text from being read multiple times. Useful for chat windows where messages might persist.\n\n", None),
+
+            ("Ignore gibberish *EXPERIMENTAL*\n", 'bold'),
+            ("-------------------------------------------------------\n", None),
+            ("Filters out text that appears to be random characters or rendered artifacts. Helps prevent reading of non-meaningful text.\n\n", None),
+
+            ("Pause at punctuation *EXPERIMENTAL*\n", 'bold'),
+            ("------------------------------------\n", None),
+            ("Adds natural pauses when encountering periods, commas, and other punctuation marks. Makes the speech sound more natural.\n\n", None),
+
+            ("Fullscreen mode *EXPERIMENTAL*\n", 'bold'),
+            ("--------------------------------------------------------\n", None),
+            ("Feature for capturing text from fullscreen applications. May cause brief screen flicker during capture for the program to take an updated screenshot.\n\n", None),
+
+            ("TIPS AND TRICKS\n", 'bold'),
+            ("═════════════\n\n", None),
+
+            ("• Use image processing for areas with difficult-to-read text\n\n", None),
+
+            ("• Create two identical areas with different hotkeys: assign one a male voice and the other a female voice.\n", None),
+            ("  This lets you easily switch between male and female voices for text, ideal for game dialogue.\n\n", None),
+
+            ("• Experiment with different preprocessing settings for optimal text recognition in your specific use case.\n\n", None),
+
+        ]
+        
+        # Insert text with tags
+        for text, tag in info_text:
+            text_widget.insert('end', text, tag)
+        
+        # Enable text selection and copying even when disabled
+        def enable_text_selection(event=None):
+            return 'break'
+            
+        text_widget.bind('<Key>', enable_text_selection)
+        text_widget.bind('<Control-c>', lambda e: text_widget.event_generate('<<Copy>>') or 'break')
+        text_widget.bind('<Control-a>', lambda e: (text_widget.tag_add('sel', '1.0', 'end'), 'break'))
+        
+        # Make text widget read-only but keep text selectable
+        text_widget.config(state='disabled')
+        
+        # Bind Escape key to close
+        how_to_use_window.bind('<Escape>', lambda e: how_to_use_window.destroy())
+        
+        # Center window on screen
+        how_to_use_window.update_idletasks()
+        width = how_to_use_window.winfo_width()
+        height = how_to_use_window.winfo_height()
+        x = (how_to_use_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (how_to_use_window.winfo_screenheight() // 2) - (height // 2)
+        how_to_use_window.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Make window modal
+        how_to_use_window.transient(self.root)
+        how_to_use_window.grab_set()
+        
+    def test_hotkey_working(self, hotkey_str):
+        """Test if a hotkey is working properly"""
+        try:
+            # Try to register the hotkey temporarily
+            test_hook = keyboard.add_hotkey(hotkey_str, lambda: None, suppress=False)
+            keyboard.remove_hotkey(hotkey_str)
+            return True
+        except Exception as e:
+            print(f"Hotkey test failed for {hotkey_str}: {e}")
+            return False
+            
+    def show_debug(self):
+        if not hasattr(sys, 'stdout_original'):
+            sys.stdout_original = sys.stdout
+        
+        if not hasattr(self, 'console_window') or not self.console_window.window.winfo_exists():
+            self.console_window = ConsoleWindow(self.root, self.log_buffer, self.layout_file, self.latest_images, self.latest_area_name)
+        else:
+            self.console_window.update_console()
+        sys.stdout = self.console_window
+        
+    def customize_processing(self, area_name_var):
+        area_name = area_name_var.get()
+        if area_name not in self.latest_images:
+            messagebox.showerror("Error", "No image to process yet. Please generate an image by pressing the hotkey.")
+            return
+
+        if area_name not in self.processing_settings:
+            self.processing_settings[area_name] = {}
+        ImageProcessingWindow(self.root, area_name, self.latest_images, self.processing_settings[area_name], self)
+        
+    def set_stop_hotkey(self):
+        # Clean up temporary hooks and disable all hotkeys
+        try:
+            # During hotkey assignment, don't block InputManager - we rely on self.setting_hotkey flag
+            self.disable_all_hotkeys(block_input_manager=False)
+        except Exception as e:
+            print(f"Warning: Error cleaning up temporary hooks: {e}")
+
+        self._hotkey_assignment_cancelled = False  # Guard flag to block late events
+        self.setting_hotkey = True
+        
+
+
+        def finish_hotkey_assignment():
+            # Restore all hotkeys after assignment is done
+            try:
+                self.stop_speaking()  # Stop the speech
+                print("System reinitialized. Audio stopped.")
+            except Exception as e:
+                print(f"Error during forced stop: {e}")
+            
+            try:
+                self.restore_all_hotkeys()
+            except Exception as e:
+                print(f"Warning: Error restoring hotkeys: {e}")
+            # Cleanup any temp hooks and preview
+            try:
+                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                    self._hotkey_preview_job = None
+            except Exception:
+                pass
+            # Cancel unhook timer if it exists
+            try:
+                if hasattr(self, 'unhook_timer') and self.unhook_timer:
+                    self.root.after_cancel(self.unhook_timer)
+                    self.unhook_timer = None
+            except Exception:
+                pass
+            try:
+                if hasattr(self.stop_hotkey_button, 'keyboard_hook_temp'):
+                    keyboard.unhook(self.stop_hotkey_button.keyboard_hook_temp)
+                    delattr(self.stop_hotkey_button, 'keyboard_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(self.stop_hotkey_button, 'keyboard_hook_temp'):
+                        delattr(self.stop_hotkey_button, 'keyboard_hook_temp')
+                except Exception:
+                    pass
+            try:
+                if hasattr(self.stop_hotkey_button, 'mouse_hook_temp'):
+                    mouse.unhook(self.stop_hotkey_button.mouse_hook_temp)
+                    delattr(self.stop_hotkey_button, 'mouse_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(self.stop_hotkey_button, 'mouse_hook_temp'):
+                        delattr(self.stop_hotkey_button, 'mouse_hook_temp')
+                except Exception:
+                    pass
+            try:
+                if hasattr(self.stop_hotkey_button, 'shift_release_hooks'):
+                    for h in getattr(self.stop_hotkey_button, 'shift_release_hooks', []) or []:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(self.stop_hotkey_button, 'shift_release_hooks')
+                if hasattr(self.stop_hotkey_button, 'ctrl_release_hooks'):
+                    for h in getattr(self.stop_hotkey_button, 'ctrl_release_hooks', []) or []:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(self.stop_hotkey_button, 'ctrl_release_hooks')
+            except Exception:
+                pass
+        
+        # Track whether a non-modifier was pressed
+        combo_state = {'non_modifier_pressed': False}
+
+        def _assign_stop_hotkey_and_register(hk_str):
+            # Final validation: Check if this is a mouse button (button1 or button2) and validate against checkbox
+            # Check if hk_str is exactly button1/button2, or contains them as part of a combination
+            # Be explicit: check for exact matches first, then substring matches
+            is_left_button = hk_str == 'button1' or hk_str.startswith('button1+') or hk_str.endswith('+button1') or '+button1+' in hk_str
+            is_right_button = hk_str == 'button2' or hk_str.startswith('button2+') or hk_str.endswith('+button2') or '+button2+' in hk_str
+            is_mouse_button = is_left_button or is_right_button
+            
+            if is_mouse_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        checkbox_value = self.allow_mouse_buttons_var.get()
+                        allow_mouse_buttons = bool(checkbox_value)
+                        print(f"Debug: Mouse button detected in stop hotkey. Checkbox value: {checkbox_value}, boolean: {allow_mouse_buttons}, hotkey: {hk_str}")
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                        allow_mouse_buttons = False
+                else:
+                    print(f"Debug: allow_mouse_buttons_var not found, defaulting to False")
+                
+                if not allow_mouse_buttons:
+                    # Reset button text and show warning
+                    print(f"Debug: Rejecting mouse button hotkey assignment - checkbox is disabled")
+                    self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                    # Always show warning
+                    try:
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                    except Exception as e:
+                        print(f"Error showing warning: {e}")
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return False
+            
+            # Check duplicate against area hotkeys
+            for area in self.areas:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == hk_str:
+                    show_thinkr_warning(self, area_name_var.get())
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                    finish_hotkey_assignment()
+                    return False
+            # Check against pause hotkey
+            if hasattr(self, 'pause_hotkey') and self.pause_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Pause/Play Hotkey")
+                return False
+            # Check against repeat latest scan hotkey
+            if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Repeat Last Scan Hotkey")
+                return False
+            # Clean old stop hotkey hooks
+            if hasattr(self, 'stop_hotkey'):
+                try:
+                    if hasattr(self.stop_hotkey_button, 'mock_button'):
+                        self._cleanup_hooks(self.stop_hotkey_button.mock_button)
+                except Exception as e:
+                    print(f"Error cleaning up stop hotkey hooks: {e}")
+            self.stop_hotkey = hk_str
+            self._set_unsaved_changes('hotkey_changed', 'Stop Hotkey')  # Mark as unsaved when stop hotkey changes
+            # Save to settings file (APP_SETTINGS_PATH)
+            self._save_stop_hotkey(hk_str)
+            # Register
+            mock_button = type('MockButton', (), {'hotkey': hk_str, 'is_stop_button': True})
+            self.stop_hotkey_button.mock_button = mock_button
+            self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+            # Nicer display mapping for sided modifiers and numpad
+            display_name = hk_str.replace('numpad ', 'NUMPAD ').replace('num_', 'num:') \
+                                   .replace('ctrl','CTRL') \
+                                   .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                   .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                                   .replace('windows','WIN') \
+                                   .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+            self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name.upper()} ]")
+            print(f"Set Stop hotkey: {hk_str}\n--------------------------")
+            self.setting_hotkey = False
+            self._hotkey_assignment_cancelled = True
+            finish_hotkey_assignment()
+            # Expand window width if needed for longer hotkey text
+            self._ensure_window_width()
+            return True
+
+        def on_key_press(event):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            # Ignore Escape
+            if event.scan_code == 1:
+                return
+            
+            # Use scan code and virtual key code for consistent behavior across keyboard layouts
+            scan_code = getattr(event, 'scan_code', None)
+            vk_code = getattr(event, 'vk_code', None)
+            
+            # Get current keyboard layout for consistency
+            current_layout = get_current_keyboard_layout()
+            
+            # Determine key name based on scan code and virtual key code for consistency
+            name = None
+            side = None
+            
+            # Handle modifier keys consistently
+            if scan_code == 29:  # Left Ctrl
+                name = 'ctrl'
+                side = 'left'
+            elif scan_code == 157:  # Right Ctrl
+                name = 'ctrl'
+                side = 'right'
+            elif scan_code == 42:  # Left Shift
+                name = 'shift'
+                side = 'left'
+            elif scan_code == 54:  # Right Shift
+                name = 'shift'
+                side = 'right'
+            elif scan_code == 56:  # Left Alt
+                name = 'left alt'
+                side = 'left'
+            elif scan_code == 184:  # Right Alt
+                name = 'right alt'
+                side = 'right'
+            elif scan_code == 91:  # Left Windows
+                name = 'windows'
+                side = 'left'
+            elif scan_code == 92:  # Right Windows
+                name = 'windows'
+                side = 'right'
+            else:
+                # For non-modifier keys, use the event name but normalize it
+                raw_name = (event.name or '').lower()
+                name = normalize_key_name(raw_name)
+                
+                # For conflicting scan codes (75, 72, 77, 80), check event name FIRST to determine user intent
+                # These scan codes are shared between numpad 2/4/6/8 and arrow keys
+                # During assignment, event name is more reliable for determining what the user wants
+                conflicting_scan_codes = {75: 'left', 72: 'up', 77: 'right', 80: 'down'}
+                is_conflicting = scan_code in conflicting_scan_codes
+                
+                if is_conflicting:
+                    # Check event name first - if it clearly indicates arrow key, use that
+                    arrow_key_names = ['up', 'down', 'left', 'right', 'pil opp', 'pil ned', 'pil venstre', 'pil høyre']
+                    is_arrow_by_name = raw_name in arrow_key_names
+                    
+                    # Check if event name indicates numpad (starts with "numpad " or is a number)
+                    is_numpad_by_name = raw_name.startswith('numpad ') or (raw_name in ['2', '4', '6', '8'] and not is_arrow_by_name)
+                    
+                    if is_arrow_by_name:
+                        # Event name clearly indicates arrow key - use that regardless of NumLock
+                        name = self.arrow_key_scan_codes[scan_code]
+                        print(f"Debug: Detected arrow key by event name: '{name}' (scan code: {scan_code}, event: {raw_name})")
+                    elif is_numpad_by_name:
+                        # Event name indicates numpad key
+                        if scan_code in self.numpad_scan_codes:
+                            sym = self.numpad_scan_codes[scan_code]
+                            name = f"num_{sym}"
+                            print(f"Debug: Detected numpad key by event name: '{name}' (scan code: {scan_code}, event: {raw_name})")
+                        else:
+                            name = self.arrow_key_scan_codes[scan_code]
+                    else:
+                        # Event name is ambiguous - check NumLock state as fallback
+                        try:
+                            import ctypes
+                            VK_NUMLOCK = 0x90
+                            numlock_is_on = bool(ctypes.windll.user32.GetKeyState(VK_NUMLOCK) & 1)
+                            if numlock_is_on:
+                                # NumLock is ON - default to numpad key
+                                if scan_code in self.numpad_scan_codes:
+                                    sym = self.numpad_scan_codes[scan_code]
+                                    name = f"num_{sym}"
+                                    print(f"Debug: Detected numpad key (NumLock ON, ambiguous event): '{name}' (scan code: {scan_code}, event: {raw_name})")
+                                else:
+                                    name = self.arrow_key_scan_codes[scan_code]
+                            else:
+                                # NumLock is OFF - default to arrow key
+                                name = self.arrow_key_scan_codes[scan_code]
+                                print(f"Debug: Detected arrow key (NumLock OFF, ambiguous event): '{name}' (scan code: {scan_code}, event: {raw_name})")
+                        except Exception as e:
+                            # Fallback: default to arrow key
+                            print(f"Debug: Error checking NumLock state: {e}, defaulting to arrow key")
+                            name = self.arrow_key_scan_codes.get(scan_code, raw_name)
+                # Check non-conflicting numpad scan codes
+                elif scan_code in self.numpad_scan_codes:
+                    sym = self.numpad_scan_codes[scan_code]
+                    name = f"num_{sym}"
+                    print(f"Debug: Detected numpad key by scan code: '{name}' (scan code: {scan_code}, event name: {raw_name})")
+                # Check non-conflicting arrow key scan codes
+                elif scan_code in self.arrow_key_scan_codes:
+                    name = self.arrow_key_scan_codes[scan_code]
+                    print(f"Debug: Detected arrow key by scan code: '{name}' (scan code: {scan_code}, event name: {raw_name})")
+                # Then check if this is a regular keyboard number by scan code
+                elif scan_code in self.keyboard_number_scan_codes:
+                    # Regular keyboard numbers use the number directly
+                    name = self.keyboard_number_scan_codes[scan_code]
+                # Then check special keys by scan code
+                elif scan_code in self.special_key_scan_codes:
+                    name = self.special_key_scan_codes[scan_code]
+                # Fallback to event name detection
+                # First check if this is an arrow key by event name (support multiple languages)
+                elif raw_name in ['up', 'down', 'left', 'right'] or raw_name in ['pil opp', 'pil ned', 'pil venstre', 'pil høyre']:
+                    # Convert Norwegian arrow key names to English
+                    if raw_name == 'pil opp':
+                        name = 'up'
+                    elif raw_name == 'pil ned':
+                        name = 'down'
+                    elif raw_name == 'pil venstre':
+                        name = 'left'
+                    elif raw_name == 'pil høyre':
+                        name = 'right'
+                    else:
+                        name = raw_name
+                # Then check if this is a numpad key by event name
+                elif raw_name.startswith('numpad ') or raw_name in ['numpad 0', 'numpad 1', 'numpad 2', 'numpad 3', 'numpad 4', 'numpad 5', 'numpad 6', 'numpad 7', 'numpad 8', 'numpad 9', 'numpad *', 'numpad +', 'numpad -', 'numpad .', 'numpad /', 'numpad enter']:
+                    # Convert numpad event name to our format
+                    if raw_name == 'numpad *':
+                        name = 'num_multiply'
+                    elif raw_name == 'numpad +':
+                        name = 'num_add'
+                    elif raw_name == 'numpad -':
+                        name = 'num_subtract'
+                    elif raw_name == 'numpad .':
+                        name = 'num_.'
+                    elif raw_name == 'numpad /':
+                        name = 'num_divide'
+                    elif raw_name == 'numpad enter':
+                        name = 'num_enter'
+                    else:
+                        # Extract the number from 'numpad X'
+                        num = raw_name.replace('numpad ', '')
+                        name = f"num_{num}"
+                # Then check special keys by event name
+                elif raw_name in ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+                                 'num lock', 'scroll lock', 'insert', 'home', 'end', 'page up', 'page down',
+                                 'delete', 'tab', 'enter', 'backspace', 'space', 'escape']:
+                    name = raw_name
+
+            # Non-modifier pressed
+            if name not in ('ctrl','alt','left alt','right alt','shift','windows'):
+                combo_state['non_modifier_pressed'] = True
+            # Bare modifier assignment path
+            if name in ('ctrl','shift','alt','left alt','right alt','windows'):
+                def _assign_bare_modifier():
+                    if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                        return
+                    try:
+                        held = []
+                        # Use scan code detection for more reliable left/right distinction
+                        left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                        
+                        if left_ctrl_pressed or right_ctrl_pressed: held.append('ctrl')
+                        if keyboard.is_pressed('shift'): held.append('shift')
+                        if keyboard.is_pressed('left alt'): held.append('left alt')
+                        if keyboard.is_pressed('right alt'): held.append('right alt')
+                        if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                            held.append('windows')
+                        if len(held) == 1:
+                            only = held[0]
+                            # Determine base from name
+                            base = None
+                            if 'ctrl' in name: base = 'ctrl'
+                            elif 'alt' in name: base = 'alt'
+                            elif 'shift' in name: base = 'shift'
+                            elif 'windows' in name: base = 'windows'
+                            
+                            if (base == 'ctrl' and only == 'ctrl') or \
+                               (base == 'alt' and (only in ['left alt','right alt'])) or \
+                               (base == 'shift' and only == 'shift') or \
+                               (base == 'windows' and only == 'windows'):
+                                key_name_local = only
+                                _assign_stop_hotkey_and_register(key_name_local)
+                                return
+                    except Exception:
+                        pass
+                # Using 300ms to give user enough time to press all keys in a multi-key combination (reduced from 800ms)
+                try:
+                    print(f"Debug: Setting timer for _assign_bare_modifier with name: '{name}'")
+                    self.root.after(300, _assign_bare_modifier)
+                    print(f"Debug: Timer set successfully")
+                except Exception as e:
+                    print(f"Debug: Error setting timer: {e}")
+                return
+
+            # Build combo from held modifiers + base key
+            try:
+                mods = []
+                # Use scan code detection for more reliable left/right distinction
+                left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                
+                if left_ctrl_pressed or right_ctrl_pressed: mods.append('ctrl')
+                if keyboard.is_pressed('shift'): mods.append('shift')
+                if keyboard.is_pressed('left alt'): mods.append('left alt')
+                if keyboard.is_pressed('right alt'): mods.append('right alt')
+                if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                    mods.append('windows')
+            except Exception:
+                mods = []
+
+            base_key = name
+            # The name is already determined by event name detection above, so use it directly
+            
+            # Check if this is a mouse button (button1 or button2) and validate against checkbox
+            # Check if base_key is button1 or button2, or contains them (for combinations)
+            is_mouse_button = base_key in ['button1', 'button2'] or 'button1' in base_key or 'button2' in base_key
+            if is_mouse_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    # Reset button text and show warning
+                    self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    return
+            
+            if base_key in ("ctrl", "shift", "alt", "windows", "left alt", "right alt"):
+                combo_parts = (mods + [base_key]) if base_key not in mods else mods[:]
+            else:
+                combo_parts = mods + [base_key]
+            key_name = "+".join(p for p in combo_parts if p)
+
+            _assign_stop_hotkey_and_register(key_name)
+            return
+            
+        def on_mouse_click(event):
+            if (self._hotkey_assignment_cancelled or 
+                not self.setting_hotkey or 
+                not isinstance(event, mouse.ButtonEvent) or 
+                event.event_type != mouse.DOWN):
+                return
+            
+            # Use the same validation logic as area hotkeys for consistency
+            # Get the button identifier directly from the mouse library
+            button_identifier = event.button
+            
+            # Check if this is a left or right mouse button (same logic as set_hotkey)
+            is_left_button = button_identifier == 1 or str(button_identifier).lower() in ['left', 'primary', 'select', 'action', 'button1', 'mouse1']
+            is_right_button = button_identifier == 2 or str(button_identifier).lower() in ['right', 'secondary', 'context', 'alternate', 'button2', 'mouse2']
+            
+            # Check if this is a left/right mouse button
+            if is_left_button or is_right_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                    finish_hotkey_assignment()
+                    return
+                
+            key_name = f"button{event.button}"
+            
+            # Use _assign_stop_hotkey_and_register which has the final validation
+            # This ensures consistency with keyboard handler and double-checks the checkbox
+            if not _assign_stop_hotkey_and_register(key_name):
+                # Assignment was rejected (e.g., mouse button not allowed, duplicate, etc.)
+                return
+
+        def on_controller_button():
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+                
+            # Wait for controller button press
+                button_name = self.controller_handler.wait_for_button_press(timeout=10)
+                if button_name:
+                    key_name = f"controller_{button_name}"
+                    
+                    # Check if this controller button is already used by any area
+                    for area in self.areas:
+                        area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                        if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == key_name:
+                            show_thinkr_warning(self, area_name_var.get())
+                            self._hotkey_assignment_cancelled = True
+                            self.setting_hotkey = False
+                            self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                            finish_hotkey_assignment()
+                            return
+                
+                # Remove existing stop hotkey if it exists
+                if hasattr(self, 'stop_hotkey'):
+                    try:
+                        if hasattr(self.stop_hotkey_button, 'mock_button'):
+                            self._cleanup_hooks(self.stop_hotkey_button.mock_button)
+                    except Exception as e:
+                        print(f"Error cleaning up stop hotkey hooks: {e}")
+                
+                self.stop_hotkey = key_name
+                self._set_unsaved_changes('hotkey_changed', 'Stop Hotkey')  # Mark as unsaved when stop hotkey changes
+                # Save to settings file (APP_SETTINGS_PATH)
+                self._save_stop_hotkey(key_name)
+                
+                # Create a mock button object to use with setup_hotkey
+                mock_button = type('MockButton', (), {'hotkey': key_name, 'is_stop_button': True})
+                self.stop_hotkey_button.mock_button = mock_button
+                
+                # Setup the hotkey
+                self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+                
+                display_name = f"Controller {button_name}"
+                self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name.upper()} ]")
+                print(f"Set Stop hotkey: {key_name}\n--------------------------")
+                
+                # Mark assignment as cancelled immediately so the button can be used right away
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                
+                finish_hotkey_assignment()
+                # Expand window width if needed for longer hotkey text
+                self._ensure_window_width()
+                return
+            else:
+                # Timeout or no button pressed
+                self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+
+        # Set button to indicate we're waiting for input
+        self.stop_hotkey_button.config(text="Press any key or combination...")
+        
+        # Set up temporary hooks for key and mouse input
+        try:
+            # Store the hooks as attributes of the button for cleanup
+            self.stop_hotkey_button.keyboard_hook_temp = keyboard.on_press(on_key_press, suppress=True)
+            self.stop_hotkey_button.mouse_hook_temp = mouse.hook(on_mouse_click)
+            
+            # Live preview of currently held modifiers while waiting for a non-modifier key
+            def _update_hotkey_preview():
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                    return
+                try:
+                    # Check if button still exists before trying to configure it
+                    if not hasattr(self, 'stop_hotkey_button') or not self.stop_hotkey_button.winfo_exists():
+                        return
+                except Exception:
+                    return
+                try:
+                    mods = []
+                    # Use scan code detection for more reliable left/right distinction
+                    left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                    
+                    if left_ctrl_pressed or right_ctrl_pressed: mods.append('CTRL')
+                    if keyboard.is_pressed('shift'): mods.append('SHIFT')
+                    if keyboard.is_pressed('left alt'): mods.append('L-ALT')
+                    if keyboard.is_pressed('right alt'): mods.append('R-ALT')
+                    if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                        mods.append('WIN')
+                    preview = " + ".join(mods)
+                    if preview:
+                        self.stop_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                    else:
+                        self.stop_hotkey_button.config(text="Press any key or combination...")
+                    # Live expand window width if needed
+                    self._ensure_window_width()
+                except Exception:
+                    pass
+                # Schedule next update
+                try:
+                    self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+                except Exception:
+                    pass
+            
+            # Start live preview polling
+            try:
+                self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+            except Exception:
+                pass
+            
+            # Start controller monitoring for stop hotkey assignment if controller support is available
+            if CONTROLLER_AVAILABLE:
+                self._start_controller_stop_hotkey_monitoring(finish_hotkey_assignment)
+        except Exception as e:
+            print(f"Error setting up hotkey hooks: {e}")
+            self.stop_hotkey_button.config(text="Set Stop Hotkey")
+            self.setting_hotkey = False
+            finish_hotkey_assignment()
+            return
+        
+        # Also listen for Shift key release to assign LSHIFT/RSHIFT reliably
+        def on_shift_release(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            side_label = 'left'
+            try:
+                raw = (getattr(_e, 'name', '') or '').lower()
+                if 'right' in raw or 'right shift' in raw:
+                    side_label = 'right'
+            except Exception:
+                pass
+            key_name_local = f"{side_label} shift"
+            _assign_stop_hotkey_and_register(key_name_local)
+
+        try:
+            self.stop_hotkey_button.shift_release_hooks = [
+                keyboard.on_release_key('left shift', on_shift_release),
+                keyboard.on_release_key('right shift', on_shift_release),
+            ]
+        except Exception:
+            self.stop_hotkey_button.shift_release_hooks = []
+        
+        # Also listen for Ctrl key release to allow assigning bare CTRL reliably for stop hotkey
+        def on_ctrl_release_stop(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            # Determine which ctrl key was released using scan code for reliability
+            side_label = 'left'
+            try:
+                scan_code = getattr(_e, 'scan_code', None)
+                if scan_code == 157:  # Right Ctrl scan code
+                    side_label = 'right'
+                elif scan_code == 29:  # Left Ctrl scan code
+                    side_label = 'left'
+                else:
+                    # Fallback to event name if scan code is not available
+                    raw = (getattr(_e, 'name', '') or '').lower()
+                    if 'right' in raw or 'right ctrl' in raw:
+                        side_label = 'right'
+            except Exception:
+                pass
+            # Assign bare CTRL (no longer sided)
+            key_name_local = "ctrl"
+            _assign_stop_hotkey_and_register(key_name_local)
+
+        try:
+            self.stop_hotkey_button.ctrl_release_hooks = [
+                keyboard.on_release_key('ctrl', on_ctrl_release_stop),
+            ]
+        except Exception:
+            self.stop_hotkey_button.ctrl_release_hooks = []
+
+        # Set a timer to reset the button if no key is pressed
+        def reset_button():
+            # Check if button still exists before trying to configure it
+            try:
+                if not hasattr(self, 'stop_hotkey_button') or not self.stop_hotkey_button.winfo_exists():
+                    # Button was destroyed, just clean up
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return
+            except Exception:
+                # Button doesn't exist or was destroyed
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+                return
+            
+            try:
+                if not hasattr(self, 'stop_hotkey') or not self.stop_hotkey:
+                    self.stop_hotkey_button.config(text="Set Stop Hotkey")
+                else:
+                    # Restore the previous hotkey display
+                    display_name = self._hotkey_to_display_name(self.stop_hotkey)
+                    self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name} ]")
+            except Exception as e:
+                # Button was destroyed between check and config
+                print(f"Error resetting stop hotkey button (button may have been destroyed): {e}")
+            finally:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+            
+        self.unhook_timer = self.root.after(4000, reset_button)
+
+    def set_pause_hotkey(self):
+        # Clean up temporary hooks and disable all hotkeys
+        try:
+            # During hotkey assignment, don't block InputManager - we rely on self.setting_hotkey flag
+            self.disable_all_hotkeys(block_input_manager=False)
+        except Exception as e:
+            print(f"Warning: Error cleaning up temporary hooks: {e}")
+
+        self._hotkey_assignment_cancelled = False  # Guard flag to block late events
+        self.setting_hotkey = True
+        
+
+        def finish_hotkey_assignment():
+            # Restore all hotkeys after assignment is done
+            try:
+                self.restore_all_hotkeys()
+            except Exception as e:
+                print(f"Warning: Error restoring hotkeys: {e}")
+            # Cleanup any temp hooks and preview
+            try:
+                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                    self._hotkey_preview_job = None
+            except Exception:
+                pass
+            # Cancel unhook timer if it exists
+            try:
+                if hasattr(self, 'unhook_timer') and self.unhook_timer:
+                    self.root.after_cancel(self.unhook_timer)
+                    self.unhook_timer = None
+            except Exception:
+                pass
+            try:
+                if hasattr(self.pause_hotkey_button, 'keyboard_hook_temp'):
+                    keyboard.unhook(self.pause_hotkey_button.keyboard_hook_temp)
+                    delattr(self.pause_hotkey_button, 'keyboard_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(self.pause_hotkey_button, 'keyboard_hook_temp'):
+                        delattr(self.pause_hotkey_button, 'keyboard_hook_temp')
+                except Exception:
+                    pass
+            try:
+                if hasattr(self.pause_hotkey_button, 'mouse_hook_temp'):
+                    mouse.unhook(self.pause_hotkey_button.mouse_hook_temp)
+                    delattr(self.pause_hotkey_button, 'mouse_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(self.pause_hotkey_button, 'mouse_hook_temp'):
+                        delattr(self.pause_hotkey_button, 'mouse_hook_temp')
+                except Exception:
+                    pass
+            try:
+                if hasattr(self.pause_hotkey_button, 'shift_release_hooks'):
+                    for h in getattr(self.pause_hotkey_button, 'shift_release_hooks', []) or []:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(self.pause_hotkey_button, 'shift_release_hooks')
+                if hasattr(self.pause_hotkey_button, 'ctrl_release_hooks'):
+                    for h in getattr(self.pause_hotkey_button, 'ctrl_release_hooks', []) or []:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(self.pause_hotkey_button, 'ctrl_release_hooks')
+            except Exception:
+                pass
+        
+        # Track whether a non-modifier was pressed
+        combo_state = {'non_modifier_pressed': False}
+
+        def _assign_pause_hotkey_and_register(hk_str):
+            # Final validation: Check if this is a mouse button (button1 or button2) and validate against checkbox
+            is_left_button = hk_str == 'button1' or hk_str.startswith('button1+') or hk_str.endswith('+button1') or '+button1+' in hk_str
+            is_right_button = hk_str == 'button2' or hk_str.startswith('button2+') or hk_str.endswith('+button2') or '+button2+' in hk_str
+            is_mouse_button = is_left_button or is_right_button
+            
+            if is_mouse_button:
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        checkbox_value = self.allow_mouse_buttons_var.get()
+                        allow_mouse_buttons = bool(checkbox_value)
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                        allow_mouse_buttons = False
+                
+                if not allow_mouse_buttons:
+                    self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                    try:
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                    except Exception as e:
+                        print(f"Error showing warning: {e}")
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return False
+            
+            # Check duplicate against area hotkeys and stop hotkey
+            for area in self.areas:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == hk_str:
+                    show_thinkr_warning(self, area_name_var.get())
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                    finish_hotkey_assignment()
+                    return False
+            # Check against stop hotkey
+            if hasattr(self, 'stop_hotkey') and self.stop_hotkey == hk_str:
+                messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+            # Check against pause hotkey
+            if hasattr(self, 'pause_hotkey') and self.pause_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Pause/Play Hotkey")
+                return False
+            # Check against repeat latest scan hotkey
+            if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Repeat Last Scan Hotkey")
+                return False
+            # Clean old pause hotkey hooks
+            if hasattr(self, 'pause_hotkey'):
+                try:
+                    if hasattr(self.pause_hotkey_button, 'mock_button'):
+                        self._cleanup_hooks(self.pause_hotkey_button.mock_button)
+                except Exception as e:
+                    print(f"Error cleaning up pause hotkey hooks: {e}")
+            self.pause_hotkey = hk_str
+            self._set_unsaved_changes('hotkey_changed', 'Pause/Play Hotkey')  # Mark as unsaved when pause hotkey changes
+            # Save to settings file (APP_SETTINGS_PATH)
+            self._save_pause_hotkey(hk_str)
+            # Register
+            mock_button = type('MockButton', (), {'hotkey': hk_str, 'is_pause_button': True})
+            self.pause_hotkey_button.mock_button = mock_button
+            self.setup_hotkey(self.pause_hotkey_button.mock_button, None)
+            # Nicer display mapping for sided modifiers and numpad
+            display_name = hk_str.replace('numpad ', 'NUMPAD ').replace('num_', 'num:') \
+                                   .replace('ctrl','CTRL') \
+                                   .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                   .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                                   .replace('windows','WIN') \
+                                   .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+            self.pause_hotkey_button.config(text=f"Pause/Play Hotkey: [ {display_name.upper()} ]")
+            print(f"Set Pause/Play hotkey: {hk_str}\n--------------------------")
+            self.setting_hotkey = False
+            self._hotkey_assignment_cancelled = True
+            finish_hotkey_assignment()
+            # Expand window width if needed for longer hotkey text
+            self._ensure_window_width()
+            return True
+
+        def on_key_press(event):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            # Ignore Escape
+            if event.scan_code == 1:
+                return
+            
+            # Use the same key detection logic as set_stop_hotkey
+            scan_code = getattr(event, 'scan_code', None)
+            raw_name = (event.name or '').lower()
+            name = normalize_key_name(raw_name)
+            
+            # Handle modifier keys consistently (same as set_stop_hotkey)
+            if scan_code == 29:  # Left Ctrl
+                name = 'ctrl'
+            elif scan_code == 157:  # Right Ctrl
+                name = 'ctrl'
+            elif scan_code == 42:  # Left Shift
+                name = 'shift'
+            elif scan_code == 54:  # Right Shift
+                name = 'shift'
+            elif scan_code == 56:  # Left Alt
+                name = 'left alt'
+            elif scan_code == 184:  # Right Alt
+                name = 'right alt'
+            elif scan_code == 91 or scan_code == 92:  # Windows keys
+                name = 'windows'
+            else:
+                # For non-modifier keys, use similar logic as set_stop_hotkey
+                if scan_code in self.numpad_scan_codes:
+                    sym = self.numpad_scan_codes[scan_code]
+                    name = f"num_{sym}"
+                elif scan_code in self.arrow_key_scan_codes:
+                    name = self.arrow_key_scan_codes[scan_code]
+                elif scan_code in self.keyboard_number_scan_codes:
+                    name = self.keyboard_number_scan_codes[scan_code]
+                elif scan_code in self.special_key_scan_codes:
+                    name = self.special_key_scan_codes[scan_code]
+
+            # Non-modifier pressed
+            if name not in ('ctrl','alt','left alt','right alt','shift','windows'):
+                combo_state['non_modifier_pressed'] = True
+            # Bare modifier assignment path
+            if name in ('ctrl','shift','alt','left alt','right alt','windows'):
+                def _assign_bare_modifier():
+                    if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                        return
+                    try:
+                        held = []
+                        left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                        if left_ctrl_pressed or right_ctrl_pressed: held.append('ctrl')
+                        if keyboard.is_pressed('shift'): held.append('shift')
+                        if keyboard.is_pressed('left alt'): held.append('left alt')
+                        if keyboard.is_pressed('right alt'): held.append('right alt')
+                        if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                            held.append('windows')
+                        if len(held) == 1:
+                            only = held[0]
+                            base = None
+                            if 'ctrl' in name: base = 'ctrl'
+                            elif 'alt' in name: base = 'alt'
+                            elif 'shift' in name: base = 'shift'
+                            elif 'windows' in name: base = 'windows'
+                            
+                            if (base == 'ctrl' and only == 'ctrl') or \
+                               (base == 'alt' and (only in ['left alt','right alt'])) or \
+                               (base == 'shift' and only == 'shift') or \
+                               (base == 'windows' and only == 'windows'):
+                                key_name_local = only
+                                _assign_pause_hotkey_and_register(key_name_local)
+                                return
+                    except Exception:
+                        pass
+                try:
+                    self.root.after(300, _assign_bare_modifier)
+                except Exception as e:
+                    print(f"Debug: Error setting timer: {e}")
+                return
+
+            # Build combo from held modifiers + base key
+            try:
+                mods = []
+                left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                if left_ctrl_pressed or right_ctrl_pressed: mods.append('ctrl')
+                if keyboard.is_pressed('shift'): mods.append('shift')
+                if keyboard.is_pressed('left alt'): mods.append('left alt')
+                if keyboard.is_pressed('right alt'): mods.append('right alt')
+                if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                    mods.append('windows')
+            except Exception:
+                mods = []
+
+            base_key = name
+            
+            # Check if this is a mouse button
+            is_mouse_button = base_key in ['button1', 'button2'] or 'button1' in base_key or 'button2' in base_key
+            if is_mouse_button:
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    return
+            
+            if base_key in ("ctrl", "shift", "alt", "windows", "left alt", "right alt"):
+                combo_parts = (mods + [base_key]) if base_key not in mods else mods[:]
+            else:
+                combo_parts = mods + [base_key]
+            key_name = "+".join(p for p in combo_parts if p)
+
+            _assign_pause_hotkey_and_register(key_name)
+            return
+            
+        def on_mouse_click(event):
+            if (self._hotkey_assignment_cancelled or 
+                not self.setting_hotkey or 
+                not isinstance(event, mouse.ButtonEvent) or 
+                event.event_type != mouse.DOWN):
+                return
+            
+            button_identifier = event.button
+            is_left_button = button_identifier == 1 or str(button_identifier).lower() in ['left', 'primary', 'select', 'action', 'button1', 'mouse1']
+            is_right_button = button_identifier == 2 or str(button_identifier).lower() in ['right', 'secondary', 'context', 'alternate', 'button2', 'mouse2']
+            
+            if is_left_button or is_right_button:
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                    finish_hotkey_assignment()
+                    return
+                
+            key_name = f"button{event.button}"
+            
+            if not _assign_pause_hotkey_and_register(key_name):
+                return
+
+        # Set button to indicate we're waiting for input
+        self.pause_hotkey_button.config(text="Press any key or combination...")
+        
+        # Set up temporary hooks for key and mouse input
+        try:
+            self.pause_hotkey_button.keyboard_hook_temp = keyboard.on_press(on_key_press, suppress=True)
+            self.pause_hotkey_button.mouse_hook_temp = mouse.hook(on_mouse_click)
+            
+            # Live preview of currently held modifiers
+            def _update_hotkey_preview():
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                    return
+                try:
+                    if not hasattr(self, 'pause_hotkey_button') or not self.pause_hotkey_button.winfo_exists():
+                        return
+                except Exception:
+                    return
+                try:
+                    mods = []
+                    left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                    if left_ctrl_pressed or right_ctrl_pressed: mods.append('CTRL')
+                    if keyboard.is_pressed('shift'): mods.append('SHIFT')
+                    if keyboard.is_pressed('left alt'): mods.append('L-ALT')
+                    if keyboard.is_pressed('right alt'): mods.append('R-ALT')
+                    if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                        mods.append('WIN')
+                    preview = " + ".join(mods)
+                    if preview:
+                        self.pause_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                    else:
+                        self.pause_hotkey_button.config(text="Press any key or combination...")
+                    self._ensure_window_width()
+                except Exception:
+                    pass
+                try:
+                    self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+                except Exception:
+                    pass
+            
+            self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+        except Exception as e:
+            print(f"Error setting up hotkey hooks: {e}")
+            self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+            self.setting_hotkey = False
+            finish_hotkey_assignment()
+            return
+        
+        # Also listen for Shift key release
+        def on_shift_release(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            side_label = 'left'
+            try:
+                raw = (getattr(_e, 'name', '') or '').lower()
+                if 'right' in raw or 'right shift' in raw:
+                    side_label = 'right'
+            except Exception:
+                pass
+            key_name_local = f"{side_label} shift"
+            _assign_pause_hotkey_and_register(key_name_local)
+
+        try:
+            self.pause_hotkey_button.shift_release_hooks = [
+                keyboard.on_release_key('left shift', on_shift_release),
+                keyboard.on_release_key('right shift', on_shift_release),
+            ]
+        except Exception:
+            self.pause_hotkey_button.shift_release_hooks = []
+        
+        # Also listen for Ctrl key release
+        def on_ctrl_release_pause(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            key_name_local = "ctrl"
+            _assign_pause_hotkey_and_register(key_name_local)
+
+        try:
+            self.pause_hotkey_button.ctrl_release_hooks = [
+                keyboard.on_release_key('ctrl', on_ctrl_release_pause),
+            ]
+        except Exception:
+            self.pause_hotkey_button.ctrl_release_hooks = []
+
+        # Set a timer to reset the button if no key is pressed
+        def reset_button():
+            try:
+                if not hasattr(self, 'pause_hotkey_button') or not self.pause_hotkey_button.winfo_exists():
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return
+            except Exception:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+                return
+            
+            try:
+                if not hasattr(self, 'pause_hotkey') or not self.pause_hotkey:
+                    self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+                else:
+                    display_name = self._hotkey_to_display_name(self.pause_hotkey)
+                    self.pause_hotkey_button.config(text=f"Pause/Play Hotkey: [ {display_name} ]")
+            except Exception as e:
+                print(f"Error resetting pause hotkey button (button may have been destroyed): {e}")
+            finally:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+            
+        self.unhook_timer = self.root.after(4000, reset_button)
+
+    def set_controller_stop_hotkey(self):
+        """Set stop hotkey using controller button"""
+        if not CONTROLLER_AVAILABLE:
+            messagebox.showwarning("Controller Not Available", 
+                                 "Controller support is not available. Please install the 'inputs' library.")
+            return
+            
+        # Clean up temporary hooks and disable all hotkeys
+        try:
+            # During hotkey assignment, don't block InputManager - we rely on self.setting_hotkey flag
+            self.disable_all_hotkeys(block_input_manager=False)
+        except Exception as e:
+            print(f"Warning: Error cleaning up temporary hooks: {e}")
+
+        self._hotkey_assignment_cancelled = False
+        self.setting_hotkey = True
+        
+        def finish_hotkey_assignment():
+            try:
+                self.stop_speaking()
+                print("System reinitialized. Audio stopped.")
+            except Exception as e:
+                print(f"Error during forced stop: {e}")
+            
+            try:
+                self.restore_all_hotkeys()
+            except Exception as e:
+                print(f"Warning: Error restoring hotkeys: {e}")
+            
+            self.setting_hotkey = False
+            self.controller_hotkey_button.config(text="Controller")
+        
+        # Set button to indicate we're waiting for controller input
+        self.controller_hotkey_button.config(text="Press controller button...")
+        
+        # Start controller monitoring in a separate thread
+        def monitor_controller():
+            try:
+                button_name = self.controller_handler.wait_for_button_press(timeout=15)
+                if button_name and not self._hotkey_assignment_cancelled:
+                    key_name = f"controller_{button_name}"
+                    
+                    # Check if this controller button is already used by any area
+                    for area in self.areas:
+                        area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                        if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == key_name:
+                            show_thinkr_warning(self, area_name_var.get())
+                            self._hotkey_assignment_cancelled = True
+                            finish_hotkey_assignment()
+                            return
+                    
+                    # Remove existing stop hotkey if it exists
+                    if hasattr(self, 'stop_hotkey'):
+                        try:
+                            if hasattr(self.stop_hotkey_button, 'mock_button'):
+                                self._cleanup_hooks(self.stop_hotkey_button.mock_button)
+                        except Exception as e:
+                            print(f"Error cleaning up stop hotkey hooks: {e}")
+                    
+                    self.stop_hotkey = key_name
+                    self._set_unsaved_changes('hotkey_changed', 'Stop Hotkey')  # Mark as unsaved when stop hotkey changes
+                    # Save to settings file (APP_SETTINGS_PATH)
+                    self._save_stop_hotkey(key_name)
+                    
+                    # Create a mock button object to use with setup_hotkey
+                    mock_button = type('MockButton', (), {'hotkey': key_name, 'is_stop_button': True})
+                    self.stop_hotkey_button.mock_button = mock_button
+                    
+                    # Setup the hotkey
+                    self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+                    
+                    display_name = f"Controller {button_name}"
+                    self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name.upper()} ]")
+                    print(f"Set Stop hotkey: {key_name}\n--------------------------")
+                    
+                    # Mark assignment as cancelled immediately so the button can be used right away
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    
+                    finish_hotkey_assignment()
+                    # Expand window width if needed for longer hotkey text
+                    self.root.after(100, self._ensure_window_width)
+                else:
+                    # Timeout or cancelled
+                    self.controller_hotkey_button.config(text="Controller")
+                    finish_hotkey_assignment()
+            except Exception as e:
+                print(f"Error in controller monitoring: {e}")
+                self.controller_hotkey_button.config(text="Controller")
+                finish_hotkey_assignment()
+        
+        # Start controller monitoring in background
+        threading.Thread(target=monitor_controller, daemon=True).start()
+        
+        # Set a timer to reset if no button is pressed
+        def reset_button():
+            # Check if buttons still exist before trying to configure them
+            try:
+                controller_exists = hasattr(self, 'controller_hotkey_button') and self.controller_hotkey_button.winfo_exists()
+                stop_button_exists = hasattr(self, 'stop_hotkey_button') and self.stop_hotkey_button.winfo_exists()
+                
+                if controller_exists:
+                    self.controller_hotkey_button.config(text="Controller")
+                
+                # Also restore the stop hotkey button if a hotkey exists
+                if stop_button_exists and hasattr(self, 'stop_hotkey') and self.stop_hotkey:
+                    display_name = self._hotkey_to_display_name(self.stop_hotkey)
+                    self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name} ]")
+            except Exception as e:
+                # Buttons may have been destroyed
+                print(f"Error resetting controller hotkey buttons (buttons may have been destroyed): {e}")
+            finally:
+                self._hotkey_assignment_cancelled = True
+                finish_hotkey_assignment()
+            
+        self.unhook_timer = self.root.after(4000, reset_button)
+
+    def set_edit_area_hotkey(self, button):
+        """Set hotkey for opening the edit area view."""
+        # Clean up temporary hooks and disable all hotkeys
+        try:
+            # During hotkey assignment, don't block InputManager - we rely on self.setting_hotkey flag
+            self.disable_all_hotkeys(block_input_manager=False)
+        except Exception as e:
+            print(f"Warning: Error cleaning up temporary hooks: {e}")
+
+        self._hotkey_assignment_cancelled = False
+        self.setting_hotkey = True
+
+        def finish_hotkey_assignment():
+            # Restore all hotkeys after assignment is done
+            try:
+                self.restore_all_hotkeys()
+            except Exception as e:
+                print(f"Warning: Error restoring hotkeys: {e}")
+            # Cleanup any temp hooks and preview
+            try:
+                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                    self._hotkey_preview_job = None
+            except Exception:
+                pass
+            # Cancel unhook timer if it exists
+            try:
+                if hasattr(self, 'unhook_timer') and self.unhook_timer:
+                    self.root.after_cancel(self.unhook_timer)
+                    self.unhook_timer = None
+            except Exception:
+                pass
+            try:
+                if hasattr(button, 'keyboard_hook_temp'):
+                    keyboard.unhook(button.keyboard_hook_temp)
+                    delattr(button, 'keyboard_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        delattr(button, 'keyboard_hook_temp')
+                except Exception:
+                    pass
+            try:
+                if hasattr(button, 'mouse_hook_temp'):
+                    mouse.unhook(button.mouse_hook_temp)
+                    delattr(button, 'mouse_hook_temp')
+            except Exception:
+                try:
+                    if hasattr(button, 'mouse_hook_temp'):
+                        delattr(button, 'mouse_hook_temp')
+                except Exception:
+                    pass
+
+        def _save_edit_area_hotkey(hk_str):
+            """Save edit area hotkey to the settings file"""
+            try:
+                import tempfile, os, json
+                game_reader_dir = APP_DOCUMENTS_DIR
+                os.makedirs(game_reader_dir, exist_ok=True)
+                temp_path = APP_SETTINGS_PATH
+                
+                # Load existing settings or create new ones
+                settings = {}
+                if os.path.exists(temp_path):
+                    try:
+                        with open(temp_path, 'r', encoding='utf-8') as f:
+                            settings = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                        print(f"Error loading settings: {e}")
+                        settings = {}
+                
+                # Save the edit area hotkey
+                settings['edit_area_hotkey'] = hk_str
+                # Update instance variable to keep in sync
+                self.edit_area_hotkey = hk_str
+                
+                # Save the updated settings
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, indent=4)
+            except Exception as e:
+                print(f"Error saving edit area hotkey: {e}")
+
+        def _assign_edit_area_hotkey_and_register(hk_str):
+            # Final validation: Check if this is a mouse button (button1 or button2) and validate against checkbox
+            # Check if hk_str is exactly button1/button2, or contains them as part of a combination
+            is_mouse_button = hk_str in ['button1', 'button2'] or 'button1' in hk_str or 'button2' in hk_str
+            if is_mouse_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    # Reset button text and show warning
+                    button.config(text="Hotkey:\nclick")
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return False
+            
+            # Check duplicate against area hotkeys and stop hotkey
+            for area in self.areas:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == hk_str:
+                    show_thinkr_warning(self, area_name_var.get())
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    button.config(text="Hotkey:\nclick")
+                    finish_hotkey_assignment()
+                    return False
+            # Check against stop hotkey
+            if hasattr(self, 'stop_hotkey') and self.stop_hotkey == hk_str:
+                messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+            # Check against pause hotkey
+            if hasattr(self, 'pause_hotkey') and self.pause_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                button.config(text="Edit Area Hotkey:\nclick to set a hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Pause/Play Hotkey")
+                return False
+            # Check against repeat latest scan hotkey
+            if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey == hk_str:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                button.config(text="Edit Area Hotkey:\nclick to set a hotkey")
+                finish_hotkey_assignment()
+                show_thinkr_warning(self, "Repeat Last Scan Hotkey")
+                return False
+            # Clean old edit area hotkey hooks
+            if hasattr(button, 'mock_button'):
+                try:
+                    self._cleanup_hooks(button.mock_button)
+                except Exception as e:
+                    print(f"Error cleaning up edit area hotkey hooks: {e}")
+            # Save to settings
+            _save_edit_area_hotkey(hk_str)
+            # Register
+            mock_button = type('MockButton', (), {'hotkey': hk_str, 'is_edit_area_button': True})
+            button.mock_button = mock_button
+            button.hotkey = hk_str
+            # Update instance variable to keep in sync
+            self.edit_area_hotkey_mock_button = mock_button
+            self.setup_hotkey(button.mock_button, None)
+            # Track hotkey change
+            self._set_unsaved_changes('hotkey_changed', 'Editor Toggle Hotkey')
+            # Display mapping
+            display_name = hk_str.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if hk_str.startswith('num_') else hk_str.replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+            button.config(text=f"Hotkey:\n{display_name.upper()}")
+            print(f"Set Edit Area hotkey: {hk_str}\n--------------------------")
+            self.setting_hotkey = False
+            self._hotkey_assignment_cancelled = True
+            finish_hotkey_assignment()
+            return True
+
+        # Track whether a non-modifier was pressed
+        combo_state = {'non_modifier_pressed': False}
+
+        def on_key_press(event):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            # Ignore Escape
+            if event.scan_code == 1:
+                return
+            
+            # Use the same key detection logic as set_stop_hotkey
+            scan_code = getattr(event, 'scan_code', None)
+            raw_name = (event.name or '').lower()
+            name = normalize_key_name(raw_name)
+            
+            # Handle modifier keys
+            if scan_code == 29:  # Left Ctrl
+                name = 'ctrl'
+            elif scan_code == 157:  # Right Ctrl
+                name = 'ctrl'
+            elif scan_code == 42:  # Left Shift
+                name = 'shift'
+            elif scan_code == 54:  # Right Shift
+                name = 'shift'
+            elif scan_code == 56:  # Left Alt
+                name = 'left alt'
+            elif scan_code == 184:  # Right Alt
+                name = 'right alt'
+            elif scan_code == 91:  # Left Windows
+                name = 'windows'
+            elif scan_code == 92:  # Right Windows
+                name = 'windows'
+            else:
+                # For non-modifier keys, use similar logic as set_stop_hotkey
+                if scan_code in self.numpad_scan_codes:
+                    sym = self.numpad_scan_codes[scan_code]
+                    name = f"num_{sym}"
+                elif scan_code in self.arrow_key_scan_codes:
+                    name = self.arrow_key_scan_codes[scan_code]
+                elif scan_code in self.keyboard_number_scan_codes:
+                    name = self.keyboard_number_scan_codes[scan_code]
+                elif scan_code in self.special_key_scan_codes:
+                    name = self.special_key_scan_codes[scan_code]
+
+            # Non-modifier pressed
+            if name not in ('ctrl','alt','left alt','right alt','shift','windows'):
+                combo_state['non_modifier_pressed'] = True
+            # Bare modifier assignment path
+            if name in ('ctrl','shift','alt','left alt','right alt','windows'):
+                def _assign_bare_modifier():
+                    if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                        return
+                    try:
+                        held = []
+                        left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                        if left_ctrl_pressed or right_ctrl_pressed: held.append('ctrl')
+                        if keyboard.is_pressed('shift'): held.append('shift')
+                        if keyboard.is_pressed('left alt'): held.append('left alt')
+                        if keyboard.is_pressed('right alt'): held.append('right alt')
+                        if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                            held.append('windows')
+                        if len(held) == 1:
+                            only = held[0]
+                            base = None
+                            if 'ctrl' in name: base = 'ctrl'
+                            elif 'alt' in name: base = 'alt'
+                            elif 'shift' in name: base = 'shift'
+                            elif 'windows' in name: base = 'windows'
+                            
+                            if (base == 'ctrl' and only == 'ctrl') or \
+                               (base == 'alt' and (only in ['left alt','right alt'])) or \
+                               (base == 'shift' and only == 'shift') or \
+                               (base == 'windows' and only == 'windows'):
+                                key_name_local = only
+                                _assign_edit_area_hotkey_and_register(key_name_local)
+                                return
+                    except Exception:
+                        pass
+                # Using 300ms to give user enough time to press all keys in a multi-key combination (reduced from 800ms)
+                try:
+                    self.root.after(300, _assign_bare_modifier)
+                except Exception as e:
+                    print(f"Debug: Error setting timer: {e}")
+                return
+
+            # Build combo from held modifiers + base key
+            try:
+                mods = []
+                left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                if left_ctrl_pressed or right_ctrl_pressed: mods.append('ctrl')
+                if keyboard.is_pressed('shift'): mods.append('shift')
+                if keyboard.is_pressed('left alt'): mods.append('left alt')
+                if keyboard.is_pressed('right alt'): mods.append('right alt')
+                if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                    mods.append('windows')
+            except Exception:
+                mods = []
+
+            base_key = name
+            # Check if this is a mouse button (button1 or button2) and validate against checkbox
+            # Check if base_key is button1 or button2, or contains them (for combinations)
+            is_mouse_button = base_key in ['button1', 'button2'] or 'button1' in base_key or 'button2' in base_key
+            if is_mouse_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    # Reset button text and show warning
+                    button.config(text="Hotkey:\nclick")
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    return
+            
+            if base_key in ("ctrl", "shift", "alt", "windows", "left alt", "right alt"):
+                combo_parts = (mods + [base_key]) if base_key not in mods else mods[:]
+            else:
+                combo_parts = mods + [base_key]
+            key_name = "+".join(p for p in combo_parts if p)
+
+            _assign_edit_area_hotkey_and_register(key_name)
+            return
+            
+        def on_mouse_click(event):
+            if (self._hotkey_assignment_cancelled or 
+                not self.setting_hotkey or 
+                not isinstance(event, mouse.ButtonEvent) or 
+                event.event_type != mouse.DOWN):
+                return
+                
+            # Only show warning for left (button1) and right (button2) mouse buttons when not allowed
+            if event.button in [1, 2]:
+                if not hasattr(self, 'allow_mouse_buttons_var') or not self.allow_mouse_buttons_var.get():
+                    messagebox.showwarning(
+                        "Error", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    button.config(text="Hotkey:\nclick")
+                    finish_hotkey_assignment()
+                    return
+                
+            key_name = f"button{event.button}"
+            
+            # Check if this mouse button is already used
+            for area in self.areas:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == key_name:
+                    show_thinkr_warning(self, area_name_var.get())
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    button.config(text="Hotkey:\nclick")
+                    finish_hotkey_assignment()
+                    return
+            
+            # Check against stop hotkey
+            if hasattr(self, 'stop_hotkey') and self.stop_hotkey == key_name:
+                messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                button.config(text="Edit Area Hotkey:\nclick to set a hotkey")
+                finish_hotkey_assignment()
+                return
+            
+            # Clean old hooks
+            if hasattr(button, 'mock_button'):
+                try:
+                    self._cleanup_hooks(button.mock_button)
+                except Exception as e:
+                    print(f"Error cleaning up edit area hotkey hooks: {e}")
+            
+            # Save and register
+            _save_edit_area_hotkey(key_name)
+            mock_button = type('MockButton', (), {'hotkey': key_name, 'is_edit_area_button': True})
+            button.mock_button = mock_button
+            button.hotkey = key_name
+            self.setup_hotkey(button.mock_button, None)
+            
+            display_name = f"Mouse Button {event.button}"
+            button.config(text=f"Hotkey:\n{display_name.upper()}")
+            print(f"Set Edit Area hotkey: {key_name}\n--------------------------")
+            
+            self.setting_hotkey = False
+            self._hotkey_assignment_cancelled = True
+            finish_hotkey_assignment()
+            return
+
+        # Set button to indicate we're waiting for input
+        button.config(text="Press any key or combination...")
+        
+        # Set up temporary hooks for key and mouse input
+        try:
+            button.keyboard_hook_temp = keyboard.on_press(on_key_press, suppress=True)
+            button.mouse_hook_temp = mouse.hook(on_mouse_click)
+            
+            # Live preview of currently held modifiers
+            def _update_hotkey_preview():
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                    return
+                try:
+                    # Check if button still exists before trying to configure it
+                    if not button.winfo_exists():
+                        return
+                except Exception:
+                    return
+                try:
+                    mods = []
+                    left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                    if left_ctrl_pressed or right_ctrl_pressed: mods.append('CTRL')
+                    if keyboard.is_pressed('shift'): mods.append('SHIFT')
+                    if keyboard.is_pressed('left alt'): mods.append('L-ALT')
+                    if keyboard.is_pressed('right alt'): mods.append('R-ALT')
+                    if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                        mods.append('WIN')
+                    preview = " + ".join(mods)
+                    if preview:
+                        button.config(text=f"Press any key or combination...\n[ {preview} + ]")
+                    else:
+                        button.config(text="Press any key or combination...")
+                    # Live expand window width if needed
+                    self._ensure_window_width()
+                except Exception:
+                    pass
+                try:
+                    self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+                except Exception:
+                    pass
+            
+            self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+        except Exception as e:
+            print(f"Error setting up hotkey hooks: {e}")
+            button.config(text="Edit Area Hotkey:\nclick to set a hotkey")
+            self.setting_hotkey = False
+            finish_hotkey_assignment()
+            return
+        
+        # Set a timer to reset the button if no key is pressed
+        def reset_button():
+            # Check if button still exists before trying to configure it
+            try:
+                if not button.winfo_exists():
+                    # Button was destroyed, just clean up
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    return
+            except Exception:
+                # Button doesn't exist or was destroyed
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+                return
+            
+            try:
+                if not hasattr(button, 'hotkey') or not button.hotkey:
+                    button.config(text="Hotkey:\nclick")
+                else:
+                    # Restore the previous hotkey display
+                    display_name = button.hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if button.hotkey.startswith('num_') else button.hotkey.replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    button.config(text=f"Hotkey:\n{display_name.upper()}")
+            except Exception as e:
+                # Button was destroyed between check and config
+                print(f"Error resetting button (button may have been destroyed): {e}")
+            finally:
+                self._hotkey_assignment_cancelled = True
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+            
+        self.unhook_timer = self.root.after(4000, reset_button)
+
+    def _save_repeat_latest_hotkey(self, hotkey):
+        """Save repeat latest hotkey to the settings file"""
+        try:
+            import tempfile, os, json
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    settings = {}
+            
+            # Save the repeat latest hotkey
+            settings['repeat_latest_hotkey'] = hotkey
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving repeat latest hotkey: {e}")
+
+    def _save_pause_hotkey(self, hotkey):
+        """Save pause/play hotkey to the settings file"""
+        try:
+            import tempfile, os, json
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    settings = {}
+            
+            # Save the pause/play hotkey
+            settings['pause_hotkey'] = hotkey
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving pause/play hotkey: {e}")
+
+    def _save_stop_hotkey(self, hotkey):
+        """Save stop hotkey to the settings file"""
+        try:
+            import tempfile, os, json
+            game_reader_dir = APP_DOCUMENTS_DIR
+            os.makedirs(game_reader_dir, exist_ok=True)
+            temp_path = APP_SETTINGS_PATH
+            
+            # Load existing settings or create new ones
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                    print(f"Error loading settings: {e}")
+                    settings = {}
+            
+            # Save the stop hotkey
+            settings['stop_hotkey'] = hotkey
+            
+            # Save the updated settings
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving stop hotkey: {e}")
+
+    def add_auto_read_area(self):
+        """Add a new Auto Read area with automatic numbering."""
+        # Count existing Auto Read areas to determine the next number
+        auto_read_count = 0
+        for area in self.areas:
+            if len(area) >= 9:
+                area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+            else:
+                area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                # Extract number from "Auto Read" or "Auto Read 1", "Auto Read 2", etc.
+                if area_name == "Auto Read":
+                    # Treat "Auto Read" (no number) as "Auto Read 1"
+                    auto_read_count = max(auto_read_count, 1)
+                else:
+                    try:
+                        # Try to extract number from "Auto Read 1", "Auto Read 2", etc.
+                        num_str = area_name.replace("Auto Read", "").strip()
+                        if num_str:
+                            num = int(num_str)
+                            auto_read_count = max(auto_read_count, num)
+                        else:
+                            auto_read_count = max(auto_read_count, 1)
+                    except ValueError:
+                        auto_read_count = max(auto_read_count, 1)
+        
+        # Always use numbered names (never just "Auto Read")
+        # Start from 1, so first area is "Auto Read 1"
+        next_number = auto_read_count + 1
+        area_name = f"Auto Read {next_number}"
+        
+        # Add the new Auto Read area (removable=True, editable_name=False)
+        self.add_read_area(removable=True, editable_name=False, area_name=area_name)
+        
+        # add_read_area already calls resize_window(force=True) at the end,
+        # but we ensure all widgets are updated first for smoother resizing
+        self.root.update_idletasks()
+    
+    def save_all_auto_read_areas(self):
+        """Save settings for all Auto Read areas to the layout file."""
+        import os
+        
+        # Check if a layout file is loaded
+        current_layout_file = self.layout_file.get()
+        if not current_layout_file or not os.path.exists(current_layout_file):
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="No layout file loaded - save layout first", fg="orange")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+            return
+        
+        # Find all Auto Read areas
+        auto_read_areas = []
+        for area in self.areas:
+            if len(area) >= 9:
+                area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, _ = area[:9]
+            else:
+                area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var = area[:8]
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                auto_read_areas.append(area_name)
+        
+        if not auto_read_areas:
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="No Auto Read areas to save", fg="orange")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+            return
+        
+        # Save to layout file using auto-save
+        try:
+            self.save_layout_auto()
+            saved_count = len(auto_read_areas)
+            # Show status message
+            if hasattr(self, 'status_label'):
+                if saved_count > 0:
+                    self.status_label.config(text=f"Saved settings for {saved_count} Auto Read area(s)", fg="black")
+                else:
+                    self.status_label.config(text="Failed to save Auto Read area settings", fg="red")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+        except Exception as e:
+            print(f"Error saving Auto Read area settings: {e}")
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Failed to save Auto Read area settings", fg="red")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+
+    def validate_numeric_input(self, P, is_speed=False):
+        """Validate input to only allow numbers with different limits for speed and volume"""
+        if P == "":  # Allow empty field
+            return True
+        # Only allow digits, no other characters
+        if not P.isdigit():
+            return False
+        value = int(P)
+        if is_speed:  # No upper limit for speed
+            return value >= 0  # Only check that it's not negative
+        else:  # For volume, keep 0-100 limit
+            return 0 <= value <= 100
+
+    def add_read_area(self, removable=True, editable_name=True, area_name="Area Name"):
+        # Check if this is an Auto Read area
+        is_auto_read = area_name.startswith("Auto Read")
+        
+        # Auto-number areas with duplicate names (only for non-Auto Read areas)
+        if not is_auto_read:
+            # Get all existing area names (excluding Auto Read areas)
+            existing_names = set()
+            for area in self.areas:
+                if len(area) > 3:
+                    name_var = area[3]
+                    existing_name = name_var.get()
+                    if not existing_name.startswith("Auto Read"):
+                        existing_names.add(existing_name)
+            
+            # If the name already exists, append a number
+            if area_name in existing_names:
+                base_name = area_name
+                counter = 2
+                new_name = f"{base_name} {counter}"
+                
+                # Find the next available number
+                while new_name in existing_names:
+                    counter += 1
+                    new_name = f"{base_name} {counter}"
+                
+                area_name = new_name
+        
+        # Limit area name to 15 characters
+        if len(area_name) > 15:
+            area_name = area_name[:15]
+        
+        # Decide parent: place Auto Read areas in the Auto Read frame
+        parent_container = self.area_frame
+        if is_auto_read and hasattr(self, 'auto_read_frame'):
+            parent_container = self.auto_read_frame
+
+        area_frame = tk.Frame(parent_container)
+        area_frame.pack(pady=(4, 0), anchor='center')
+        area_name_var = tk.StringVar(value=area_name)
+        area_name_label = tk.Label(area_frame, textvariable=area_name_var)
+        area_name_label.pack(side="left")
+        
+        # Add separator after area name
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+        
+        # Add "Freez Screen" checkbox for Auto Read areas only
+        freeze_screen_var = None
+        if is_auto_read:
+            freeze_screen_var = tk.BooleanVar(value=False)
+            freeze_screen_checkbox = tk.Checkbutton(area_frame, text="Freez\nScreen", variable=freeze_screen_var)
+            freeze_screen_checkbox.pack(side="left")
+            # Track freeze screen checkbox changes to mark as unsaved
+            def on_freeze_screen_change(*args):
+                area_name = area_name_var.get()
+                self._set_unsaved_changes('area_settings', area_name)
+            freeze_screen_var.trace('w', on_freeze_screen_change)
+            # Add separator
+            tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+        
+        # For Auto Read, never allow editing or right-click
+        if editable_name and not is_auto_read:
+            def prompt_edit_area_name(event=None):
+                try:
+                    self.disable_all_hotkeys()
+                    new_name = self._edit_area_name_dialog(area_name_var.get())
+                    if new_name and new_name.strip():
+                        new_name = new_name.strip()
+                        # Limit to 15 characters
+                        if len(new_name) > 15:
+                            new_name = new_name[:15]
+                        area_name_var.set(new_name)
+                        area_name = area_name_var.get()
+                        self._set_unsaved_changes('area_settings', area_name)  # Mark as unsaved when area name changes
+                finally:
+                    try:
+                        self.restore_all_hotkeys()
+                    except Exception as e:
+                        print(f"Error restoring hotkeys after rename: {e}")
+                self.resize_window()
+            area_name_label.bind('<Button-3>', prompt_edit_area_name)  # Right-click to edit
+
+        # Initialize the button first
+        # Set Area buttons are now hidden - use the "Edit Areas" button in the main window instead
+        # Auto Read areas don't have Set Area button - area selection is triggered by hotkey
+        set_area_button = None
+
+        # Always add hotkey button for all areas, including Auto Read
+        hotkey_button = tk.Button(area_frame, text="Set Hotkey")
+        hotkey_button.config(command=lambda: self.set_hotkey(hotkey_button, area_frame))
+        hotkey_button.pack(side="left")
+        
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+
+        # Add Img. Processing button with checkbox
+        customize_button = tk.Button(area_frame, text="Img. Processing...", command=partial(self.customize_processing, area_name_var))
+        customize_button.pack(side="left")
+        tk.Label(area_frame, text=" Enable:").pack(side="left")  # Label for the checkbox
+        preprocess_var = tk.BooleanVar()
+        preprocess_checkbox = tk.Checkbutton(area_frame, variable=preprocess_var)
+        preprocess_checkbox.pack(side="left")
+        # Track preprocess checkbox changes to mark as unsaved
+        def on_preprocess_change(*args):
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        preprocess_var.trace('w', on_preprocess_change)
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+
+        # Get voice descriptions for the dropdown menu and create display names
+        voice_names = []
+        voice_display_names = []
+        voice_full_names = {}  # Map display names to full names
+        
+        if hasattr(self, 'voices') and self.voices:
+            try:
+                for i, voice in enumerate(self.voices, 1):
+                    full_name = voice.GetDescription()
+                    voice_names.append(full_name)
+                    
+                    # Create abbreviated display name with numbering
+                    if "Microsoft" in full_name and " - " in full_name:
+                        # Format: "Microsoft David - en-US" -> "1. David (en-US)"
+                        parts = full_name.split(" - ")
+                        if len(parts) == 2:
+                            voice_part = parts[0].replace("Microsoft ", "")
+                            lang_part = parts[1]
+                            display_name = f"{i}. {voice_part} ({lang_part})"
+                        else:
+                            display_name = f"{i}. {full_name}"
+                    elif " - " in full_name:
+                        # Format: "David - en-US" -> "1. David (en-US)"
+                        parts = full_name.split(" - ")
+                        if len(parts) == 2:
+                            display_name = f"{i}. {parts[0]} ({parts[1]})"
+                        else:
+                            display_name = f"{i}. {full_name}"
+                    else:
+                        display_name = f"{i}. {full_name}"
+                    
+                    
+                    voice_display_names.append(display_name)
+                    voice_full_names[display_name] = full_name
+            except Exception as e:
+                print(f"Warning: Could not get voice descriptions: {e}")
+                voice_names = []
+                voice_display_names = []
+        
+        # Set default voice to the first voice in the list, or fallback if none available
+        default_voice = voice_display_names[0] if voice_display_names else "No voices available"
+        voice_var = tk.StringVar(value=default_voice)
+        
+        # Voice selection setup
+        
+        # Function to update the actual voice when display name is selected
+        def on_voice_selection(*args):
+            selected_display = voice_var.get()
+            if selected_display in voice_full_names:
+                # Store the full name for actual speech
+                voice_var._full_name = voice_full_names[selected_display]
+            else:
+                voice_var._full_name = selected_display
+            # Mark as unsaved when voice changes
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        
+        # Set the full name for the default voice
+        if default_voice in voice_full_names:
+            voice_var._full_name = voice_full_names[default_voice]
+        
+        # Create the OptionMenu with display names and command
+        voice_menu = tk.OptionMenu(
+            area_frame, 
+            voice_var,
+            *voice_display_names if voice_display_names else ["No voices available"],
+            command=on_voice_selection
+        )
+        # Set a fixed width to prevent layout issues when voice names change
+        # This ensures the dropdown doesn't change size and push other elements around
+        voice_menu.config(width=40)  # Fixed width that can accommodate most voice names
+        
+        # Configure the OptionMenu to display text left-aligned instead of centered
+        # This prevents long names from being cut off on the sides
+        voice_menu.config(anchor="w")  # "w" = west (left-aligned)
+        
+        voice_menu.pack(side="left")
+        
+
+
+        
+
+        
+
+        
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+
+        speed_var = tk.StringVar(value="100")
+        tk.Label(area_frame, text="Reading Speed % :").pack(side="left")
+        vcmd = (self.root.register(lambda P: self.validate_numeric_input(P, is_speed=True)), '%P')
+        speed_entry = tk.Entry(area_frame, textvariable=speed_var, width=5, validate='all', validatecommand=vcmd)
+        speed_entry.pack(side="left")
+        # Track speed changes to mark as unsaved
+        def on_speed_change(*args):
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        speed_var.trace('w', on_speed_change)
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+        
+        speed_entry.bind('<Control-v>', lambda e: 'break')
+        speed_entry.bind('<Control-V>', lambda e: 'break')
+        speed_entry.bind('<Key>', lambda e: self.validate_speed_key(e, speed_var))
+        
+        # Add PSM dropdown
+        psm_var = tk.StringVar(value="3 (Default - Fully auto, no OSD)")
+        psm_options = [
+            "0 (OSD only)",
+            "1 (Auto + OSD)",
+            "2 (Auto, no OSD, no block)",
+            "3 (Default - Fully auto, no OSD)",
+            "4 (Single column)",
+            "5 (Single uniform block)",
+            "6 (Single uniform block of text)",
+            "7 (Single text line)",
+            "8 (Single word)",
+            "9 (Single word in circle)",
+            "10 (Single character)",
+            "11 (Sparse text)",
+            "12 (Sparse text + OSD)",
+            "13 (Raw line - no layout)"
+        ]
+        tk.Label(area_frame, text="PSM:").pack(side="left")
+        # Function to handle PSM selection and mark as unsaved
+        def on_psm_selection(*args):
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        psm_menu = tk.OptionMenu(
+            area_frame,
+            psm_var,
+            psm_options[0],  # Use first option as default for menu order
+            *psm_options[1:],  # Pass remaining options to avoid duplication
+            command=on_psm_selection
+        )
+        # Set a fixed width to prevent layout issues
+        psm_menu.config(width=8)
+        # Configure the OptionMenu to display text left-aligned instead of centered
+        psm_menu.config(anchor="w")  # "w" = west (left-aligned)
+        psm_menu.pack(side="left")
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+
+        if removable or is_auto_read:
+            # Add Remove Area button for all removable areas (including Auto Read areas)
+            remove_area_button = tk.Button(area_frame, text="Remove Area", command=lambda: self.remove_area(area_frame, area_name_var.get()))
+            remove_area_button.pack(side="left")
+            # Add separator
+            tk.Label(area_frame, text="").pack(side="left")  # No symbol for last separator; empty label
+        else:
+            # This branch is for non-removable, non-Auto Read areas (shouldn't happen in current design)
+            tk.Label(area_frame, text="").pack(side="left")  # No symbol for last separator; empty label
+
+        self.areas.append((area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var))
+        area_name = area_name_var.get()
+        self._set_unsaved_changes('area_added', area_name)  # Mark as unsaved when area is added
+        print("Added new read area.\n--------------------------")
+        
+        # Bind events to update window size live
+        def bind_resize_events(widget):
+            if isinstance(widget, tk.Entry):
+                widget.bind('<KeyRelease>', lambda e: self.resize_window())
+                widget.bind('<FocusOut>', lambda e: self.resize_window())
+            if isinstance(widget, ttk.Combobox):
+                widget.bind('<<ComboboxSelected>>', lambda e: self.resize_window())
+            elif isinstance(widget, tk.OptionMenu):
+                widget.bind('<<ComboboxSelected>>', lambda e: self.resize_window())
+            widget.bind('<Configure>', lambda e: self.resize_window())
+        for widget in area_frame.winfo_children():
+            bind_resize_events(widget)
+        area_frame.bind('<Configure>', lambda e: self.resize_window())
+
+        # Call resize_window to ensure the window properly resizes when new areas are added
+        self.resize_window(force=True)
+
+    def remove_area(self, area_frame, area_name):
+        # Find and clean up the hotkey for this area
+        for area in self.areas:
+            if area[0] == area_frame:  # Found matching frame
+                hotkey_button = area[1]  # Get the hotkey button
+                
+                # Clean up keyboard hook if it exists
+                if hasattr(hotkey_button, 'keyboard_hook') and hotkey_button.keyboard_hook:
+                    try:
+                        # Debug: Log the type of object we're dealing with
+                        hook_type = type(hotkey_button.keyboard_hook).__name__
+                        hook_value = str(hotkey_button.keyboard_hook)[:100]  # Limit length for logging
+                        print(f"Cleaning up keyboard hook - Type: {hook_type}, Value: {hook_value}")
+                        
+                        # Check if this is a custom ctrl hook or a regular add_hotkey hook
+                        if hasattr(hotkey_button.keyboard_hook, 'remove'):
+                            # This is an add_hotkey hook
+                            keyboard.remove_hotkey(hotkey_button.keyboard_hook)
+                            print(f"Successfully removed hotkey-based keyboard hook")
+                        else:
+                            # This is a custom on_press hook
+                            keyboard.unhook(hotkey_button.keyboard_hook)
+                            print(f"Successfully unhooked custom keyboard hook")
+                    except Exception as e:
+                        print(f"Warning: Error cleaning up keyboard hook: {e}")
+                    finally:
+                        # Always set to None to prevent future errors
+                        hotkey_button.keyboard_hook = None
+
+                # Clean up mouse hook if it exists
+                if hasattr(hotkey_button, 'mouse_hook'):
+                    try:
+                        # Only try to unhook if the hook exists and is not None
+                        if hotkey_button.mouse_hook:
+                            # Debug: Log the type of object we're dealing with
+                            hook_type = type(hotkey_button.mouse_hook).__name__
+                            hook_value = str(hotkey_button.mouse_hook)[:100]  # Limit length for logging
+                            print(f"Cleaning up mouse hook - Type: {hook_type}, Value: {hook_value}")
+                            
+                            # Check if it's a hook ID
+                            if hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
+                                try:
+                                    mouse.unhook(hotkey_button.mouse_hook_id)
+                                    print(f"Successfully unhooked mouse hook ID")
+                                except Exception:
+                                    print(f"Failed to unhook mouse hook ID")
+                                    pass
+                            # Clean up the handler function reference
+                            if hasattr(hotkey_button, 'mouse_hook'):
+                                hotkey_button.mouse_hook = None
+                    except Exception as e:
+                        print(f"Warning: Error cleaning up mouse hook: {e}")
+                    finally:
+                        # Always set to None to prevent future errors
+                        hotkey_button.mouse_hook = None
+                        
+                try:
+                    self.latest_images[area_name].close()
+                    del self.latest_images[area_name]
+                except (AttributeError, KeyError, Exception):
+                    # Image may not have close() method or may already be deleted
+                    pass
+                
+                # Clean up processing settings for this area
+                if area_name in self.processing_settings:
+                    del self.processing_settings[area_name]
+        
+        # Remove the area frame from the UI
+        area_frame.destroy()
+        # Remove the area from the list of areas
+        self.areas = [area for area in self.areas if area[0] != area_frame]
+        self._set_unsaved_changes('area_removed', area_name)  # Mark as unsaved when area is removed
+        print(f"Removed area: {area_name}\n--------------------------")
+        
+        # Resize the window after removing an area to ensure proper sizing
+        self.resize_window(force=True)
+        # Ensure window position keeps buttons visible after removing area
+        self._ensure_window_position()
+
+    def _ensure_window_width(self):
+        """Lightweight method to expand window width if content exceeds current width.
+        Only expands, never shrinks - used for live hotkey preview updates."""
+        try:
+            self.root.update_idletasks()
+            # Check if any area frame needs more width
+            required_width = 0
+            if hasattr(self, 'area_frame'):
+                required_width = max(required_width, self.area_frame.winfo_reqwidth())
+            if hasattr(self, 'auto_read_frame'):
+                required_width = max(required_width, self.auto_read_frame.winfo_reqwidth())
+            # Add padding for window borders and scrollbar
+            required_width += 40
+            
+            current_width = self.root.winfo_width()
+            if required_width > current_width:
+                # Expand the window width to fit content
+                current_height = self.root.winfo_height()
+                self.root.geometry(f"{required_width}x{current_height}")
+                # Also update minimum width so user can't shrink below content
+                self.root.minsize(required_width, 290)
+                # Check position after width change
+                self._ensure_window_position()
+        except Exception:
+            pass
+
+    def _ensure_window_position(self):
+        """Ensure the window position keeps all buttons (especially Remove Area buttons) visible on screen.
+        Adjusts window position if buttons would be outside the visible screen area.
+        Note: This method no longer constrains the window to the primary monitor, allowing it to be moved to other monitors."""
+        try:
+            self.root.update_idletasks()
+            
+            # Get screen dimensions (for reference, but we won't constrain to primary monitor)
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+            
+            # Get current window position and size
+            window_x = self.root.winfo_x()
+            window_y = self.root.winfo_y()
+            window_width = self.root.winfo_width()
+            window_height = self.root.winfo_height()
+            
+            # Don't constrain window to primary monitor - allow movement to other monitors
+            # Only adjust if buttons are cut off within the window itself
+            needs_position_adjustment = False
+            new_x = window_x
+            new_y = window_y
+            new_width = window_width
+            new_height = window_height
+            
+            # Removed: Primary monitor constraint checks that prevented multi-monitor dragging
+            # The window can now be freely moved to any monitor
+            
+            # Now check if any Remove Area buttons are cut off by window edges
+            max_button_right = 0
+            max_button_bottom = 0
+            
+            for area in self.areas:
+                area_frame = area[0]
+                try:
+                    # Find the Remove Area button in this frame
+                    for widget in area_frame.winfo_children():
+                        if isinstance(widget, tk.Button) and widget.cget("text") == "Remove Area":
+                            # Get button position relative to root window
+                            try:
+                                button_x = widget.winfo_rootx() - self.root.winfo_rootx()
+                                button_y = widget.winfo_rooty() - self.root.winfo_rooty()
+                                button_width = widget.winfo_width()
+                                button_height = widget.winfo_height()
+                                
+                                # Track the rightmost and bottommost button positions
+                                button_right = button_x + button_width
+                                button_bottom = button_y + button_height
+                                
+                                if button_right > max_button_right:
+                                    max_button_right = button_right
+                                if button_bottom > max_button_bottom:
+                                    max_button_bottom = button_bottom
+                            except Exception:
+                                continue
+                            break  # Found the button for this area
+                except Exception:
+                    continue  # Skip this area if there's an error
+            
+            # Check if buttons extend beyond window edges
+            padding = 20  # Padding to keep buttons comfortably visible
+            
+            if max_button_right > 0 and max_button_right + padding > new_width:
+                # Button is cut off on the right - expand window width to show it
+                required_width = max_button_right + padding
+                new_width = required_width
+                needs_position_adjustment = True
+            
+            if max_button_bottom > 0 and max_button_bottom + padding > new_height:
+                # Button is cut off at the bottom - expand window height to show it
+                required_height = max_button_bottom + padding
+                new_height = required_height
+                needs_position_adjustment = True
+            
+            # Apply adjustments if needed
+            if needs_position_adjustment:
+                self.root.geometry(f"{new_width}x{new_height}+{new_x}+{new_y}")
+                self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def resize_window(self, force: bool = False):
+        """Resize the window based on current content.
+        If force is True, actively set the window geometry to fit the content (used after loading a layout)."""
+        # Ensure positions/sizes are current
+        self.root.update_idletasks()
+
+        # Dynamically compute the non-scrollable portion height (everything above the areas canvas)
+        # This includes the Auto Read section, so we need to account for it separately
+        try:
+            base_top = self.area_canvas.winfo_rooty() - self.root.winfo_rooty()
+            # Ensure base_top is not negative (can happen during initialization)
+            if base_top < 0:
+                base_top = 210  # Use safe default
+        except Exception:
+            base_top = 210
+        # base_height represents the Y position of area_canvas, which includes Auto Read section above it
+        # We'll calculate the actual base (non-Auto Read) height separately
+        base_height = max(150, base_top + 20)  # add small bottom margin
+        min_width = 850
+        max_width = 1000
+        area_frame_height = 0
+        if len(self.areas) > 0:
+            self.area_frame.update_idletasks()
+            area_frame_height = self.area_frame.winfo_height()
+        # Determine total height needed for all current areas
+        area_row_height = 60  # Approx row height (for fallback)
+        # Count only non-Auto Read areas for the scroll field calculation
+        num_scroll_areas = 0
+        for area in self.areas:
+            if len(area) >= 9:
+                area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+            else:
+                area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+            area_name = area_name_var.get()
+            if not area_name.startswith("Auto Read"):
+                num_scroll_areas += 1
+        content_height = area_frame_height if area_frame_height > 0 else num_scroll_areas * area_row_height
+        
+        # Calculate Auto Read canvas height to include in total window height
+        # This will be recalculated and applied later in the Auto Read scrolling section
+        auto_read_canvas_height = 0
+        auto_read_count = 0
+        auto_read_frame_height = 0
+        auto_read_row_height = 60  # Approx row height for Auto Read areas
+        
+        if hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+            try:
+                # Count Auto Read areas
+                for area in self.areas:
+                    if len(area) >= 9:
+                        area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                    else:
+                        area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                    area_name = area_name_var.get()
+                    if area_name.startswith("Auto Read"):
+                        auto_read_count += 1
+                
+                # Get frame height after ensuring it's updated
+                self.auto_read_frame.update_idletasks()
+                auto_read_frame_height = self.auto_read_frame.winfo_height()
+                
+                auto_read_show_scroll = auto_read_count >= 4
+                
+                if auto_read_show_scroll:
+                    # Show exactly 4 rows when scrolling is active
+                    # Use actual measured height per row if available, otherwise use estimate
+                    if auto_read_frame_height > 0 and auto_read_count > 0:
+                        # Calculate actual height per row
+                        actual_row_height = auto_read_frame_height / auto_read_count
+                        # Use 4 rows
+                        auto_read_canvas_height = int(4 * actual_row_height)
+                    else:
+                        # Fallback: use 4 rows estimate
+                        auto_read_canvas_height = 4 * auto_read_row_height
+                else:
+                    # All Auto Read content fits
+                    if auto_read_frame_height > 0:
+                        auto_read_canvas_height = max(auto_read_frame_height, auto_read_row_height)
+                    else:
+                        auto_read_canvas_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+            except Exception:
+                auto_read_canvas_height = 0
+        
+        # base_top is the Y position of area_canvas, which already accounts for everything above it
+        # including the Auto Read section. base_height = base_top + 20 (with minimum of 150).
+        # We need to ensure the window is tall enough for:
+        # - Everything up to area_canvas (base_height, which includes Auto Read section)
+        # - The regular areas content (content_height)
+        # But we also need to verify the Auto Read section has enough space.
+        
+        # Calculate total height: base_height already includes space up to area_canvas
+        # However, base_height might not account for the actual Auto Read canvas height if it grew,
+        # so we need to ensure we have enough space for Auto Read + regular areas
+        
+        # Get the actual position of area_canvas to calculate properly
+        # base_height = max(150, base_top + 20) ensures minimum, but base_top should reflect Auto Read growth
+        # If Auto Read canvas exists and has height, ensure we account for it
+        if hasattr(self, 'auto_read_canvas') and auto_read_canvas_height > 0:
+            # Get position of Auto Read section
+            try:
+                auto_read_top = self.auto_read_outer_frame.winfo_rooty() - self.root.winfo_rooty()
+            except Exception:
+                auto_read_top = 0
+            
+            if auto_read_top > 0:
+                # Calculate: space to Auto Read + Auto Read height + space to regular areas + regular areas
+                # space_to_regular = base_top - (auto_read_top + auto_read_canvas_height)
+                # But base_top might not be accurate yet, so use base_height as fallback
+                # Total = auto_read_top + auto_read_canvas_height + space_between + content_height + margin
+                # Where space_between includes separator and button
+                auto_read_bottom = auto_read_top + auto_read_canvas_height
+                if base_top > auto_read_bottom:
+                    space_between = base_top - auto_read_bottom
+                else:
+                    # base_top might not be updated yet, use a reasonable estimate
+                    space_between = 30  # separator + button area
+                space_between = max(30, space_between)  # Ensure minimum space
+                total_height_unconstrained = auto_read_top + auto_read_canvas_height + space_between + content_height + 20
+            else:
+                # Fallback: use base_height which should account for Auto Read
+                total_height_unconstrained = base_height + content_height
+        else:
+            # No Auto Read or no height yet, use base_height
+            total_height_unconstrained = base_height + content_height
+        
+        # Add separator height to total (separator is after area_outer_frame)
+        separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+        total_height_unconstrained += separator_height_estimate
+        
+        # Ensure total_height is always positive and reasonable
+        # If calculation resulted in invalid value, use safe fallback
+        if total_height_unconstrained < 250:
+            # Something went wrong with the calculation, use safe defaults
+            total_height = max(base_height + content_height + auto_read_canvas_height + 20, 250)
+        else:
+            total_height = total_height_unconstrained
+        # Screen-constrained maximum height
+        try:
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_h = 1000
+        vertical_margin = 140  # Keep some space from screen edges
+        max_allowed_height = max(300, screen_h - vertical_margin)
+        # Decide if scrollbar should be shown either due to screen limit or explicit row limit (>9)
+        show_scroll_due_to_count = num_scroll_areas > 5
+        show_scroll_due_to_screen = total_height_unconstrained > max_allowed_height
+        show_scroll = show_scroll_due_to_count or show_scroll_due_to_screen
+
+        # Compute target height of the window
+        # Note: separator height is already included in total_height_unconstrained
+        if show_scroll_due_to_count:
+            # Cap visible rows to 5 when there are more than 9 areas
+            visible_rows = 5
+            # Do not grow the window further when crossing the threshold; keep current height or smaller cap
+            cur_h_for_cap = self.root.winfo_height()
+            # Include separator height estimate in the calculation
+            separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+            desired_height_cap = min(base_height + visible_rows * area_row_height + separator_height_estimate, max_allowed_height)
+            target_height = min(cur_h_for_cap, desired_height_cap)
+        else:
+            # Otherwise try to fit all content within the screen
+            # total_height_unconstrained already includes separator height
+            target_height = min(total_height_unconstrained, max_allowed_height)
+        
+        # Determine the widest area
+        widest = min_width
+        for area in self.areas:
+            frame = area[0]
+            frame.update_idletasks()
+            frame_left = frame.winfo_rootx()
+            farthest_right = frame_left
+            for child in frame.winfo_children():
+                child.update_idletasks()
+                child_right = child.winfo_rootx() + child.winfo_width()
+                if child_right > farthest_right:
+                    farthest_right = child_right
+            area_width = farthest_right - frame_left
+            if area_width > widest:
+                widest = area_width
+        widest += 60
+                                                                        
+                 
+        window_width = max(min_width, min(max_width, widest))        
+        
+        # Apply scrollbar logic based on whether all content fits vertically
+        if hasattr(self, 'area_scrollbar') and hasattr(self, 'area_canvas'):
+            if show_scroll:
+                # Need scrolling
+                self.area_scrollbar.pack(side='right', fill='y')
+                self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
+                if show_scroll_due_to_count:
+                    canvas_height = max(100, min(target_height - base_height, 5 * area_row_height))
+                else:
+                    canvas_height = max(100, target_height - base_height)
+                self.area_canvas.config(height=canvas_height)
+                # Add extra height to ensure separator is visible when scrollbar appears
+                if hasattr(self, 'area_separator'):
+                    self.area_separator.lift()
+                    # Increase target_height by 10px to ensure separator is visible
+                    target_height = min(target_height + 5, max_allowed_height)
+            else:
+                # All content fits; no scrollbar
+                self.area_scrollbar.pack_forget()
+                # Expand canvas to show all content when it fits
+                self.area_canvas.config(height=area_frame_height)
+                # Ensure separator is visible
+                if hasattr(self, 'area_separator'):
+                    self.area_separator.lift()
+        
+        # Handle Auto Read area scrolling - show scrollbar when there are more than 4 Auto Read areas
+        # Reuse the values calculated above to ensure consistency
+        if hasattr(self, 'auto_read_scrollbar') and hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+            # Recalculate frame height to ensure it's current
+            self.auto_read_frame.update_idletasks()
+            auto_read_frame_height = self.auto_read_frame.winfo_height()
+            
+            # Recalculate scroll status and canvas height
+            auto_read_show_scroll = auto_read_count >= 4
+            
+            if auto_read_show_scroll:
+                # Need scrolling for Auto Read areas
+                self.auto_read_scrollbar.pack(side='right', fill='y')
+                self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
+                # Show exactly 4 rows when scrolling is active
+                if auto_read_frame_height > 0 and auto_read_count > 0:
+                    # Calculate actual height per row
+                    actual_row_height = auto_read_frame_height / auto_read_count
+                    # Use 4 rows
+                    calculated_height = int(4 * actual_row_height)
+                else:
+                    # Fallback: use 4 rows estimate
+                    calculated_height = 4 * auto_read_row_height
+                self.auto_read_canvas.config(height=calculated_height)
+                auto_read_canvas_height = calculated_height  # Update for consistency
+                # Update scroll region and ensure inner frame width matches canvas
+                self.root.update_idletasks()
+                canvas_width = self.auto_read_canvas.winfo_width()
+                if canvas_width > 1:
+                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
+            else:
+                # All Auto Read content fits; no scrollbar
+                self.auto_read_scrollbar.pack_forget()
+                # Expand canvas to show all content when it fits
+                # Use the same calculated height from above for consistency
+                if auto_read_frame_height > 0:
+                    calculated_height = max(auto_read_frame_height, auto_read_row_height)
+                else:
+                    calculated_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+                self.auto_read_canvas.config(height=calculated_height)
+                auto_read_canvas_height = calculated_height  # Update for consistency
+                # Update scroll region and ensure inner frame width matches canvas
+                self.root.update_idletasks()
+                canvas_width = self.auto_read_canvas.winfo_width()
+                if canvas_width > 1:
+                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
+        
+        # Set minimums (use a constant min width so user can resize horizontally).
+        # Ensure minimum width is sufficient to keep the single-line options from truncating.
+        min_required_width = max(min_width, 1155) #Main Window Size
+        self.root.minsize(min_required_width, 290)
+        
+        # Optionally force window geometry (used when loading a layout)
+        cur_width = self.root.winfo_width()
+        cur_height = self.root.winfo_height()
+        if force:
+            # To ensure Tk applies the new size reliably even when shrinking, call geometry twice
+            self.root.geometry(f"{window_width}x{target_height}")
+            self.root.update_idletasks()
+            self.root.geometry(f"{window_width}x{target_height}")
+
+        self.root.update_idletasks()  # Ensure geometry is applied
+        
+        # Ensure separator is always visible on top
+        if hasattr(self, 'area_separator'):
+            self.area_separator.lift()
+        
+        # Ensure window position keeps buttons visible after resize
+        self._ensure_window_position()
+
+    def edit_areas(self):
+        """Open the edit areas screen. Finds the first non-Auto Read area to use for the edit screen."""
+        # Find the first non-Auto Read area
+        target_frame = None
+        target_area_name_var = None
+        
+        for area in self.areas:
+            if len(area) >= 9:
+                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var = area[:9]
+            else:
+                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var = area[:8]
+                freeze_screen_var = None
+            area_name = area_name_var.get()
+            # Skip Auto Read areas
+            if not area_name.startswith("Auto Read"):
+                target_frame = area_frame
+                target_area_name_var = area_name_var
+                break
+        
+        # If no regular areas exist, create a new one so the edit view can be opened
+        if target_frame is None:
+            # Create a new area automatically
+            self.add_read_area(removable=True, editable_name=True, area_name="Area Name")
+            # Get the newly created area
+            if self.areas:
+                target_frame = self.areas[-1][0]
+                target_area_name_var = self.areas[-1][3]
+        
+        # Call set_area with the first available area (set_area_button can be None since buttons are hidden)
+        self.set_area(target_frame, target_area_name_var, None)
+
+    def set_auto_read_area(self, frame, area_name_var, set_area_button):
+        """Simple area selection for AutoRead areas - replicates behavior from nov_26.py"""
+        # Auto Read always opens area selection window to allow setting a new area each time
+        # This is by design - Auto Read's task is to set a new area each time it's triggered
+        # Check if another area selection is already in progress
+        if hasattr(self, 'area_selection_in_progress') and self.area_selection_in_progress:
+            print("Another area selection is already in progress. Please wait for it to complete.")
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Another area selection is already in progress", fg="red")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(3000, lambda: self.status_label.config(text=""))
+            return
+        
+        # Mark that area selection is now in progress
+        self.area_selection_in_progress = True
+        
+        # Capture the foreground window handle (the game window) before starting selection
+        # This will be used to restore focus to the game after selection completes
+        try:
+            game_window_handle = win32gui.GetForegroundWindow()
+            # Verify the window is not our own root window
+            root_hwnd = self.root.winfo_id()
+            if game_window_handle == root_hwnd:
+                # If GameReader is in focus, try to find the game window differently
+                # For now, we'll just store None and skip restoration
+                game_window_handle = None
+        except Exception as e:
+            print(f"Warning: Could not capture game window handle: {e}")
+            game_window_handle = None
+        
+        # Ensure root window stays in background and doesn't flash
+        # Store current root window state
+        root_was_visible = self.root.winfo_viewable()
+        if root_was_visible:
+            # Lower root window to keep it in background
+            self.root.lower()
+        
+        x1, y1, x2, y2 = 0, 0, 0, 0
+        selection_cancelled = False
+        
+        # Store the current mouse hooks to restore them later
+        self.saved_mouse_hooks = []
+        if hasattr(self, 'mouse_hooks') and self.mouse_hooks:
+            self.saved_mouse_hooks = self.mouse_hooks.copy()
+        
+        # --- Disable all hotkeys before starting area selection ---
+        # Use InputManager to block all hotkey handlers
+        InputManager.block()
+        
+        try:
+            # Only unhook keyboard hotkeys, leave mouse hooks alone (for cleanup)
+            keyboard.unhook_all()
+            # Clear the mouse hooks list but don't unhook them yet
+            if hasattr(self, 'mouse_hooks'):
+                self.mouse_hooks.clear()
+        except Exception as e:
+            print(f"Error disabling hotkeys for area selection: {e}")
+        
+        self.hotkeys_disabled_for_selection = True
+
+        def on_drag(event):
+            if not selection_cancelled:
+                # Only allow interaction if window is ready
+                if not hasattr(select_area_window, 'window_ready') or not select_area_window.window_ready:
+                    return
+                    
+                # Use event coordinates directly for canvas drawing
+                canvas_x = event.x
+                canvas_y = event.y
+                
+                # Update both rectangles with canvas coordinates
+                coords = (
+                    min(canvas_x, x1), 
+                    min(canvas_y, y1),
+                    max(canvas_x, x1), 
+                    max(canvas_y, y1)
+                )
+                
+                # Update both rectangles
+                canvas.coords(border, *coords)
+                canvas.coords(border_outline, *coords)
+                
+                # Debug: Show current drag coordinates (only print occasionally to avoid spam)
+                if hasattr(on_drag, 'last_debug_time'):
+                    if time.time() - on_drag.last_debug_time > 0.5:  # Print every 0.5 seconds
+                        print(f"Debug: Dragging - Current: ({canvas_x}, {canvas_y}), Start: ({x1}, {y1})")
+                        on_drag.last_debug_time = time.time()
+                else:
+                    on_drag.last_debug_time = time.time()
+
+        def on_click(event):
+            nonlocal x1, y1
+            # Only allow interaction if window is ready
+            if not hasattr(select_area_window, 'window_ready') or not select_area_window.window_ready:
+                print("Debug: Ignoring click - window not ready yet")
+                return
+                
+            # Store canvas coordinates
+            x1 = event.x
+            y1 = event.y
+            print(f"Debug: Mouse click - Canvas coordinates: ({x1}, {y1})")
+            canvas.bind("<B1-Motion>", on_drag)
+            canvas.bind("<ButtonRelease-1>", on_release)
+            # Initialize both rectangles at click point
+            canvas.coords(border, x1, y1, x1, y1)
+            canvas.coords(border_outline, x1, y1, x1, y1)
+
+        def on_release(event):
+            nonlocal x1, y1, x2, y2
+            if not selection_cancelled:
+                # Only allow interaction if window is ready
+                if not hasattr(select_area_window, 'window_ready') or not select_area_window.window_ready:
+                    print("Debug: Ignoring release - window not ready yet")
+                    return
+                    
+                try:
+                    # Stop speech on mouse release if the checkbox is checked
+                    if hasattr(self, 'interrupt_on_new_scan_var') and self.interrupt_on_new_scan_var.get():
+                        self.stop_speaking()
+                    
+                    # Convert canvas coordinates to screen coordinates for the final area
+                    # Canvas coordinates are relative to the selection window, which is positioned at (window_x, window_y)
+                    # But we need to convert to actual screen coordinates using the original min_x, min_y
+                    x2 = event.x + min_x  # Convert canvas to screen coordinates
+                    y2 = event.y + min_y
+                    x1_screen = x1 + min_x
+                    y1_screen = y1 + min_y
+                    
+                    print(f"Debug: Mouse release - Canvas: ({event.x}, {event.y}), Screen: ({x2}, {y2}), Start: ({x1_screen}, {y1_screen})")
+                    
+                    # Only set coordinates if we have a valid selection (not a click)
+                    # Check minimum drag distance using canvas coordinates for consistency
+                    if abs(event.x - x1) > 5 and abs(event.y - y1) > 5:  # Minimum 5px drag
+                        final_coords = (
+                            min(x1_screen, x2), 
+                            min(y1_screen, y2),
+                            max(x1_screen, x2), 
+                            max(y1_screen, y2)
+                        )
+                        frame.area_coords = final_coords
+                        print(f"Debug: Area selection coordinates - Canvas: ({x1}, {y1}), Screen: ({x1_screen}, {y1_screen}), Final: {final_coords}")
+                    else:
+                        # If it's just a click, don't update the coordinates
+                        frame.area_coords = getattr(frame, 'area_coords', (0, 0, 0, 0))
+                    
+                    # Release grabs/bindings before destroying the overlay
+                    try:
+                        select_area_window.grab_release()
+                    except Exception:
+                        pass
+                    try:
+                        self.root.unbind_all("<Escape>")
+                    except Exception:
+                        pass
+                    try:
+                        canvas.unbind("<Button-1>")
+                        canvas.unbind("<B1-Motion>")
+                        canvas.unbind("<Escape>")
+                    except Exception:
+                        pass
+                    # Destroy the selection window to restore normal mouse handling
+                    select_area_window.destroy()
+                    
+                    # Restore focus to the game window if we captured it
+                    if game_window_handle is not None:
+                        try:
+                            # Use a small delay to ensure the selection window is fully destroyed
+                            def restore_game_focus():
+                                try:
+                                    # Check if the window still exists
+                                    if win32gui.IsWindow(game_window_handle):
+                                        # Restore the window if it's minimized
+                                        if win32gui.IsIconic(game_window_handle):
+                                            win32gui.ShowWindow(game_window_handle, win32con.SW_RESTORE)
+                                        # Bring the window to foreground
+                                        win32gui.SetForegroundWindow(game_window_handle)
+                                        print("Restored focus to game window")
+                                    else:
+                                        print("Game window no longer exists, skipping focus restoration")
+                                except Exception as e:
+                                    print(f"Error restoring focus to game window: {e}")
+                            
+                            # Restore focus after a short delay to ensure selection window is destroyed
+                            self.root.after(150, restore_game_focus)
+                        except Exception as e:
+                            print(f"Error scheduling game window focus restoration: {e}")
+                    
+                    # AutoRead areas always trigger reading immediately after selection
+                    # Unless this is an automation area (skip reading for automations)
+                    print("GAME_TEXT_READER: Area selection completed, checking if automation...")
+                    print(f"GAME_TEXT_READER: Frame has _is_automation: {hasattr(frame, '_is_automation')}")
+                    if hasattr(frame, '_is_automation'):
+                        print(f"GAME_TEXT_READER: Frame._is_automation = {frame._is_automation}")
+                    print(f"GAME_TEXT_READER: Frame has _automation_callback: {hasattr(frame, '_automation_callback')}")
+                    
+                    if not hasattr(frame, '_is_automation') or not frame._is_automation:
+                        print("GAME_TEXT_READER: Not an automation, calling read_area()...")
+                        self.root.after(100, lambda: self.read_area(frame))
+                        
+                        # If this was called from a combo, trigger the combo callback after read_area starts
+                        # This allows the combo to start monitoring speech after area selection completes
+                        if hasattr(frame, '_combo_callback') and frame._combo_callback:
+                            print("GAME_TEXT_READER: Combo callback detected, scheduling callback after read_area starts...")
+                            combo_callback = frame._combo_callback
+                            # Mark that this was NOT cancelled (area was selected successfully)
+                            if hasattr(frame, '_combo_cancelled'):
+                                frame._combo_cancelled = False
+                            # Call after a short delay to ensure read_area() has started
+                            self.root.after(300, lambda: combo_callback())
+                            # Clear the callback to avoid calling it again
+                            delattr(frame, '_combo_callback')
+                    elif hasattr(frame, '_automation_callback'):
+                        # Call automation callback instead
+                        # Store callback in local variable to avoid closure issues
+                        print("GAME_TEXT_READER: Automation detected, calling automation callback...")
+                        callback = frame._automation_callback
+                        print(f"GAME_TEXT_READER: Callback function: {callback}")
+                        self.root.after(100, lambda: callback(frame))
+                        print("GAME_TEXT_READER: Automation callback scheduled")
+                    else:
+                        print("GAME_TEXT_READER: WARNING - Automation flag set but no callback found!")
+                    
+                    # Mark that we have unsaved changes - find area name from frame
+                    area_name = "Unknown Area"
+                    for area in self.areas:
+                        if area[0] == frame:
+                            area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                            break
+                    self._set_unsaved_changes('area_settings', area_name)
+                    
+                except Exception as e:
+                    print(f"Error during area selection: {e}")
+                finally:
+                    # Always ensure hotkeys are restored (but don't force focus to GameReader window)
+                    self._restore_hotkeys_after_selection(restore_focus=False)
+
+        def on_escape(event):
+            nonlocal selection_cancelled
+            selection_cancelled = True
+            if not hasattr(frame, 'area_coords'):
+                frame.area_coords = (0, 0, 0, 0)
+            
+            # Clear frozen screenshot if it exists (user cancelled selection)
+            if hasattr(frame, 'frozen_screenshot'):
+                delattr(frame, 'frozen_screenshot')
+            if hasattr(frame, 'frozen_screenshot_bounds'):
+                delattr(frame, 'frozen_screenshot_bounds')
+            
+            # Release grabs/bindings before destroying the overlay
+            try:
+                select_area_window.grab_release()
+            except Exception:
+                pass
+            try:
+                self.root.unbind_all("<Escape>")
+            except Exception:
+                pass
+            try:
+                canvas.unbind("<Button-1>")
+                canvas.unbind("<B1-Motion>")
+                canvas.unbind("<Escape>")
+            except Exception:
+                pass
+            # Destroy the selection window to restore normal mouse handling
+            select_area_window.destroy()
+            
+            # Restore focus to the game window if we captured it
+            if game_window_handle is not None:
+                try:
+                    # Use a small delay to ensure the selection window is fully destroyed
+                    def restore_game_focus():
+                        try:
+                            # Check if the window still exists
+                            if win32gui.IsWindow(game_window_handle):
+                                # Restore the window if it's minimized
+                                if win32gui.IsIconic(game_window_handle):
+                                    win32gui.ShowWindow(game_window_handle, win32con.SW_RESTORE)
+                                # Bring the window to foreground
+                                win32gui.SetForegroundWindow(game_window_handle)
+                                print("Restored focus to game window (selection cancelled)")
+                            else:
+                                print("Game window no longer exists, skipping focus restoration")
+                        except Exception as e:
+                            print(f"Error restoring focus to game window: {e}")
+                    
+                    # Restore focus after a short delay to ensure selection window is destroyed
+                    self.root.after(150, restore_game_focus)
+                except Exception as e:
+                    print(f"Error scheduling game window focus restoration: {e}")
+            
+            # Use our helper method to ensure consistent hotkey restoration (but don't force focus to GameReader)
+            self._restore_hotkeys_after_selection(restore_focus=False)
+            print("Area selection cancelled\n--------------------------")
+            
+            # If this was called from a combo, trigger the combo callback even on cancellation
+            # This allows the combo to continue to the next step when Auto Read is cancelled
+            if hasattr(frame, '_combo_callback') and frame._combo_callback:
+                print("GAME_TEXT_READER: Combo callback detected on cancellation, calling callback to move to next step...")
+                combo_callback = frame._combo_callback
+                # Mark that this was a cancellation so speech monitoring knows to skip speech wait
+                if hasattr(frame, '_combo_cancelled'):
+                    frame._combo_cancelled = True
+                else:
+                    setattr(frame, '_combo_cancelled', True)
+                # Call after a short delay to ensure cleanup is complete
+                self.root.after(200, lambda: combo_callback())
+                # Clear the callback to avoid calling it again
+                delattr(frame, '_combo_callback')
+
+        # Create fullscreen window that spans all monitors
+        # Set overrideredirect and hide immediately to prevent any flash
+        print("GAME_TEXT_READER: Creating select_area_window (Toplevel)...")
+        select_area_window = tk.Toplevel(self.root)
+        print(f"GAME_TEXT_READER: Window created: {select_area_window}")
+        # Set alpha to 0.0 FIRST to make it invisible before any other operations
+        print("GAME_TEXT_READER: Setting alpha to 0.0...")
+        select_area_window.attributes("-alpha", 0.0)
+        print("GAME_TEXT_READER: Setting overrideredirect(True)...")
+        select_area_window.overrideredirect(True)  # Remove title bar immediately
+        print("GAME_TEXT_READER: Calling withdraw()...")
+        select_area_window.withdraw()  # Hide immediately before any other operations
+        # Force update to ensure alpha is applied before window can be seen
+        print("GAME_TEXT_READER: Calling update_idletasks()...")
+        select_area_window.update_idletasks()
+        print("GAME_TEXT_READER: Window initialized (withdrawn, alpha=0.0)")
+        
+        # Set icon (though overrideredirect means it won't show, set it anyway)
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                select_area_window.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting selection window icon: {e}")
+        
+        # Make it transient to prevent root window from being shown/brought to front
+        select_area_window.transient(self.root)
+        
+        # Add a protocol handler to reset the flag if the window is destroyed unexpectedly
+        def on_window_destroy():
+            if hasattr(self, 'area_selection_in_progress'):
+                self.area_selection_in_progress = False
+            # Ensure hotkeys are restored
+            self._restore_hotkeys_after_selection()
+        
+        select_area_window.protocol("WM_DELETE_WINDOW", on_window_destroy)
+        
+        # Get the true multi-monitor dimensions using win32api.GetSystemMetrics
+        # This ensures consistency with capture_screen_area function
+        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
+        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
+        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        max_x = min_x + virtual_width
+        max_y = min_y + virtual_height
+        
+        print(f"Debug: Area selection - Virtual screen bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
+        print(f"Debug: Area selection - Window size: {virtual_width}x{virtual_height}")
+        
+        # Check if freeze screen is enabled for this Auto Read area
+        freeze_screen_enabled = False
+        screenshot_image = None
+        
+        # First check if this is an automation frame with _freeze_screen attribute
+        if hasattr(frame, '_is_automation') and frame._is_automation:
+            if hasattr(frame, '_freeze_screen'):
+                freeze_screen_enabled = frame._freeze_screen
+                print(f"GAME_TEXT_READER: Automation frame detected, freeze_screen_enabled = {freeze_screen_enabled}")
+        else:
+            # Check in areas list for regular Auto Read areas
+            for area in self.areas:
+                if len(area) >= 9:  # Check if tuple has freeze_screen_var
+                    area_frame_check, _, _, area_name_var_check, _, _, _, _, freeze_screen_var_check = area[:9]
+                    if area_frame_check == frame and area_name_var_check == area_name_var:
+                        if freeze_screen_var_check and hasattr(freeze_screen_var_check, 'get'):
+                            freeze_screen_enabled = freeze_screen_var_check.get()
+                        break
+        
+        # Check if fullscreen mode is enabled
+        fullscreen_mode_enabled = hasattr(self, 'fullscreen_mode_var') and self.fullscreen_mode_var.get()
+        
+        # If fullscreen mode is enabled, we need to capture a screenshot for display
+        # This applies whether freeze screen is on or off, to prevent the game from minimizing
+        # Save the game window handle for use in PrintWindow capture
+        game_window_handle_for_frozen = None
+        if fullscreen_mode_enabled:
+            try:
+                # Force screen refresh before taking screenshot
+                foreground_hwnd = win32gui.GetForegroundWindow()
+                root_hwnd = self.root.winfo_id()
+                
+                if foreground_hwnd and foreground_hwnd != root_hwnd:
+                    # Save the game window handle BEFORE tabbing out - we'll use this for PrintWindow
+                    game_window_handle_for_frozen = foreground_hwnd
+                    
+                    # Briefly bring GameReader to foreground, then restore original
+                    # This forces Windows to refresh the screen buffer
+                    try:
+                        original_foreground = foreground_hwnd
+                        if root_hwnd and self.root.winfo_viewable():
+                            # Step 1: Tab out - bring GameReader to foreground
+                            if win32gui.IsIconic(root_hwnd):
+                                win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
+                            win32gui.SetForegroundWindow(root_hwnd)
+                            self.root.update()
+                            time.sleep(0.02)  # 20ms - minimal delay for tab out
+                            
+                            # Step 2: Tab back in - restore game to foreground
+                            if win32gui.IsWindow(original_foreground):
+                                # Restore if minimized
+                                if win32gui.IsIconic(original_foreground):
+                                    win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
+                                    time.sleep(0.05)  # Wait for restore
+                                
+                                # Bring to foreground
+                                win32gui.SetForegroundWindow(original_foreground)
+                                time.sleep(0.15)  # 150ms - initial delay after setting foreground
+                                
+                                # Step 3: Wait for game to be fully active before screenshot
+                                # Poll to ensure the game window is actually in foreground
+                                max_wait = 50  # Maximum 50 attempts (500ms total)
+                                wait_count = 0
+                                game_confirmed = False
+                                while wait_count < max_wait:
+                                    current_foreground = win32gui.GetForegroundWindow()
+                                    if current_foreground == original_foreground:
+                                        # Game is in foreground, wait a bit more to ensure it's fully rendered
+                                        time.sleep(0.2)  # 200ms delay for game to fully render
+                                        # Verify one more time that game is still in foreground
+                                        final_check = win32gui.GetForegroundWindow()
+                                        if final_check == original_foreground:
+                                            print("Fullscreen mode: Game confirmed active before screenshot")
+                                            game_confirmed = True
+                                            break
+                                    time.sleep(0.01)  # 10ms between checks
+                                    wait_count += 1
+                                
+                                if not game_confirmed:
+                                    print(f"Warning: Game may not be fully active after {max_wait * 10}ms wait")
+                                
+                                # Additional delay to ensure game is fully rendered and screen buffer is updated
+                                time.sleep(0.3)  # 300ms delay for game to fully restore and render
+                    except Exception as e:
+                        print(f"Error in fullscreen refresh before screenshot: {e}")
+                
+                # Invalidate windows to force refresh
+                try:
+                    desktop_hwnd = win32gui.GetDesktopWindow()
+                    if desktop_hwnd:
+                        ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
+                    if foreground_hwnd and foreground_hwnd != root_hwnd:
+                        ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
+                        win32gui.UpdateWindow(foreground_hwnd)
+                except (OSError, AttributeError, Exception):
+                    # Window handle may be invalid or window may be closed
+                    pass
+                
+                print("Fullscreen mode: Screen refreshed before screenshot")
+            except Exception as e:
+                print(f"Error applying fullscreen refresh before screenshot: {e}")
+        
+        # Take screenshot only if freeze screen is enabled (for both display and reading)
+        # Fullscreen mode alone does not require a frozen screenshot
+        if freeze_screen_enabled:
+            try:
+                print(f"Taking screenshot for display and reading: {virtual_width}x{virtual_height} at ({min_x}, {min_y})")
+                
+                # Check if fullscreen mode is enabled - use PrintWindow if so
+                # Use the saved game window handle (captured before tabbing out)
+                use_printwindow = (hasattr(self, 'fullscreen_mode_var') and self.fullscreen_mode_var.get())
+                target_hwnd = game_window_handle_for_frozen if use_printwindow else None
+                
+                if use_printwindow and target_hwnd and target_hwnd != self.root.winfo_id():
+                    # Try PrintWindow method for fullscreen apps
+                    try:
+                        window_rect = win32gui.GetWindowRect(target_hwnd)
+                        window_width = window_rect[2] - window_rect[0]
+                        window_height = window_rect[3] - window_rect[1]
+                        
+                        if window_width > 0 and window_height > 0:
+                            hwindc = win32gui.GetWindowDC(target_hwnd)
+                            if hwindc:
+                                try:
+                                    srcdc = win32ui.CreateDCFromHandle(hwindc)
+                                    memdc = srcdc.CreateCompatibleDC()
+                                    bmp = win32ui.CreateBitmap()
+                                    bmp.CreateCompatibleBitmap(srcdc, window_width, window_height)
+                                    memdc.SelectObject(bmp)
+                                    
+                                    # Use PrintWindow to capture
+                                    PW_RENDERFULLCONTENT = 0x00000002
+                                    result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetHandle(), PW_RENDERFULLCONTENT)
+                                    
+                                    if result:
+                                        bmpinfo = bmp.GetInfo()
+                                        bmpstr = bmp.GetBitmapBits(True)
+                                        screenshot_image = Image.frombuffer(
+                                            'RGB',
+                                            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                                            bmpstr, 'raw', 'BGRX', 0, 1
+                                        )
+                                        print(f"Frozen screenshot captured using PrintWindow: {screenshot_image.size}")
+                                        
+                                        # Apply image processing to frozen screenshot if option is enabled
+                                        area_name = area_name_var.get() if area_name_var else None
+                                        process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
+                                                                        self.process_freeze_screen_var.get() and
+                                                                        area_name and
+                                                                        area_name in self.processing_settings)
+                                        
+                                        if process_freeze_screen_enabled:
+                                            settings = self.processing_settings[area_name]
+                                            screenshot_image = preprocess_image(
+                                                screenshot_image,
+                                                brightness=settings.get('brightness', 1.0),
+                                                contrast=settings.get('contrast', 1.0),
+                                                saturation=settings.get('saturation', 1.0),
+                                                sharpness=settings.get('sharpness', 1.0),
+                                                blur=settings.get('blur', 0.0),
+                                                threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                                                hue=settings.get('hue', 0.0),
+                                                exposure=settings.get('exposure', 1.0)
+                                            )
+                                            print("Image processing applied to frozen screenshot (PrintWindow).")
+                                        
+                                        # Clean up before storing
+                                        try:
+                                            if memdc:
+                                                memdc.DeleteDC()
+                                            if bmp:
+                                                win32gui.DeleteObject(bmp.GetHandle())
+                                        except Exception:
+                                            pass
+                                        
+                                        # Store the full window screenshot for freeze screen
+                                        frame.frozen_screenshot = screenshot_image.copy()
+                                        frame.frozen_screenshot_bounds = (window_rect[0], window_rect[1], window_width, window_height)
+                                        print(f"Stored frozen screenshot from PrintWindow for reading")
+                                    else:
+                                        raise Exception("PrintWindow failed")
+                                except Exception as e:
+                                    print(f"PrintWindow failed: {e}, falling back to BitBlt")
+                                    use_printwindow = False  # Fall back to BitBlt
+                                finally:
+                                    # Always clean up resources
+                                    try:
+                                        if memdc:
+                                            memdc.DeleteDC()
+                                        if bmp:
+                                            win32gui.DeleteObject(bmp.GetHandle())
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if hwindc:
+                                            win32gui.ReleaseDC(target_hwnd, hwindc)
+                                    except Exception:
+                                        pass
+                        else:
+                            use_printwindow = False  # Fall back to BitBlt
+                    except Exception as e:
+                        print(f"Error using PrintWindow: {e}, falling back to BitBlt")
+                        use_printwindow = False  # Fall back to BitBlt
+                
+                # Fall back to normal BitBlt method if PrintWindow didn't work or wasn't requested
+                if not use_printwindow or screenshot_image is None:
+                    # Use win32api method to capture entire virtual screen (all monitors)
+                    hwin = win32gui.GetDesktopWindow()
+                    hwindc = win32gui.GetWindowDC(hwin)
+                    memdc = None
+                    bmp = None
+                    try:
+                        srcdc = win32ui.CreateDCFromHandle(hwindc)
+                        memdc = srcdc.CreateCompatibleDC()
+                        
+                        # Create bitmap for entire virtual screen
+                        bmp = win32ui.CreateBitmap()
+                        bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
+                        memdc.SelectObject(bmp)
+                        
+                        # Copy entire virtual screen into bitmap
+                        memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
+                        
+                        # Convert bitmap to PIL Image
+                        bmpinfo = bmp.GetInfo()
+                        bmpstr = bmp.GetBitmapBits(True)
+                        screenshot_image = Image.frombuffer(
+                            'RGB',
+                            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                            bmpstr, 'raw', 'BGRX', 0, 1
+                        )
+                    finally:
+                        # Always clean up resources
+                        try:
+                            if memdc:
+                                memdc.DeleteDC()
+                            if bmp:
+                                win32gui.DeleteObject(bmp.GetHandle())
+                            win32gui.ReleaseDC(hwin, hwindc)
+                        except Exception:
+                            pass
+                    
+                    print(f"Screenshot captured using BitBlt: {screenshot_image.size}")
+                    
+                    # Apply image processing to frozen screenshot if option is enabled
+                    area_name = area_name_var.get() if area_name_var else None
+                    process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
+                                                    self.process_freeze_screen_var.get() and
+                                                    area_name and
+                                                    area_name in self.processing_settings)
+                    
+                    if process_freeze_screen_enabled:
+                        settings = self.processing_settings[area_name]
+                        screenshot_image = preprocess_image(
+                            screenshot_image,
+                            brightness=settings.get('brightness', 1.0),
+                            contrast=settings.get('contrast', 1.0),
+                            saturation=settings.get('saturation', 1.0),
+                            sharpness=settings.get('sharpness', 1.0),
+                            blur=settings.get('blur', 0.0),
+                            threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                            hue=settings.get('hue', 0.0),
+                            exposure=settings.get('exposure', 1.0)
+                        )
+                        print("Image processing applied to frozen screenshot (BitBlt).")
+                    
+                    # Store the frozen screenshot in the frame for freeze screen
+                    frame.frozen_screenshot = screenshot_image.copy()
+                    frame.frozen_screenshot_bounds = (min_x, min_y, virtual_width, virtual_height)
+                    print(f"Stored frozen screenshot in frame for reading")
+            except Exception as e:
+                print(f"Error taking screenshot: {e}")
+                import traceback
+                traceback.print_exc()
+                screenshot_image = None
+                # Clear any existing frozen screenshot
+                if hasattr(frame, 'frozen_screenshot'):
+                    delattr(frame, 'frozen_screenshot')
+                if hasattr(frame, 'frozen_screenshot_bounds'):
+                    delattr(frame, 'frozen_screenshot_bounds')
+        
+        # Set window to cover entire virtual screen
+        # Use the actual virtual screen coordinates, even if negative
+        # Windows should handle negative coordinates for multi-monitor setups
+        select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+        
+        print(f"Debug: Window positioned at ({min_x}, {min_y}) with size {virtual_width}x{virtual_height}")
+        
+        # Create canvas first
+        canvas = tk.Canvas(select_area_window, 
+                          cursor="cross",
+                          width=virtual_width,
+                          height=virtual_height,
+                          highlightthickness=0,
+                          bg='white')
+        canvas.pack(fill="both", expand=True)
+        
+        # Display screenshot on canvas if available (with white overlay)
+        # Use stored frozen screenshot if screenshot_image is not available (shouldn't happen, but safety check)
+        if not screenshot_image and hasattr(frame, 'frozen_screenshot') and frame.frozen_screenshot is not None:
+            screenshot_image = frame.frozen_screenshot
+        if screenshot_image:
+            try:
+                print(f"Displaying frozen screenshot on canvas")
+                
+                # Add red border to the screenshot edges (6px thick, 50% transparent)
+                border_width = 7  # Border thickness in pixels
+                # Convert to RGBA mode to support transparency
+                if screenshot_image.mode != 'RGBA':
+                    screenshot_image = screenshot_image.convert('RGBA')
+                draw = ImageDraw.Draw(screenshot_image)
+                width, height = screenshot_image.size
+                # Draw red border rectangle on the edges with 50% transparency (alpha = 128)
+                # Top edge
+                draw.rectangle([0, 0, width, border_width], fill=(255, 0, 0, 255))
+                # Bottom edge
+                draw.rectangle([0, height - border_width, width, height], fill=(255, 0, 0, 255))
+                # Left edge
+                draw.rectangle([0, 0, border_width, height], fill=(255, 0, 0, 255))
+                # Right edge
+                draw.rectangle([width - border_width, 0, width, height], fill=(255, 0, 0, 255))
+                
+                # Convert screenshot to PhotoImage (fully opaque, 100% visible)
+                screenshot_photo = ImageTk.PhotoImage(screenshot_image)
+                
+                # Display the screenshot on the canvas covering entire virtual screen
+                # Screenshot is fully opaque and 100% visible
+                canvas.create_image(0, 0, 
+                                  anchor="nw", 
+                                  image=screenshot_photo,
+                                  tags="screenshot_bg")
+                
+                # Create a semi-transparent white overlay using PIL with alpha channel
+                # This allows the screenshot to show through the white overlay
+                white_overlay_image = Image.new('RGBA', (virtual_width, virtual_height), (255, 255, 255, 50))  # 50% opacity (128/255)
+                white_overlay_photo = ImageTk.PhotoImage(white_overlay_image)
+                
+                # Display the semi-transparent white overlay on top of the screenshot
+                canvas.create_image(0, 0,
+                                  anchor="nw",
+                                  image=white_overlay_photo,
+                                  tags="white_overlay")
+                
+                # Explicitly set z-order: screenshot at bottom, white overlay above it
+                # This ensures proper layering even if items are redrawn
+                canvas.tag_lower("screenshot_bg")  # Put screenshot at the very bottom
+                canvas.tag_raise("white_overlay", "screenshot_bg")  # Put white overlay above screenshot
+                
+                # Keep references to prevent garbage collection
+                canvas.screenshot_photo = screenshot_photo
+                canvas.white_overlay_photo = white_overlay_photo
+                print(f"Frozen screenshot displayed on canvas with semi-transparent white overlay (screenshot fully opaque, overlay 50% transparent)")
+            except Exception as e:
+                print(f"Error displaying screenshot: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Set window properties - keep alpha at 0.0 (invisible) until everything is ready
+        select_area_window.attributes("-topmost", True)  # Keep window on top
+        select_area_window.attributes("-alpha", 0.0)  # Keep invisible for now
+        
+        # Force update to ensure geometry and positioning are applied
+        select_area_window.update_idletasks()
+        select_area_window.update()  # Force full update to ensure positioning
+        
+        # Wait 200ms before showing the window to ensure everything is fully processed
+        # This prevents any flash and gives Windows time to set up the window properly
+        def show_window_with_alpha():
+            print("GAME_TEXT_READER: show_window_with_alpha() called")
+            # For fullscreen mode, ensure game is still in foreground before showing selection
+            if fullscreen_mode_enabled and game_window_handle_for_frozen:
+                try:
+                    current_foreground = win32gui.GetForegroundWindow()
+                    if current_foreground != game_window_handle_for_frozen:
+                        print(f"Warning: Game lost focus before showing selection window, attempting to restore...")
+                        # Try to restore game window to foreground
+                        if win32gui.IsWindow(game_window_handle_for_frozen):
+                            if win32gui.IsIconic(game_window_handle_for_frozen):
+                                win32gui.ShowWindow(game_window_handle_for_frozen, win32con.SW_RESTORE)
+                                time.sleep(0.1)
+                            win32gui.SetForegroundWindow(game_window_handle_for_frozen)
+                            time.sleep(0.2)  # Wait for game to be in foreground
+                            print("Game window restored to foreground")
+                except Exception as e:
+                    print(f"Error verifying game foreground status: {e}")
+            
+            # Ensure window is still positioned correctly
+            select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+            select_area_window.update_idletasks()
+            
+            # Show window while still invisible (alpha 0.0)
+            print("GAME_TEXT_READER: Calling select_area_window.deiconify()...")
+            select_area_window.deiconify()
+            print("GAME_TEXT_READER: Window deiconified")
+            
+            # Set alpha based on whether screenshot is enabled
+            # If screenshot is enabled, use full opacity (1.0) so screenshot is 100% visible
+            # Otherwise, use 0.5 for the white background
+            window_alpha = 1.0 if screenshot_image else 0.2
+            print(f"GAME_TEXT_READER: Setting window alpha to {window_alpha} (screenshot: {screenshot_image is not None})")
+            select_area_window.attributes("-alpha", window_alpha)
+            # Force immediate update to apply alpha
+            select_area_window.update()
+            print("GAME_TEXT_READER: Window should now be visible!")
+            print(f"GAME_TEXT_READER: Window geometry: {select_area_window.geometry()}")
+            print(f"GAME_TEXT_READER: Window exists: {select_area_window.winfo_exists()}")
+        
+        # Wait before showing the selection window
+        # Longer delay for fullscreen mode to ensure game is fully restored
+        delay_ms = 150 if fullscreen_mode_enabled else 0
+        self.root.after(delay_ms, show_window_with_alpha)
+        
+        # Force the window to be positioned correctly with multiple attempts
+        def ensure_proper_positioning():
+            try:
+                select_area_window.update_idletasks()
+                select_area_window.lift()
+                select_area_window.focus_force()
+                
+                # Check if positioning worked
+                actual_x = select_area_window.winfo_x()
+                actual_y = select_area_window.winfo_y()
+                
+                if abs(actual_x - min_x) > 10 or abs(actual_y - min_y) > 10:
+                    print(f"Debug: Window positioning failed, retrying... Expected: ({min_x}, {min_y}), Got: ({actual_x}, {actual_y})")
+                    # Try to reposition
+                    select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+                    select_area_window.update_idletasks()
+                    
+                    # Check again
+                    actual_x = select_area_window.winfo_x()
+                    actual_y = select_area_window.winfo_y()
+                    print(f"Debug: After retry - Position: ({actual_x}, {actual_y})")
+                else:
+                    print(f"Debug: Window positioned correctly at ({actual_x}, {actual_y})")
+                    
+            except Exception as e:
+                print(f"Debug: Error ensuring proper positioning: {e}")
+        
+        # Ensure proper positioning with a delay
+        self.root.after(100, ensure_proper_positioning)
+        
+        # Create border rectangle with more visible red border
+        # These borders need to be on top of the white overlay and screenshot
+        border = canvas.create_rectangle(0, 0, 0, 0,
+                                       outline='red',
+                                       width=3,  # Increased width
+                                       dash=(8, 4),  # Longer dashes, shorter gaps
+                                       tags="selection_border")
+        
+        # Check if fullscreen mode is enabled for more aggressive focus handling
+        fullscreen_mode_enabled = hasattr(self, 'fullscreen_mode_var') and self.fullscreen_mode_var.get()
+        
+        # Wait for proper positioning before binding events
+        def bind_events_after_positioning():
+            try:
+                # Only bind events if window is properly positioned
+                actual_x = select_area_window.winfo_x()
+                actual_y = select_area_window.winfo_y()
+                
+                if abs(actual_x - min_x) <= 10 and abs(actual_y - min_y) <= 10:
+                    print("Debug: Binding events - window properly positioned")
+                    # Bind events
+                    canvas.bind("<Button-1>", on_click)
+                    canvas.bind("<Escape>", on_escape)
+                    select_area_window.bind("<Escape>", on_escape)
+                    # Capture Escape at the application level to ensure it works even if focus is lost
+                    try:
+                        self.root.bind_all("<Escape>", on_escape)
+                    except Exception:
+                        pass
+                    
+                    # Add focus and key bindings
+                    select_area_window.focus_force()
+                    # Grab all events so Escape is reliably received
+                    try:
+                        select_area_window.grab_set()
+                    except Exception:
+                        pass
+                    select_area_window.bind("<FocusOut>", lambda e: select_area_window.focus_force())
+                    select_area_window.bind("<Key>", lambda e: on_escape(e) if e.keysym == "Escape" else None)
+                    
+                    # For fullscreen mode, add more aggressive focus recapture
+                    if fullscreen_mode_enabled:
+                        def aggressive_focus_recapture():
+                            try:
+                                if select_area_window.winfo_exists():
+                                    # Force window to stay on top
+                                    select_area_window.attributes("-topmost", True)
+                                    select_area_window.lift()
+                                    # Force focus back to selection window
+                                    select_area_window.focus_force()
+                                    # Try to set grab again in case it was lost
+                                    try:
+                                        select_area_window.grab_set()
+                                    except Exception:
+                                        pass
+                                    # Schedule next recapture check
+                                    self.root.after(100, aggressive_focus_recapture)
+                            except Exception:
+                                pass  # Window was destroyed, stop recapture
+                        
+                        # Start aggressive focus recapture after initial setup
+                        self.root.after(200, aggressive_focus_recapture)
+                        print("Debug: Fullscreen mode - aggressive focus recapture enabled")
+                    
+                    # Mark that the window is ready for interaction
+                    select_area_window.window_ready = True
+                    print("Debug: Area selection window is ready for interaction")
+                    
+                else:
+                    print(f"Debug: Window not properly positioned yet, retrying... ({actual_x}, {actual_y}) vs ({min_x}, {min_y})")
+                    # Retry after a short delay
+                    self.root.after(50, bind_events_after_positioning)
+                    
+            except Exception as e:
+                print(f"Debug: Error binding events: {e}")
+        
+        # Bind events after positioning is confirmed
+        self.root.after(150, bind_events_after_positioning)
+        
+        # Add timeout to prevent hanging if window never gets positioned
+        def timeout_handler():
+            if not hasattr(select_area_window, 'window_ready') or not select_area_window.window_ready:
+                print("Debug: Timeout - forcing window to be ready")
+                select_area_window.window_ready = True
+                # Force bind events
+                try:
+                    canvas.bind("<Button-1>", on_click)
+                    canvas.bind("<Escape>", on_escape)
+                    select_area_window.bind("<Escape>", on_escape)
+                    self.root.bind_all("<Escape>", on_escape)
+                    select_area_window.focus_force()
+                    select_area_window.grab_set()
+                    select_area_window.bind("<FocusOut>", lambda e: select_area_window.focus_force())
+                    select_area_window.bind("<Key>", lambda e: on_escape(e) if e.keysym == "Escape" else None)
+                    
+                    # For fullscreen mode, add more aggressive focus recapture
+                    if fullscreen_mode_enabled:
+                        def aggressive_focus_recapture():
+                            try:
+                                if select_area_window.winfo_exists():
+                                    # Force window to stay on top
+                                    select_area_window.attributes("-topmost", True)
+                                    select_area_window.lift()
+                                    # Force focus back to selection window
+                                    select_area_window.focus_force()
+                                    # Try to set grab again in case it was lost
+                                    try:
+                                        select_area_window.grab_set()
+                                    except Exception:
+                                        pass
+                                    # Schedule next recapture check
+                                    self.root.after(100, aggressive_focus_recapture)
+                            except Exception:
+                                pass  # Window was destroyed, stop recapture
+                        
+                        # Start aggressive focus recapture after initial setup
+                        self.root.after(200, aggressive_focus_recapture)
+                        print("Debug: Fullscreen mode (timeout) - aggressive focus recapture enabled")
+                    
+                    print("Debug: Events bound after timeout")
+                except Exception as e:
+                    print(f"Debug: Error binding events after timeout: {e}")
+        
+        # Set timeout to 2 seconds
+        self.root.after(2000, timeout_handler)
+        
+        # Create second border for better visibility
+        border_outline = canvas.create_rectangle(0, 0, 0, 0,
+                                          outline='red',
+                                          width=3,
+                                          dash=(8, 4),
+                                          dashoffset=6,  # Offset to create alternating pattern
+                                          tags="selection_border")
+        
+        # Ensure selection borders are always on top of screenshot and white overlay
+        if screenshot_image:
+            canvas.tag_raise("selection_border", "white_overlay")
+            canvas.tag_raise("selection_border", "screenshot_bg")
+        
+        # Create transparent black box with "press esc to exit" text in center top
+        def create_exit_message():
+            try:
+                # Calculate center top position
+                center_x = virtual_width // 2
+                top_y = 20  # Position from top
+                
+                # Create a semi-transparent black rectangle
+                # Box dimensions
+                box_width = 200
+                box_height = 30
+                
+                # Create semi-transparent black background using a rectangle with fill
+                # We'll use a solid color with alpha by creating an image
+                # PIL Image and ImageTk are already imported at the top of the file
+                
+                # Create a semi-transparent black image
+                overlay_img = Image.new('RGBA', (box_width, box_height), (0, 0, 0, 255))  # 180/255 ≈ 70% opacity
+                overlay_photo = ImageTk.PhotoImage(overlay_img)
+                
+                # Add the image to canvas
+                exit_box = canvas.create_image(center_x, top_y + box_height // 2, 
+                                              image=overlay_photo, 
+                                              anchor='center',
+                                              tags="exit_message")
+                
+                # Keep reference to prevent garbage collection
+                canvas.exit_overlay_photo = overlay_photo
+                
+                # Add text on top
+                exit_text = canvas.create_text(center_x, top_y + box_height // 2,
+                                              text="Press ESC to exit",
+                                              fill="white",
+                                              font=("Arial", 14, "bold"),
+                                              tags="exit_message")
+                
+                # Ensure exit message is on top of everything
+                # Try to raise above other elements if they exist
+                try:
+                    canvas.tag_raise("exit_message", "selection_border")
+                except (tk.TclError, Exception):
+                    pass  # Tag doesn't exist, skip
+                try:
+                    canvas.tag_raise("exit_message", "white_overlay")
+                except (tk.TclError, Exception):
+                    pass  # Tag doesn't exist, skip
+                try:
+                    canvas.tag_raise("exit_message", "screenshot_bg")
+                except (tk.TclError, Exception):
+                    pass  # Tag doesn't exist, skip
+                
+            except Exception as e:
+                print(f"Error creating exit message: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Create exit message after window is shown
+        self.root.after(250, create_exit_message)
+
+    def set_area(self, frame, area_name_var, set_area_button):
+        # Check if another area selection is already in progress
+        if hasattr(self, 'area_selection_in_progress') and self.area_selection_in_progress:
+            print("Another area selection is already in progress. Please wait for it to complete.")
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Another area selection is already in progress", fg="red")
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                self._feedback_timer = self.root.after(3000, lambda: self.status_label.config(text=""))
+            return
+        
+        # Mark that area selection is now in progress
+        self.area_selection_in_progress = True
+        
+        # Ensure root window stays in background and doesn't flash
+        root_was_visible = self.root.winfo_viewable()
+        if root_was_visible:
+            self.root.lower()
+        
+        # Store the current mouse hooks to restore them later
+        self.saved_mouse_hooks = []
+        if hasattr(self, 'mouse_hooks') and self.mouse_hooks:
+            self.saved_mouse_hooks = self.mouse_hooks.copy()
+        
+        # Disable all hotkeys before starting area selection
+        try:
+            keyboard.unhook_all()
+            if hasattr(self, 'mouse_hooks'):
+                self.mouse_hooks.clear()
+        except Exception as e:
+            print(f"Error disabling hotkeys for area selection: {e}")
+        
+        self.hotkeys_disabled_for_selection = True
+        
+        # Get virtual screen dimensions
+        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        
+        # Get primary monitor position and dimensions
+        # Use EnumDisplayMonitors to reliably find the primary monitor
+        # This is more reliable than MonitorFromPoint in multi-monitor setups
+        primary_monitor_x, primary_monitor_y, primary_monitor_width, primary_monitor_height = get_primary_monitor_info()
+        
+        # Calculate center position relative to canvas coordinates (accounting for min_x/min_y offset)
+        # Primary monitor center in screen coordinates
+        primary_center_x_screen = primary_monitor_x + (primary_monitor_width // 2)
+        primary_center_y_screen = primary_monitor_y + (primary_monitor_height // 2)
+        # Convert to canvas coordinates (relative to min_x/min_y)
+        main_monitor_center_x = primary_center_x_screen - min_x
+        main_monitor_center_y = primary_center_y_screen - min_y
+        # Calculate top position of primary monitor in canvas coordinates (for toolbar positioning)
+        main_monitor_top_y = primary_monitor_y - min_y
+        
+        # Take screenshot of all monitors if enabled (before windows are created)
+        screenshot_image = None
+        # Use pre-loaded screenshot background setting (loaded at startup)
+        if self.edit_area_screenshot_bg:
+            try:
+                print(f"Taking screenshot of all monitors for edit view background: {virtual_width}x{virtual_height} at ({min_x}, {min_y})")
+                
+                # Use win32api method to capture entire virtual screen (all monitors)
+                # This handles negative coordinates properly
+                hwin = win32gui.GetDesktopWindow()
+                hwindc = win32gui.GetWindowDC(hwin)
+                memdc = None
+                bmp = None
+                try:
+                    srcdc = win32ui.CreateDCFromHandle(hwindc)
+                    memdc = srcdc.CreateCompatibleDC()
+                    
+                    # Create bitmap for entire virtual screen
+                    bmp = win32ui.CreateBitmap()
+                    bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
+                    memdc.SelectObject(bmp)
+                    
+                    # Copy entire virtual screen into bitmap
+                    memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
+                    
+                    # Convert bitmap to PIL Image
+                    bmpinfo = bmp.GetInfo()
+                    bmpstr = bmp.GetBitmapBits(True)
+                    screenshot_image = Image.frombuffer(
+                        'RGB',
+                        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                        bmpstr, 'raw', 'BGRX', 0, 1
+                    )
+                finally:
+                    # Always clean up resources
+                    try:
+                        if memdc:
+                            memdc.DeleteDC()
+                        if bmp:
+                            win32gui.DeleteObject(bmp.GetHandle())
+                        win32gui.ReleaseDC(hwin, hwindc)
+                    except Exception:
+                        pass
+                
+                print(f"Screenshot captured successfully: {screenshot_image.size}")
+            except Exception as e:
+                print(f"Error taking screenshot for edit view background: {e}")
+                import traceback
+                traceback.print_exc()
+                screenshot_image = None
+        
+        # Create TWO separate windows for independent transparency control
+        # 1. Background window - transparent white background
+        background_window = tk.Toplevel(self.root)
+        background_window.attributes("-alpha", 0.0)
+        background_window.overrideredirect(True)
+        background_window.withdraw()
+        background_window.update_idletasks()
+        
+        background_window.transient(self.root)
+        background_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+        background_window.attributes("-topmost", True)
+        background_window.attributes("-alpha", 0.0)
+        
+        # 2. Overlay window - fully opaque for boxes and buttons
+        select_area_window = tk.Toplevel(self.root)
+        select_area_window.attributes("-alpha", 0.0)
+        select_area_window.overrideredirect(True)
+        select_area_window.withdraw()
+        select_area_window.update_idletasks()
+        
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                select_area_window.iconbitmap(icon_path)
+                background_window.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting selection window icon: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        select_area_window.transient(self.root)
+        select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+        select_area_window.attributes("-topmost", True)
+        # Alpha will be set after loading from settings
+        
+        def on_window_destroy():
+            if hasattr(self, 'area_selection_in_progress'):
+                self.area_selection_in_progress = False
+            # Clear the callback reference
+            if hasattr(self, '_edit_area_done_callback'):
+                self._edit_area_done_callback = None
+            # Destroy both windows
+            try:
+                background_window.destroy()
+            except (tk.TclError, AttributeError, Exception):
+                # Window may already be destroyed
+                pass
+            try:
+                select_area_window.destroy()
+            except (tk.TclError, AttributeError, Exception):
+                # Window may already be destroyed
+                pass
+            self._restore_hotkeys_after_selection()
+        
+        select_area_window.protocol("WM_DELETE_WINDOW", on_window_destroy)
+        background_window.protocol("WM_DELETE_WINDOW", on_window_destroy)
+        
+        # Create canvas for background window
+        background_canvas = tk.Canvas(background_window, 
+                                     width=virtual_width,
+                                     height=virtual_height,
+                                     highlightthickness=0,
+                                     bg='black')
+        background_canvas.pack(fill="both", expand=True)
+        
+        # Display screenshot on background canvas if available
+        background_photo = None
+        if screenshot_image:
+            try:
+                print(f"Displaying screenshot on background canvas. Virtual screen: {min_x}, {min_y}, {virtual_width}x{virtual_height}")
+                
+                # Add red border to the screenshot edges (6px thick, 50% transparent)
+                border_width = 6  # Border thickness in pixels
+                # Convert to RGBA mode to support transparency
+                if screenshot_image.mode != 'RGBA':
+                    screenshot_image = screenshot_image.convert('RGBA')
+                draw = ImageDraw.Draw(screenshot_image)
+                width, height = screenshot_image.size
+                # Draw red border rectangle on the edges with 50% transparency (alpha = 128)
+                # Top edge
+                draw.rectangle([0, 0, width, border_width], fill=(255, 0, 0, 255))
+                # Bottom edge
+                draw.rectangle([0, height - border_width, width, height], fill=(255, 0, 0, 255))
+                # Left edge
+                draw.rectangle([0, 0, border_width, height], fill=(255, 0, 0, 255))
+                # Right edge
+                draw.rectangle([width - border_width, 0, width, height], fill=(255, 0, 0, 255))
+                
+                # Convert screenshot to PhotoImage
+                background_photo = ImageTk.PhotoImage(screenshot_image)
+                
+                # Screenshot covers entire virtual screen, so position at (0, 0) in canvas coordinates
+                # Canvas coordinates start at (0, 0) which corresponds to virtual screen (min_x, min_y)
+                print(f"Positioning screenshot at canvas coordinates: (0, 0)")
+                
+                # Display the screenshot on the canvas covering entire virtual screen
+                background_canvas.create_image(0, 0, 
+                                              anchor="nw", 
+                                              image=background_photo,
+                                              tags="screenshot_bg")
+                
+                # Create a semi-transparent white overlay using PIL with alpha channel
+                # This allows the screenshot to show through the white overlay
+                white_overlay_image = Image.new('RGBA', (virtual_width, virtual_height), (255, 255, 255, 50))  # 50% opacity (128/255)
+                white_overlay_photo = ImageTk.PhotoImage(white_overlay_image)
+                
+                # Display the semi-transparent white overlay on top of the screenshot
+                background_canvas.create_image(0, 0,
+                                              anchor="nw",
+                                              image=white_overlay_photo,
+                                              tags="white_overlay")
+                
+                # Explicitly set z-order: screenshot at bottom, white overlay above it
+                # This ensures proper layering even if items are redrawn
+                background_canvas.tag_lower("screenshot_bg")  # Put screenshot at the very bottom
+                background_canvas.tag_raise("white_overlay", "screenshot_bg")  # Put white overlay above screenshot
+                
+                # Keep references to prevent garbage collection
+                background_canvas.background_photo = background_photo
+                background_canvas.white_overlay_photo = white_overlay_photo
+                print("Screenshot displayed on background canvas with semi-transparent white overlay (screenshot fully opaque, overlay 50% transparent)")
+            except Exception as e:
+                print(f"Error displaying screenshot on edit view background: {e}")
+                import traceback
+                traceback.print_exc()
+                background_photo = None
+        
+        # Create canvas for overlay window - transparent background
+        # Use a specific color for transparency that we won't use in boxes
+        # Using a very specific magenta shade (#FF00FE) as transparent color key
+        TRANSPARENT_COLOR = "#FF00FE"
+        try:
+            # Try to set transparent color (Windows-specific)
+            select_area_window.attributes("-transparentcolor", TRANSPARENT_COLOR)
+            select_area_window.configure(bg=TRANSPARENT_COLOR)
+            canvas_bg = TRANSPARENT_COLOR
+        except (tk.TclError, AttributeError, Exception):
+            # Fallback: if transparentcolor not supported, use black with window alpha
+            select_area_window.configure(bg='black')
+            canvas_bg = 'black'
+        
+        canvas = tk.Canvas(select_area_window, 
+                          width=virtual_width,
+                          height=virtual_height,
+                          highlightthickness=0,
+                          bg=canvas_bg)
+        canvas.pack(fill="both", expand=True)
+        
+        background_window.update_idletasks()
+        select_area_window.update_idletasks()
+        select_area_window.update()
+        
+        # Store area boxes data
+        area_boxes = {}
+        selected_box = None
+        drag_start = None
+        resize_handle = None
+        RESIZE_HANDLE_SIZE = 8
+        
+        # Save original area coordinates to restore if closing without saving
+        original_area_coords = {}
+        original_areas_set = set()  # Track which areas existed when editor opened
+        for area in self.areas:
+            area_frame = area[0]
+            original_areas_set.add(area_frame)
+            if hasattr(area_frame, 'area_coords'):
+                # Save a copy of the original coordinates
+                original_area_coords[area_frame] = getattr(area_frame, 'area_coords', (0, 0, 0, 0))
+        
+        # Transparency variables - can be adjusted independently
+        # Boxes/buttons opacity controlled by slider
+        # Use pre-loaded alpha value from settings (loaded at startup)
+        boxes_alpha = self.edit_area_alpha
+        
+        # Function to update box opacity (removed white background)
+        def update_box_opacity():
+            """Update the opacity of area boxes based on alpha slider"""
+            # Control the overlay window's alpha directly
+            select_area_window.attributes("-alpha", boxes_alpha)
+            # Redraw boxes to reflect new opacity
+            draw_area_boxes()
+        
+        # Generate random colors for each area
+        def generate_color():
+            return "#{:02x}{:02x}{:02x}".format(
+                random.randint(100, 255),
+                random.randint(100, 255),
+                random.randint(100, 255)
+            )
+        
+        # Get hotkey display text
+        def get_hotkey_display(hotkey_button):
+            # Check if we're in hotkey assignment mode and show the live preview from button
+            if getattr(self, 'setting_hotkey', False) and hasattr(hotkey_button, 'cget'):
+                try:
+                    button_text = hotkey_button.cget('text')
+                    # If button shows assignment text, extract and return the preview part
+                    if "Set Hotkey:" in button_text:
+                        # Extract content between [ and ]
+                        match = re.search(r'\[([^\]]*)\]', button_text)
+                        if match:
+                            preview = match.group(1).strip()
+                            return preview if preview else "..."
+                    elif "Press" in button_text:
+                        # For "Press any key or combination..." or "Press key: [ ... ]"
+                        match = re.search(r'Press key:\s*\[([^\]]*)\]', button_text)
+                        if match:
+                            preview = match.group(1).strip()
+                            return preview if preview else "..."
+                        elif "Press any key" in button_text:
+                            return "..."
+                except Exception:
+                    pass
+            
+            # Normal display when not in assignment mode
+            if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
+                hk = hotkey_button.hotkey.upper()
+                return hk.replace('LEFT ALT', 'L-ALT').replace('RIGHT ALT', 'R-ALT') \
+                        .replace('WINDOWS', 'WIN').replace('CTRL', 'CTRL')
+            return "Click here to set hotkey"
+        
+        # Draw all area boxes
+        def draw_area_boxes():
+            # Check if canvas still exists (editor might have been closed)
+            try:
+                if not canvas.winfo_exists():
+                    return
+            except (tk.TclError, AttributeError):
+                # Canvas has been destroyed
+                return
+            
+            try:
+                canvas.delete("area_box")
+                canvas.delete("area_text")
+                canvas.delete("area_hotkey")
+                canvas.delete("resize_handle")
+                canvas.delete("inner_box")
+                canvas.delete("text_bg")
+                canvas.delete("hotkey_bg")
+                canvas.delete("overlay_box")
+            except tk.TclError:
+                # Canvas was destroyed during operation
+                return
+            # Don't delete white_bg here - it's managed separately
+            
+            center_x = virtual_width // 2
+            center_y = virtual_height // 2
+            default_size = 200
+            
+            # Remove area_boxes entries for areas that no longer exist
+            existing_frames = {area[0] for area in self.areas}
+            frames_to_remove = [frame for frame in area_boxes.keys() if frame not in existing_frames]
+            for frame in frames_to_remove:
+                del area_boxes[frame]
+            
+            # Count grayed out areas to offset them
+            grayed_index = 0
+            
+            for area in self.areas:
+                area_frame, hotkey_button, _, name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                area_name = name_var.get()
+                
+                # Skip Auto Read areas - don't show them in edit screen
+                if area_name.startswith("Auto Read"):
+                    continue
+                
+                # Get or create box data
+                if area_frame not in area_boxes:
+                    # Check if area has coordinates
+                    if hasattr(area_frame, 'area_coords') and area_frame.area_coords and area_frame.area_coords != (0, 0, 0, 0):
+                        x1, y1, x2, y2 = area_frame.area_coords
+                        # Convert screen coordinates to canvas coordinates
+                        x1_canvas = x1 - min_x
+                        y1_canvas = y1 - min_y
+                        x2_canvas = x2 - min_x
+                        y2_canvas = y2 - min_y
+                        color = generate_color()
+                        is_grayed = False
+                    else:
+                        # Place in center, grayed out, offset to avoid overlap
+                        offset_x = (grayed_index % 3 - 1) * (default_size + 20)
+                        offset_y = (grayed_index // 3) * (default_size + 20)
+                        x1_canvas = center_x - default_size // 2 + offset_x
+                        y1_canvas = center_y - default_size // 2 + offset_y
+                        x2_canvas = center_x + default_size // 2 + offset_x
+                        y2_canvas = center_y + default_size // 2 + offset_y
+                        color = "#808080"  # Gray
+                        is_grayed = True
+                        grayed_index += 1
+                    
+                    area_boxes[area_frame] = {
+                        'x1': x1_canvas, 'y1': y1_canvas, 'x2': x2_canvas, 'y2': y2_canvas,
+                        'color': color, 'is_grayed': is_grayed, 'name_var': name_var,
+                        'hotkey_button': hotkey_button
+                    }
+                
+                box_data = area_boxes[area_frame]
+                x1, y1, x2, y2 = box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2']
+                color = box_data['color']
+                is_grayed = box_data['is_grayed']
+                
+                # Draw box with opacity controlled by stipple pattern
+                # In delete mode, highlight hovered box with red color
+                if delete_mode and hovered_box == area_frame:
+                    # Highlight box in red when hovered in delete mode
+                    fill_color = "#ff4444"  # Red color for delete mode hover
+                    outline_color = "#cc0000"  # Darker red outline
+                    outline_width = 3
+                elif not is_grayed:
+                    # Active boxes: full color fill with the area's color
+                    fill_color = color  # Use the area's color for fill
+                    outline_color = "#000000"  # Black outline for contrast
+                    outline_width = 3
+                else:
+                    # Grayed out boxes: light gray fill
+                    fill_color = "#d0d0d0"
+                    outline_color = "#808080"
+                    outline_width = 3
+                
+                # Draw box without stipple (opacity controlled by window alpha)
+                canvas.create_rectangle(x1, y1, x2, y2,
+                                       fill=fill_color,
+                                       outline=outline_color,
+                                       width=outline_width,
+                                       tags=("area_box", f"box_{id(area_frame)}", "overlay_box"))
+                
+                # Boxes are on main window which is above background window
+                # No need to raise relative to white_bg since it's on a different window
+                
+                # Draw a white border inside for better text visibility
+                if not is_grayed:
+                    inner_margin = outline_width + 2
+                    canvas.create_rectangle(x1 + inner_margin, y1 + inner_margin,
+                                           x2 - inner_margin, y2 - inner_margin,
+                                           fill="",
+                                           outline="white",
+                                           width=1,
+                                           tags=("area_box", f"box_{id(area_frame)}", "inner_box"))
+                else:
+                    inner_margin = outline_width + 2  # Use same margin for grayed boxes
+                
+                # Draw resize handles (for all boxes, not just active ones)
+                handles = [
+                    (x1, y1, "nw"), (x2, y1, "ne"),
+                    (x1, y2, "sw"), (x2, y2, "se"),
+                    ((x1+x2)//2, y1, "n"), ((x1+x2)//2, y2, "s"),
+                    (x1, (y1+y2)//2, "w"), (x2, (y1+y2)//2, "e")
+                ]
+                for hx, hy, handle_type in handles:
+                    canvas.create_rectangle(hx-RESIZE_HANDLE_SIZE//2, hy-RESIZE_HANDLE_SIZE//2,
+                                           hx+RESIZE_HANDLE_SIZE//2, hy+RESIZE_HANDLE_SIZE//2,
+                                           fill=outline_color, outline="black", width=1,
+                                           tags=("resize_handle", f"handle_{id(area_frame)}_{handle_type}"))
+                
+                # Draw area name in top left with background for visibility
+                center_x_box = (x1 + x2) // 2
+                center_y_box = (y1 + y2) // 2
+                # Use black text for better contrast on white background
+                text_color = "black" if not is_grayed else "#666666"
+                
+                # Position name aligned with inner white border corner
+                # Show "Click here to Set Area Name" if name is empty or default
+                if not area_name or area_name.strip() == "" or area_name == "Area Name":
+                    name_text = "Click here to set Area Name"
+                else:
+                    name_text = f"Area Name: {area_name}"
+                # Measure text width accurately using font
+                name_font_obj = tkfont.Font(family="Helvetica", size=13, weight="bold")
+                text_bg_width = name_font_obj.measure(name_text) + 6  # Add small padding inside
+                text_bg_height = 22
+                name_x = x1 + inner_margin  # Aligned with inner border on the left
+                name_y = y1 + inner_margin + 11  # Aligned with inner border + half text height
+                
+                # Draw text background rectangle with white background, sized to text
+                # Include both text and text_bg tags so clicking anywhere on the name box works
+                canvas.create_rectangle(name_x, name_y - 11,
+                                       name_x + text_bg_width, name_y + 11,
+                                       fill="white", outline="black",
+                                       width=1,
+                                       tags=("area_text", f"text_bg_{id(area_frame)}", f"text_{id(area_frame)}"))
+                
+                canvas.create_text(name_x + 3, name_y,
+                                 text=name_text,
+                                 fill=text_color,
+                                 font=("Helvetica", 13, "bold"),
+                                 anchor="w",
+                                 tags=("area_text", f"text_{id(area_frame)}"))
+                
+                # Draw hotkey in center of box with background
+                # In delete mode, show "Click to delete" instead of hotkey
+                if delete_mode:
+                    hotkey_text = "Click to delete"
+                else:
+                    hotkey_display = get_hotkey_display(hotkey_button)
+                    # During assignment, show "Set Hotkey: [ ... ]" format to match button
+                    if getattr(self, 'setting_hotkey', False) and hasattr(hotkey_button, 'cget'):
+                        try:
+                            button_text = hotkey_button.cget('text')
+                            if "Set Hotkey:" in button_text or "Press" in button_text:
+                                # Use the button text format directly
+                                if "Set Hotkey:" in button_text:
+                                    hotkey_text = button_text  # "Set Hotkey: [ ... ]"
+                                elif "Press key:" in button_text:
+                                    hotkey_text = button_text  # "Press key: [ ... ]"
+                                else:
+                                    hotkey_text = "Press any key or combination..."
+                            else:
+                                # If no hotkey, show "click to set hotkey" without "Hotkey:" prefix
+                                if hotkey_display == "Click here to set hotkey":
+                                    hotkey_text = hotkey_display
+                                else:
+                                    hotkey_text = f"Hotkey: {hotkey_display}"
+                        except Exception:
+                            # If no hotkey, show "click to set hotkey" without "Hotkey:" prefix
+                            if hotkey_display == "Click here to set hotkey":
+                                hotkey_text = hotkey_display
+                            else:
+                                hotkey_text = f"Hotkey: {hotkey_display}"
+                    else:
+                        # If no hotkey, show "click to set hotkey" without "Hotkey:" prefix
+                        if hotkey_display == "Click here to set hotkey":
+                            hotkey_text = hotkey_display
+                        else:
+                            hotkey_text = f"Hotkey: {hotkey_display}"
+                # Measure text width accurately using font
+                hotkey_font_obj = tkfont.Font(family="Helvetica", size=11, weight="bold")
+                hotkey_bg_width = hotkey_font_obj.measure(hotkey_text) + 10  # Add small padding
+                hotkey_x = center_x_box  # Center of box
+                hotkey_y = center_y_box  # Center of box
+                
+                # Draw hotkey background rectangle with white background, sized to text
+                # Include both hotkey and hotkey_bg tags so clicking anywhere on the hotkey box works
+                canvas.create_rectangle(hotkey_x - hotkey_bg_width // 2, hotkey_y - 11,
+                                       hotkey_x + hotkey_bg_width // 2, hotkey_y + 11,
+                                       fill="white", outline="black",
+                                       width=1,
+                                       tags=("area_hotkey", f"hotkey_bg_{id(area_frame)}", f"hotkey_{id(area_frame)}"))
+                
+                canvas.create_text(hotkey_x, hotkey_y,
+                                 text=hotkey_text,
+                                 fill=text_color,
+                                 font=("Helvetica", 11, "bold"),
+                                 anchor="c",
+                                 tags=("area_hotkey", f"hotkey_{id(area_frame)}"))
+            
+            # Ensure area boxes are always below button background (if it exists)
+            try:
+                # Check if button_bg_fill exists before trying to lower items below it
+                if canvas.find_withtag("button_bg_fill"):
+                    canvas.tag_lower("area_box", "button_bg_fill")
+                    canvas.tag_lower("area_text", "button_bg_fill")
+                    canvas.tag_lower("area_hotkey", "button_bg_fill")
+                    canvas.tag_lower("resize_handle", "button_bg_fill")
+                    canvas.tag_lower("inner_box", "button_bg_fill")
+            except Exception:
+                # If tag doesn't exist yet, that's okay - it will be created later
+                pass
+        
+        # Track if name editing is active to prevent box movement
+        name_editing_active = False
+        finish_name_edit_callback = None  # Callback to finish name editing when clicking outside
+        drag_initial_state = None  # Track initial position when drag starts
+        delete_mode = False  # Track if we're in delete mode
+        hovered_box = None  # Track which box is being hovered over
+        
+        # Undo/Redo system
+        undo_stack = []  # List of state snapshots
+        redo_stack = []  # List of states for redo
+        max_undo_history = 50  # Limit undo history
+        
+        def save_state():
+            """Save current state for undo"""
+            # Clear the layout_just_loaded flag on first user action
+            if getattr(self, '_layout_just_loaded', False):
+                self._layout_just_loaded = False
+            
+            # Create a snapshot of current state
+            state = {
+                'boxes': {},  # Box positions by area name
+                'names': {},  # Area names by area name (for consistency)
+                'area_names': []  # List of area names that exist
+            }
+            
+            # Save box positions and track which areas exist
+            # Use self.areas to get complete picture, not just area_boxes
+            for area in self.areas:
+                area_frame = area[0]
+                name_var = area[3] if len(area) > 3 else None
+                if name_var:
+                    area_name = name_var.get()
+                    # Skip Auto Read areas - they shouldn't be in edit view undo/redo
+                    if area_name.startswith("Auto Read"):
+                        continue
+                    
+                    state['area_names'].append(area_name)
+                    state['names'][area_name] = area_name
+                    
+                    # Get box data from area_boxes if available, otherwise use defaults
+                    if area_frame in area_boxes:
+                        box_data = area_boxes[area_frame]
+                        state['boxes'][area_name] = {
+                            'x1': box_data['x1'],
+                            'y1': box_data['y1'],
+                            'x2': box_data['x2'],
+                            'y2': box_data['y2'],
+                            'color': box_data.get('color', '#808080'),
+                            'is_grayed': box_data.get('is_grayed', False)
+                        }
+                    else:
+                        # Area exists but hasn't been positioned yet - save with default/zero values
+                        state['boxes'][area_name] = {
+                            'x1': 0,
+                            'y1': 0,
+                            'x2': 0,
+                            'y2': 0,
+                            'color': '#808080',
+                            'is_grayed': False
+                        }
+            
+            # Add to undo stack and clear redo stack
+            undo_stack.append(state)
+            if len(undo_stack) > max_undo_history:
+                undo_stack.pop(0)  # Remove oldest
+            redo_stack.clear()  # Clear redo when new action is done
+            # Update button states after save (called later when buttons exist)
+            self.root.after(10, lambda: update_undo_redo_buttons() if 'update_undo_redo_buttons' in dir() else None)
+        
+        def restore_state(state):
+            """Restore a saved state"""
+            saved_area_names = state.get('area_names', [])
+            saved_boxes = state.get('boxes', {})
+            saved_names = state.get('names', {})
+            
+            # Get current areas (excluding Auto Read) - build a fresh list each time
+            def get_current_areas():
+                current_areas = []
+                for area in self.areas:
+                    area_frame = area[0]
+                    name_var = area[3] if len(area) > 3 else None
+                    if name_var:
+                        area_name = name_var.get()
+                        # Skip Auto Read areas - they shouldn't be in edit view undo/redo
+                        if not area_name.startswith("Auto Read"):
+                            current_areas.append((area_frame, name_var, area_name))
+                return current_areas
+            
+            current_areas = get_current_areas()
+            
+            # Build a list of saved area info with their order preserved
+            saved_areas_info = []
+            for area_name in saved_area_names:
+                saved_areas_info.append({
+                    'name': area_name,
+                    'box': saved_boxes.get(area_name, {}),
+                    'display_name': saved_names.get(area_name, area_name)
+                })
+            
+            # Strategy: Match by index/order, which should work if areas are added in order
+            # First, ensure we have the right number of areas
+            # Remove excess areas (from the end, to preserve order)
+            while len(current_areas) > len(saved_areas_info):
+                area_frame, name_var, area_name = current_areas[-1]
+                self.remove_area(area_frame, area_name)
+                if area_frame in area_boxes:
+                    del area_boxes[area_frame]
+                current_areas.pop()
+                # Rebuild current_areas after removal since self.areas changed
+                current_areas = get_current_areas()
+            
+            # Add missing areas
+            while len(current_areas) < len(saved_areas_info):
+                saved_info = saved_areas_info[len(current_areas)]
+                self.add_read_area(removable=True, editable_name=True, area_name=saved_info['name'])
+                # Rebuild current_areas list after adding
+                current_areas = get_current_areas()
+            
+            # Now restore positions and names for each area by index
+            # Rebuild one more time to ensure we have the latest state
+            current_areas = get_current_areas()
+            for idx, (area_frame, name_var, current_name) in enumerate(current_areas):
+                if idx < len(saved_areas_info):
+                    saved_info = saved_areas_info[idx]
+                    saved_name = saved_info['name']
+                    saved_box = saved_info['box']
+                    saved_display_name = saved_info['display_name']
+                    
+                    # Restore the name
+                    name_var.set(saved_display_name)
+                    
+                    # Find the corresponding area in self.areas to get hotkey_button
+                    hotkey_button = None
+                    for area in self.areas:
+                        if area[0] == area_frame:
+                            hotkey_button = area[1] if len(area) > 1 else None
+                            break
+                    
+                    # Ensure area is in area_boxes
+                    if area_frame not in area_boxes:
+                        area_boxes[area_frame] = {
+                            'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0,
+                            'color': '#808080',
+                            'is_grayed': False,
+                            'name_var': name_var,
+                            'hotkey_button': hotkey_button
+                        }
+                    
+                    box_data = area_boxes[area_frame]
+                    
+                    # Restore position
+                    if saved_box:
+                        box_data['x1'] = saved_box.get('x1', 0)
+                        box_data['y1'] = saved_box.get('y1', 0)
+                        box_data['x2'] = saved_box.get('x2', 0)
+                        box_data['y2'] = saved_box.get('y2', 0)
+                        if 'color' in saved_box:
+                            box_data['color'] = saved_box['color']
+                        if 'is_grayed' in saved_box:
+                            box_data['is_grayed'] = saved_box['is_grayed']
+                    
+                    # Update name_var reference
+                    box_data['name_var'] = name_var
+            
+            draw_area_boxes()
+        
+        def undo_action():
+            """Undo last action"""
+            if not undo_stack:
+                return
+            
+            # Save current state to redo stack using the same format as save_state
+            current_state = {
+                'boxes': {},
+                'names': {},
+                'area_names': []
+            }
+            # Use self.areas to get complete picture, not just area_boxes
+            for area in self.areas:
+                area_frame = area[0]
+                name_var = area[3] if len(area) > 3 else None
+                if name_var:
+                    area_name = name_var.get()
+                    # Skip Auto Read areas - they shouldn't be in edit view undo/redo
+                    if area_name.startswith("Auto Read"):
+                        continue
+                    
+                    current_state['area_names'].append(area_name)
+                    current_state['names'][area_name] = area_name
+                    
+                    # Get box data from area_boxes if available, otherwise use defaults
+                    if area_frame in area_boxes:
+                        box_data = area_boxes[area_frame]
+                        current_state['boxes'][area_name] = {
+                            'x1': box_data['x1'],
+                            'y1': box_data['y1'],
+                            'x2': box_data['x2'],
+                            'y2': box_data['y2'],
+                            'color': box_data.get('color', '#808080'),
+                            'is_grayed': box_data.get('is_grayed', False)
+                        }
+                    else:
+                        # Area exists but hasn't been positioned yet - save with default/zero values
+                        current_state['boxes'][area_name] = {
+                            'x1': 0,
+                            'y1': 0,
+                            'x2': 0,
+                            'y2': 0,
+                            'color': '#808080',
+                            'is_grayed': False
+                        }
+            
+            redo_stack.append(current_state)
+            
+            # Restore previous state
+            previous_state = undo_stack.pop()
+            restore_state(previous_state)
+            self._set_unsaved_changes()
+            # Update button states after undo
+            self.root.after(10, update_undo_redo_buttons)
+        
+        def redo_action():
+            """Redo last undone action"""
+            if not redo_stack:
+                return
+            
+            # Save current state to undo stack using the same format as save_state
+            current_state = {
+                'boxes': {},
+                'names': {},
+                'area_names': []
+            }
+            # Use self.areas to get complete picture, not just area_boxes
+            for area in self.areas:
+                area_frame = area[0]
+                name_var = area[3] if len(area) > 3 else None
+                if name_var:
+                    area_name = name_var.get()
+                    # Skip Auto Read areas - they shouldn't be in edit view undo/redo
+                    if area_name.startswith("Auto Read"):
+                        continue
+                    
+                    current_state['area_names'].append(area_name)
+                    current_state['names'][area_name] = area_name
+                    
+                    # Get box data from area_boxes if available, otherwise use defaults
+                    if area_frame in area_boxes:
+                        box_data = area_boxes[area_frame]
+                        current_state['boxes'][area_name] = {
+                            'x1': box_data['x1'],
+                            'y1': box_data['y1'],
+                            'x2': box_data['x2'],
+                            'y2': box_data['y2'],
+                            'color': box_data.get('color', '#808080'),
+                            'is_grayed': box_data.get('is_grayed', False)
+                        }
+                    else:
+                        # Area exists but hasn't been positioned yet - save with default/zero values
+                        current_state['boxes'][area_name] = {
+                            'x1': 0,
+                            'y1': 0,
+                            'x2': 0,
+                            'y2': 0,
+                            'color': '#808080',
+                            'is_grayed': False
+                        }
+            
+            undo_stack.append(current_state)
+            
+            # Restore redo state
+            next_state = redo_stack.pop()
+            restore_state(next_state)
+            self._set_unsaved_changes()
+            # Update button states after redo
+            self.root.after(10, update_undo_redo_buttons)
+        
+        # Save initial state only if not loading a layout or if layout was just loaded
+        # If a layout was just loaded, start with a fresh undo stack (don't save initial state)
+        # This prevents undo from removing all areas right after loading a layout
+        if not getattr(self, '_is_loading_layout', False) and not getattr(self, '_layout_just_loaded', False):
+            save_state()
+        else:
+            # Clear undo stack when loading a layout - don't allow undoing back before the load
+            undo_stack.clear()
+            redo_stack.clear()
+        
+        # Handle mouse events
+        def on_canvas_click(event):
+            nonlocal selected_box, drag_start, resize_handle, name_editing_active, drag_initial_state, delete_mode, hovered_box, finish_name_edit_callback
+            
+            # If editing name and clicking outside the text area, finish editing
+            if name_editing_active:
+                items = canvas.find_closest(event.x, event.y)
+                clicked_on_text = False
+                clicked_on_entry = False
+                if items:
+                    clicked_item = items[0]
+                    tags = canvas.gettags(clicked_item)
+                    # Check if clicking on text area or entry widget
+                    for tag in tags:
+                        if tag.startswith("text_"):
+                            clicked_on_text = True
+                            break
+                    # Also check if clicking directly on the entry widget
+                    try:
+                        # Check if the click is within the entry widget bounds
+                        widget = canvas.itemcget(clicked_item, "window")
+                        if widget:
+                            clicked_on_entry = True
+                    except (tk.TclError, AttributeError, Exception):
+                        # Item may not have window attribute or may not exist
+                        pass
+                
+                # If not clicking on text or entry, finish editing
+                if not clicked_on_text and not clicked_on_entry and finish_name_edit_callback:
+                    finish_name_edit_callback()
+                    return
+            
+            # In delete mode, clicking a box deletes it
+            if delete_mode:
+                items = canvas.find_closest(event.x, event.y)
+                if items:
+                    clicked_item = items[0]
+                    tags = canvas.gettags(clicked_item)
+                    # Check if clicking on a box
+                    for tag in tags:
+                        if tag.startswith("box_"):
+                            # Find which box this is
+                            for area_frame, box_data in area_boxes.items():
+                                if f"box_{id(area_frame)}" in tag:
+                                    delete_area_on_click(area_frame)
+                                    return
+                return
+            
+            # Don't allow box selection/dragging/resizing while editing name or in delete mode
+            if name_editing_active or delete_mode:
+                return
+            
+            # Get the clicked item
+            items = canvas.find_closest(event.x, event.y)
+            if not items:
+                selected_box = None
+                drag_start = None
+                resize_handle = None
+                return
+            
+            clicked_item = items[0]
+            tags = canvas.gettags(clicked_item)
+            
+            # Check if clicking on resize handle
+            for tag in tags:
+                if tag.startswith("handle_"):
+                    parts = tag.split("_")
+                    if len(parts) >= 3:
+                        handle_type = parts[-1]
+                        # Find which box this handle belongs to
+                        for area_frame, box_data in area_boxes.items():
+                            if f"handle_{id(area_frame)}" in tag:
+                                # Save initial position to check if box actually moved
+                                drag_initial_state = {
+                                    'x1': box_data['x1'],
+                                    'y1': box_data['y1'],
+                                    'x2': box_data['x2'],
+                                    'y2': box_data['y2']
+                                }
+                                # Allow resizing even if grayed out (user can activate it)
+                                resize_handle = (area_frame, handle_type)
+                                selected_box = area_frame
+                                drag_start = (event.x, event.y)
+                                return
+            
+            # Check if clicking on text (to edit name)
+            # Only allow editing if not already editing
+            if not name_editing_active:
+                for tag in tags:
+                    if tag.startswith("text_"):
+                        # Find which area this text belongs to
+                        for area_frame, box_data in area_boxes.items():
+                            if f"text_{id(area_frame)}" in tag:
+                                edit_area_name(area_frame)
+                                return
+            
+            # Check if clicking on hotkey (to edit hotkey)
+            for tag in tags:
+                if tag.startswith("hotkey_"):
+                    # Find which area this hotkey belongs to
+                    for area_frame, box_data in area_boxes.items():
+                        if f"hotkey_{id(area_frame)}" in tag:
+                            edit_area_hotkey(area_frame)
+                            return
+            
+            # Check if clicking on a box (for dragging)
+            for tag in tags:
+                if tag.startswith("box_"):
+                    # Find which box this is
+                    for area_frame, box_data in area_boxes.items():
+                        if f"box_{id(area_frame)}" in tag:
+                            # Save initial position to check if box actually moved
+                            drag_initial_state = {
+                                'x1': box_data['x1'],
+                                'y1': box_data['y1'],
+                                'x2': box_data['x2'],
+                                'y2': box_data['y2']
+                            }
+                            # Allow dragging all boxes, even grayed out ones
+                            selected_box = area_frame
+                            drag_start = (event.x, event.y)
+                            resize_handle = None
+                            return
+            
+            # Clicked on empty space or done button
+            selected_box = None
+            drag_start = None
+            resize_handle = None
+        
+        def on_canvas_drag(event):
+            nonlocal selected_box, drag_start, resize_handle, name_editing_active, delete_mode
+            
+            # Don't allow dragging/resizing while editing name or in delete mode
+            if name_editing_active or delete_mode:
+                return
+            
+            if selected_box is None or drag_start is None:
+                return
+            
+            if selected_box not in area_boxes:
+                return
+            
+            box_data = area_boxes[selected_box]
+            # Allow dragging/resizing even if grayed out
+            
+            dx = event.x - drag_start[0]
+            dy = event.y - drag_start[1]
+            
+            if resize_handle:
+                # Resizing
+                handle_type = resize_handle[1]
+                x1, y1, x2, y2 = box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2']
+                
+                if handle_type == "nw":
+                    box_data['x1'] = min(x1 + dx, x2 - 20)
+                    box_data['y1'] = min(y1 + dy, y2 - 20)
+                elif handle_type == "ne":
+                    box_data['x2'] = max(x2 + dx, x1 + 20)
+                    box_data['y1'] = min(y1 + dy, y2 - 20)
+                elif handle_type == "sw":
+                    box_data['x1'] = min(x1 + dx, x2 - 20)
+                    box_data['y2'] = max(y2 + dy, y1 + 20)
+                elif handle_type == "se":
+                    box_data['x2'] = max(x2 + dx, x1 + 20)
+                    box_data['y2'] = max(y2 + dy, y1 + 20)
+                elif handle_type == "n":
+                    box_data['y1'] = min(y1 + dy, y2 - 20)
+                elif handle_type == "s":
+                    box_data['y2'] = max(y2 + dy, y1 + 20)
+                elif handle_type == "w":
+                    box_data['x1'] = min(x1 + dx, x2 - 20)
+                elif handle_type == "e":
+                    box_data['x2'] = max(x2 + dx, x1 + 20)
+            else:
+                # Dragging
+                box_data['x1'] += dx
+                box_data['y1'] += dy
+                box_data['x2'] += dx
+                box_data['y2'] += dy
+            
+            drag_start = (event.x, event.y)
+            draw_area_boxes()
+        
+        def on_canvas_release(event):
+            nonlocal selected_box, drag_start, resize_handle, drag_initial_state
+            
+            if selected_box is not None:
+                box_data = area_boxes[selected_box]
+                
+                # Check if box actually moved/resized
+                if drag_initial_state:
+                    moved = (box_data['x1'] != drag_initial_state['x1'] or
+                            box_data['y1'] != drag_initial_state['y1'] or
+                            box_data['x2'] != drag_initial_state['x2'] or
+                            box_data['y2'] != drag_initial_state['y2'])
+                    
+                    if moved:
+                        # Box moved, save state before the change (restore initial, then save)
+                        temp_x1, temp_y1, temp_x2, temp_y2 = box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2']
+                        box_data['x1'] = drag_initial_state['x1']
+                        box_data['y1'] = drag_initial_state['y1']
+                        box_data['x2'] = drag_initial_state['x2']
+                        box_data['y2'] = drag_initial_state['y2']
+                        save_state()  # Save the state before change
+                        box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2'] = temp_x1, temp_y1, temp_x2, temp_y2
+                
+                # Update area coordinates (convert canvas to screen coordinates)
+                x1_screen = box_data['x1'] + min_x
+                y1_screen = box_data['y1'] + min_y
+                x2_screen = box_data['x2'] + min_x
+                y2_screen = box_data['y2'] + min_y
+                
+                # Ensure valid coordinates
+                if x1_screen < x2_screen and y1_screen < y2_screen:
+                    selected_box.area_coords = (x1_screen, y1_screen, x2_screen, y2_screen)
+                    # Activate the area if it was grayed out
+                    if box_data['is_grayed']:
+                        box_data['is_grayed'] = False
+                        # Assign a color if it was grayed out
+                        box_data['color'] = generate_color()
+                    # Update button text and track area setting change
+                    area_name = "Unknown Area"
+                    for area in self.areas:
+                        if area[0] == selected_box:
+                            if area[2] is not None:
+                                area[2].config(text="Edit Area")
+                            area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                            break
+                    self._set_unsaved_changes('area_settings', area_name)
+                    draw_area_boxes()
+            
+            selected_box = None
+            drag_start = None
+            resize_handle = None
+            drag_initial_state = None
+        
+        def edit_area_name(area_frame):
+            nonlocal name_editing_active, finish_name_edit_callback
+            
+            if area_frame not in area_boxes:
+                return
+            box_data = area_boxes[area_frame]
+            name_var = box_data['name_var']
+            current_name = name_var.get()
+            
+            # Get the position of the name box
+            x1, y1, x2, y2 = box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2']
+            inner_margin = 3 + 2  # outline_width + 2
+            name_x = x1 + inner_margin
+            name_y = y1 + inner_margin + 11
+            
+            # Calculate text width for the entry widget
+            name_font_obj = tkfont.Font(family="Helvetica", size=13, weight="bold")
+            # Use the same logic as display to get correct width
+            if not current_name or current_name.strip() == "" or current_name == "Area Name":
+                name_text = "Click here to set Area Name"
+            else:
+                name_text = f"Area Name: {current_name}"
+            text_bg_width = name_font_obj.measure(name_text) + 6
+            
+            # Disable hotkeys during editing
+            self.disable_all_hotkeys()
+            
+            # Set flag to prevent box movement during editing
+            name_editing_active = True
+            
+            # Create an Entry widget overlay on the canvas
+            entry = tk.Entry(canvas, font=("Helvetica", 13, "bold"), width=20)
+            # If name is default/empty, start with empty entry
+            if current_name and current_name != "Area Name":
+                entry.insert(0, current_name)
+            
+            # Limit entry to 15 characters - prevent typing beyond limit
+            def on_key_press(event):
+                # Allow special keys (backspace, delete, arrow keys, etc.)
+                if event.keysym in ('BackSpace', 'Delete', 'Left', 'Right', 'Home', 'End', 'Tab', 'Up', 'Down'):
+                    return None
+                # Allow Ctrl/Cmd combinations (for copy, paste, select all, etc.)
+                if event.state & 0x4 or event.state & 0x1:  # Ctrl or Cmd
+                    return None
+                
+                # Check current length and selection
+                current_text = entry.get()
+                try:
+                    # If text is selected, we can replace it, so check if replacement would exceed limit
+                    if entry.selection_present():
+                        start_idx = int(entry.index(tk.SEL_FIRST))
+                        end_idx = int(entry.index(tk.SEL_LAST))
+                        selected_length = end_idx - start_idx
+                        # Calculate what length would be after replacing selected text with new character
+                        new_length = len(current_text) - selected_length + 1
+                        # If replacing selected text would exceed limit, prevent the key
+                        if new_length > 15:
+                            return "break"
+                    else:
+                        # No selection - if at limit, prevent the key
+                        if len(current_text) >= 15:
+                            return "break"  # Prevent the character from being inserted
+                except (tk.TclError, ValueError, Exception) as e:
+                    # If entry operations fail, check limit as fallback
+                    try:
+                        current_text = entry.get()
+                    except Exception:
+                        current_text = ""
+                    if len(current_text) >= 15:
+                        return "break"
+                return None
+            
+            def on_paste(event):
+                # Handle paste by checking length after paste
+                def check_paste():
+                    current_text = entry.get()
+                    if len(current_text) > 15:
+                        # Truncate to 15 characters
+                        entry.delete(15, tk.END)
+                # Check after a short delay to allow paste to complete
+                entry.after(10, check_paste)
+                return None
+            
+            # Bind to key press to prevent typing beyond limit
+            entry.bind('<KeyPress>', on_key_press)
+            entry.bind('<<Paste>>', on_paste)
+            
+            # Position the entry widget at the name location
+            # Convert canvas coordinates to window coordinates
+            canvas_x = canvas.canvasx(name_x + 3)
+            canvas_y = canvas.canvasy(name_y - 11)
+            entry_window = canvas.create_window(canvas_x, canvas_y, anchor="nw", window=entry, 
+                                                width=text_bg_width - 6, height=22)
+            
+            # Set focus and select text after window is created
+            entry.focus_set()
+            entry.icursor(tk.END)
+            entry.select_range(0, tk.END)
+            # Force update to ensure focus works
+            canvas.update_idletasks()
+            
+            def finish_edit(event=None):
+                nonlocal name_editing_active, finish_name_edit_callback
+                new_name = entry.get().strip()
+                if new_name:
+                    if len(new_name) > 15:
+                        new_name = new_name[:15]
+                    
+                    # Only save state if name actually changed
+                    if new_name != current_name:
+                        save_state()
+                    
+                    name_var.set(new_name)
+                    area_name = name_var.get()
+                    self._set_unsaved_changes('area_settings', area_name)
+                canvas.delete(entry_window)
+                entry.destroy()
+                # Clear the callback
+                finish_name_edit_callback = None
+                # Re-enable box movement
+                name_editing_active = False
+                try:
+                    self.restore_all_hotkeys()
+                except Exception as e:
+                    print(f"Error restoring hotkeys: {e}")
+                draw_area_boxes()
+            
+            def cancel_edit(event=None):
+                nonlocal name_editing_active, finish_name_edit_callback
+                canvas.delete(entry_window)
+                entry.destroy()
+                # Clear the callback
+                finish_name_edit_callback = None
+                # Re-enable box movement
+                name_editing_active = False
+                try:
+                    self.restore_all_hotkeys()
+                except Exception as e:
+                    print(f"Error restoring hotkeys: {e}")
+                draw_area_boxes()
+            
+            # Store the finish callback so it can be called from canvas click
+            finish_name_edit_callback = finish_edit
+            
+            # Ensure hotkeys stay disabled when entry has focus
+            def on_entry_focus_in(event):
+                # Disable hotkeys when entry gets focus (in case they were re-enabled somehow)
+                self.disable_all_hotkeys()
+            
+            def on_entry_focus_out(event):
+                # Finish editing when focus is lost
+                finish_edit()
+            
+            entry.bind('<Return>', finish_edit)
+            entry.bind('<Escape>', cancel_edit)
+            entry.bind('<FocusIn>', on_entry_focus_in)
+            entry.bind('<FocusOut>', on_entry_focus_out)  # Finish when clicking away
+        
+        def edit_area_hotkey(area_frame):
+            if area_frame not in area_boxes:
+                return
+            box_data = area_boxes[area_frame]
+            hotkey_button = box_data['hotkey_button']
+            
+            # Store original setting_hotkey state
+            was_setting = getattr(self, 'setting_hotkey', False)
+            
+            # Start hotkey assignment
+            self.set_hotkey(hotkey_button, area_frame)
+            
+            # Periodically redraw to show live hotkey preview updates
+            def update_hotkey_display():
+                # Check if canvas still exists (editor might have been closed)
+                try:
+                    if not canvas.winfo_exists():
+                        return
+                except (tk.TclError, AttributeError):
+                    # Canvas has been destroyed
+                    return
+                
+                if getattr(self, 'setting_hotkey', False):
+                    draw_area_boxes()
+                    # Only schedule next update if canvas still exists
+                    try:
+                        if canvas.winfo_exists():
+                            self.root.after(100, update_hotkey_display)  # Update every 100ms
+                    except (tk.TclError, AttributeError):
+                        pass
+                else:
+                    # Final redraw when done
+                    draw_area_boxes()
+            
+            # Start updating
+            self.root.after(100, update_hotkey_display)
+        
+        # Track counter for new areas to give them unique offsets
+        new_area_counter = 0
+        import math  # For calculating offsets in circular pattern
+        
+        def add_new_area():
+            nonlocal new_area_counter
+            # Save state before adding
+            save_state()
+            
+            # Add a new area
+            self.add_read_area(removable=True, editable_name=True, area_name="Area Name")
+            
+            # Find the newly added area and give it a unique offset position
+            # Get the last area that was just added
+            if self.areas:
+                new_area_frame = self.areas[-1][0]  # Get the frame of the most recently added area
+                name_var = self.areas[-1][3]
+                area_name = name_var.get()
+                
+                # Skip if it's Auto Read
+                if not area_name.startswith("Auto Read"):
+                    # Calculate a unique offset based on counter
+                    # Use a circular pattern: offset in a circle around center
+                    offset_distance = 250  # Distance from center
+                    angle = (new_area_counter * 45) % 360  # 45 degree increments, cycles every 8 areas
+                    offset_x = int(offset_distance * math.cos(math.radians(angle)))
+                    offset_y = int(offset_distance * math.sin(math.radians(angle)))
+                    
+                    # Set initial position in center of main monitor with offset
+                    center_x = main_monitor_center_x
+                    center_y = main_monitor_center_y
+                    default_size = 200
+                    x1_canvas = center_x - default_size // 2 + offset_x
+                    y1_canvas = center_y - default_size // 2 + offset_y
+                    x2_canvas = center_x + default_size // 2 + offset_x
+                    y2_canvas = center_y + default_size // 2 + offset_y
+                    
+                    # Initialize in area_boxes if not already there
+                    if new_area_frame not in area_boxes:
+                        area_boxes[new_area_frame] = {
+                            'x1': x1_canvas,
+                            'y1': y1_canvas,
+                            'x2': x2_canvas,
+                            'y2': y2_canvas,
+                            'color': generate_color(),
+                            'is_grayed': False,
+                            'name_var': name_var,
+                            'hotkey_button': self.areas[-1][1]
+                        }
+                    
+                    new_area_counter += 1
+            
+            # Refresh the view - don't clear, just redraw to pick up new areas
+            draw_area_boxes()
+        
+        def toggle_delete_mode():
+            nonlocal delete_mode, hovered_box
+            try:
+                delete_mode = not delete_mode
+                hovered_box = None  # Clear hover when toggling
+                # Access delete_button from outer scope (it's created later but will exist when called)
+                if delete_mode:
+                    delete_button.config(text="❌ Stop Delete")
+                else:
+                    delete_button.config(text="❌ Delete Area")
+                draw_area_boxes()
+            except Exception as e:
+                print(f"Error in toggle_delete_mode: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        def delete_area_on_click(area_frame):
+            """Delete an area when clicked in delete mode"""
+            if area_frame not in area_boxes:
+                return
+            
+            # Save state before removing
+            save_state()
+            
+            box_data = area_boxes[area_frame]
+            name_var = box_data['name_var']
+            area_name = name_var.get()
+            
+            # Find the area in self.areas to get the full tuple
+            for area in self.areas:
+                if area[0] == area_frame:
+                    # Remove the area
+                    self.remove_area(area_frame, area_name)
+                    # Remove from area_boxes
+                    if area_frame in area_boxes:
+                        del area_boxes[area_frame]
+                    # Clear hover since the box is gone
+                    nonlocal hovered_box
+                    hovered_box = None
+                    # Stay in delete mode - don't exit
+                    # Refresh the view
+                    draw_area_boxes()
+                    break
+        
+        def on_close():
+            """Close editor without saving any changes"""
+            # Restore original area coordinates to discard any changes
+            for area_frame, original_coords in original_area_coords.items():
+                if hasattr(area_frame, 'area_coords'):
+                    area_frame.area_coords = original_coords
+            
+            # Remove any areas that were added during this editing session
+            areas_to_remove = []
+            for area in self.areas:
+                area_frame = area[0]
+                if area_frame not in original_areas_set:
+                    # This area was added during editing, remove it
+                    name_var = area[3] if len(area) > 3 else None
+                    if name_var:
+                        area_name = name_var.get()
+                        areas_to_remove.append((area_frame, area_name))
+            
+            # Remove the new areas
+            for area_frame, area_name in areas_to_remove:
+                try:
+                    self.remove_area(area_frame, area_name)
+                except Exception as e:
+                    print(f"Error removing area {area_name} on close: {e}")
+            
+            # Clear the callback reference
+            if hasattr(self, '_edit_area_done_callback'):
+                self._edit_area_done_callback = None
+            
+            # Clean up
+            try:
+                select_area_window.grab_release()
+            except Exception:
+                pass
+            try:
+                self.root.unbind_all("<Escape>")
+            except Exception:
+                pass
+            try:
+                select_area_window.destroy()
+            except Exception:
+                pass
+            try:
+                background_window.destroy()
+            except Exception:
+                pass
+            self._restore_hotkeys_after_selection()
+        
+        def on_done():
+            # Save all coordinates
+            for area_frame, box_data in area_boxes.items():
+                x1_screen = box_data['x1'] + min_x
+                y1_screen = box_data['y1'] + min_y
+                x2_screen = box_data['x2'] + min_x
+                y2_screen = box_data['y2'] + min_y
+                if x1_screen < x2_screen and y1_screen < y2_screen:
+                    area_frame.area_coords = (x1_screen, y1_screen, x2_screen, y2_screen)
+                    # Update button text if this was the area being edited
+                    for area in self.areas:
+                        if area[0] == area_frame and area[2] is not None:
+                            area[2].config(text="Edit Area")
+            
+            # Save alpha value to settings
+            try:
+                import tempfile, json
+                game_reader_dir = APP_DOCUMENTS_DIR
+                os.makedirs(game_reader_dir, exist_ok=True)
+                temp_path = APP_SETTINGS_PATH
+                
+                # Load existing settings or create new ones
+                settings = {}
+                if os.path.exists(temp_path):
+                    try:
+                        with open(temp_path, 'r', encoding='utf-8') as f:
+                            settings = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError, IOError, OSError) as e:
+                        print(f"Error loading settings: {e}")
+                        settings = {}
+                
+                # Save the alpha value
+                settings['edit_area_alpha'] = boxes_alpha
+                # Update instance variable to keep in sync
+                self.edit_area_alpha = boxes_alpha
+                
+                # Save the updated settings
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, indent=4)
+            except Exception as e:
+                print(f"Error saving alpha value: {e}")
+            
+            # Save layout - prompt if no layout is loaded
+            current_layout_file = self.layout_file.get()
+            if current_layout_file and os.path.exists(current_layout_file):
+                # Layout file exists, auto-save it
+                try:
+                    self.save_layout_auto()
+                except Exception as e:
+                    print(f"Error auto-saving layout: {e}")
+            else:
+                # No layout file loaded, prompt user to save one
+                try:
+                    # Store the layout file value before calling save_layout
+                    layout_file_before = self.layout_file.get()
+                    self.save_layout()
+                    # Check if a layout file was saved (user didn't cancel)
+                    layout_file_after = self.layout_file.get()
+                    if not layout_file_after or layout_file_after == layout_file_before:
+                        # User cancelled or save failed, don't close the editor
+                        return
+                except Exception as e:
+                    print(f"Error saving layout: {e}")
+                    # If save failed, don't close the editor
+                    return
+            
+            # Clear the callback reference
+            if hasattr(self, '_edit_area_done_callback'):
+                self._edit_area_done_callback = None
+            
+            # Clean up
+            try:
+                select_area_window.grab_release()
+            except Exception:
+                pass
+            try:
+                self.root.unbind_all("<Escape>")
+            except Exception:
+                pass
+            try:
+                select_area_window.destroy()
+            except Exception:
+                pass
+            try:
+                background_window.destroy()
+            except Exception:
+                pass
+            self._restore_hotkeys_after_selection()
+            # Area selection in edit view - track as area settings change for all affected areas
+            # Since this could affect multiple areas, we'll just mark as general change
+            # The actual area coordinates are saved, so this is an area setting change
+            # We can't easily determine which specific area, so use a generic approach
+            self._set_unsaved_changes()  # Generic change tracking for edit view area selection
+        
+        # Store reference to on_close callback so hotkey can call it (toggle closes without saving)
+        self._edit_area_done_callback = on_close
+        
+        def on_escape(event):
+            on_done()
+        
+        # Create control buttons toolbar at the top
+        # Buttons will be in a toolbar at the top of the screen
+        button_frame = tk.Frame(canvas, bg="#333333")  # Dark gray background to match banner
+        # Don't pack - we'll add it as a canvas window instead
+        
+        # Function to draw button background and borders
+        def draw_button_background():
+            """Draw border around buttons"""
+            canvas.delete("button_bg")
+            # Get button frame position and size
+            # Button frame is centered on main monitor at main_monitor_center_x, y=50
+            button_frame.update_idletasks()
+            frame_width = button_frame.winfo_reqwidth()
+            frame_height = button_frame.winfo_reqheight()
+            
+            # Padding determines how far the background extends from buttons
+            padding = 8  # Distance from buttons to background edge
+            border_width = 6  # Thickness of the border
+            bg_color = "#333333"  # Dark gray background color
+            border_color = "#2a2a2a"  # Slightly darker gray for visible border (same dark gray family)
+            button_border_color = "#333333"  # Dark gray for individual button borders
+            button_border_width = 3  # Thickness of button borders
+            
+            # Rectangle coordinates for background
+            # Use the same Y position as the toolbar (50px from top of primary monitor)
+            button_y_pos = main_monitor_top_y + 50
+            x1 = main_monitor_center_x - (frame_width // 2) - padding
+            y1 = button_y_pos - (frame_height // 2) - padding
+            x2 = main_monitor_center_x + (frame_width // 2) + padding
+            y2 = button_y_pos + (frame_height // 2) + padding
+            
+            # Draw dark gray background with visible dark gray border
+            canvas.create_rectangle(x1, y1, x2, y2,
+                                   fill=bg_color,  # Dark gray fill
+                                   outline=border_color,  # Slightly darker gray border (visible)
+                                   width=border_width,  # Border thickness
+                                   tags=("button_bg", "button_bg_fill"))
+            
+            # Borders are now drawn using Frame highlightthickness, no need to draw on canvas
+            # Ensure buttons are on top of background
+            canvas.tag_raise("control_buttons", "button_bg")
+        
+        # Dark gray border color for buttons
+        button_border_color = "#333333"
+        button_border_width = 3
+        
+        # Create buttons in order: Transparency, Undo, Redo, Add Area, Delete Area, Editor Toggle Hotkey, Close, Save and Close
+        # Wrap each button in a Frame with border
+        
+        # Alpha slider for box opacity (Transparency)
+        alpha_frame = tk.Frame(button_frame,
+                              highlightthickness=button_border_width,
+                              highlightbackground=button_border_color,
+                              bg=button_border_color)
+        alpha_frame.pack(side="left", padx=3)
+        
+        alpha_inner_frame = tk.Frame(alpha_frame)
+        alpha_inner_frame.pack()
+        
+        alpha_label = tk.Label(alpha_inner_frame, text="Transparency:", font=("Helvetica", 8))
+        alpha_label.pack(side="left", padx=2)
+        
+        def on_alpha_change(value):
+            nonlocal boxes_alpha
+            boxes_alpha = float(value) / 100.0
+            update_box_opacity()
+        
+        alpha_slider = tk.Scale(alpha_inner_frame, from_=10, to=100, orient="horizontal",
+                               length=80, command=on_alpha_change,
+                               font=("Helvetica", 7))
+        alpha_slider.set(int(boxes_alpha * 100))
+        alpha_slider.pack(side="left")
+        
+        # Apply the loaded alpha value initially
+        update_box_opacity()
+        
+        # Undo button
+        undo_frame = tk.Frame(button_frame,
+                              highlightthickness=button_border_width,
+                              highlightbackground=button_border_color,
+                              bg=button_border_color)
+        undo_frame.pack(side="left", padx=3)
+        # Use larger font for icon but keep same height as other buttons by reducing padding
+        undo_button = tk.Button(undo_frame, text="〈 Undo", command=undo_action,
+                               font=("Helvetica", 12, "bold"),
+                               bg="#FF9800", fg="white",
+                               relief="flat", bd=0,
+                               padx=6, pady=3)  # Reduced pady to match other buttons' height
+        undo_button.pack()
+        
+        # Redo button
+        redo_frame = tk.Frame(button_frame,
+                              highlightthickness=button_border_width,
+                              highlightbackground=button_border_color,
+                              bg=button_border_color)
+        redo_frame.pack(side="left", padx=3)
+        # Use larger font for icon but keep same height as other buttons by reducing padding
+        redo_button = tk.Button(redo_frame, text=" 〉Redo", command=redo_action,
+                               font=("Helvetica", 12, "bold"),
+                               bg="#FF9800", fg="white",
+                               relief="flat", bd=0,
+                               padx=6, pady=3)  # Reduced pady to match other buttons' height
+        redo_button.pack()
+        
+        # Function to update undo/redo button states
+        def update_undo_redo_buttons():
+            """Update undo/redo button states based on stack availability"""
+            # Update undo button
+            if undo_stack:
+                undo_button.config(bg="#FF9800", fg="white")
+            else:
+                undo_button.config(bg="#808080", fg="#CCCCCC")
+            
+            # Update redo button
+            if redo_stack:
+                redo_button.config(bg="#FF9800", fg="white")
+            else:
+                redo_button.config(bg="#808080", fg="#CCCCCC")
+        
+        # Initialize button states
+        update_undo_redo_buttons()
+        
+        # Add Area button
+        add_frame = tk.Frame(button_frame,
+                            highlightthickness=button_border_width,
+                            highlightbackground=button_border_color,
+                            bg=button_border_color)
+        add_frame.pack(side="left", padx=3)
+        add_button = tk.Button(add_frame, text="➕ Add Area", command=add_new_area,
+                              font=("Helvetica", 10, "bold"),
+                              bg="#2196F3", fg="white",
+                              relief="flat", bd=0,
+                              padx=6, pady=6)
+        add_button.pack()
+        
+        # Delete Area button
+        delete_frame = tk.Frame(button_frame,
+                               highlightthickness=button_border_width,
+                               highlightbackground=button_border_color,
+                               bg=button_border_color)
+        delete_frame.pack(side="left", padx=3)
+        delete_button = tk.Button(delete_frame, text="❌ Delete Area", command=toggle_delete_mode,
+                                 font=("Helvetica", 10, "bold"),
+                                 bg="#f44336", fg="white",
+                                 relief="flat", bd=0,
+                                 padx=6, pady=6)
+        delete_button.pack()
+        
+        # Edit Area Hotkey button
+        edit_area_hotkey_frame = tk.Frame(button_frame,
+                                         highlightthickness=button_border_width,
+                                         highlightbackground=button_border_color,
+                                         bg=button_border_color)
+        edit_area_hotkey_frame.pack(side="left", padx=3)
+        edit_area_hotkey_button = tk.Button(edit_area_hotkey_frame, 
+                                           text="Click here to assign a\nhotkey to toggle this editor",
+                                           command=lambda: self.set_edit_area_hotkey(edit_area_hotkey_button),
+                                           font=("Helvetica", 10, "bold"),
+                                           bg="#2196F3", fg="white",
+                                           relief="flat", bd=0,
+                                           padx=5, pady=4,
+                                           justify='center')
+        edit_area_hotkey_button.pack()
+        
+        # Store reference to button for restore_all_hotkeys
+        self.edit_area_hotkey_button = edit_area_hotkey_button
+        
+        # Use pre-loaded edit area hotkey (loaded at startup)
+        if self.edit_area_hotkey:
+            try:
+                edit_area_hotkey_button.hotkey = self.edit_area_hotkey
+                display_name = self.edit_area_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if self.edit_area_hotkey.startswith('num_') else self.edit_area_hotkey.replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                edit_area_hotkey_button.config(text=f"Editor Toggle Hotkey:\n{display_name.upper()}")
+                # Use existing mock button if it was created at startup, otherwise create a new one
+                if self.edit_area_hotkey_mock_button:
+                    edit_area_hotkey_button.mock_button = self.edit_area_hotkey_mock_button
+                    # Ensure the hotkey is still registered (in case it was unhooked)
+                    try:
+                        self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                    except Exception as e:
+                        print(f"Error re-registering edit area hotkey during GUI setup: {e}")
+                else:
+                    mock_button = type('MockButton', (), {'hotkey': self.edit_area_hotkey, 'is_edit_area_button': True})
+                    edit_area_hotkey_button.mock_button = mock_button
+                    self.edit_area_hotkey_mock_button = mock_button  # Store reference
+                    self.setup_hotkey(edit_area_hotkey_button.mock_button, None)
+            except Exception as e:
+                print(f"Error setting up edit area hotkey: {e}")
+        
+        # Use pre-loaded screenshot background setting (loaded at startup)
+        self.screenshot_bg_var.set(self.edit_area_screenshot_bg)
+        
+        # Close button - Close without saving
+        close_frame = tk.Frame(button_frame, 
+                              highlightthickness=button_border_width,
+                              highlightbackground=button_border_color,
+                              bg=button_border_color)
+        close_frame.pack(side="left", padx=3)
+        close_button = tk.Button(close_frame, text="Close", command=on_close,
+                                font=("Helvetica", 10, "bold"),
+                                bg="#f44336", fg="white",
+                                relief="flat", bd=0,
+                                padx=6, pady=6)
+        close_button.pack()
+        
+        # Save button - Save and Close
+        save_frame = tk.Frame(button_frame, 
+                             highlightthickness=button_border_width,
+                             highlightbackground=button_border_color,
+                             bg=button_border_color)
+        save_frame.pack(side="left", padx=3)
+        save_button = tk.Button(save_frame, text="Save and Close", command=on_done,
+                               font=("Helvetica", 10, "bold"),
+                               bg="#4CAF50", fg="white",
+                               relief="flat", bd=0,
+                               padx=6, pady=6)
+        save_button.pack()
+        
+        # Update the frame to ensure proper sizing
+        button_frame.update_idletasks()
+        
+        # Create window for buttons toolbar at the top center of main monitor (positioned 50px from top of primary monitor)
+        # Use main_monitor_top_y + 50 to ensure it's 50px from the top of the primary monitor, not the virtual screen
+        toolbar_y = main_monitor_top_y + 50
+        canvas.create_window(main_monitor_center_x, toolbar_y, window=button_frame, tags="control_buttons")
+        
+        # Handle mouse motion for hover detection in delete mode
+        def on_canvas_motion(event):
+            nonlocal hovered_box, delete_mode
+            if not delete_mode:
+                hovered_box = None
+                return
+            
+            # Find which box (if any) the mouse is over
+            items = canvas.find_closest(event.x, event.y)
+            if not items:
+                hovered_box = None
+                draw_area_boxes()
+                return
+            
+            clicked_item = items[0]
+            tags = canvas.gettags(clicked_item)
+            
+            # Check if hovering over a box
+            new_hovered = None
+            for tag in tags:
+                if tag.startswith("box_"):
+                    # Find which box this is
+                    for area_frame, box_data in area_boxes.items():
+                        if f"box_{id(area_frame)}" in tag:
+                            new_hovered = area_frame
+                            break
+                    if new_hovered:
+                        break
+            
+            # Only redraw if hover changed
+            if new_hovered != hovered_box:
+                hovered_box = new_hovered
+                draw_area_boxes()
+        
+        # Bind canvas events
+        canvas.bind("<Button-1>", on_canvas_click)
+        canvas.bind("<B1-Motion>", on_canvas_drag)
+        canvas.bind("<ButtonRelease-1>", on_canvas_release)
+        canvas.bind("<Motion>", on_canvas_motion)
+        canvas.bind("<Escape>", on_escape)
+        select_area_window.bind("<Escape>", on_escape)
+        
+        # Show window
+        def show_window():
+            # Show background window if screenshot is enabled
+            if screenshot_image:
+                print("Showing background window with screenshot")
+                background_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+                background_window.update_idletasks()
+                background_window.deiconify()
+                background_window.attributes("-alpha", 1.0)  # Fully opaque for screenshot
+                # Keep background window topmost so it appears above desktop windows
+                background_window.attributes("-topmost", True)
+                background_window.update()
+                print("Background window shown")
+            
+            # Show overlay window on top (boxes/buttons only)
+            select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
+            select_area_window.update_idletasks()
+            select_area_window.deiconify()
+            
+            # Set window alpha controlled by slider
+            select_area_window.attributes("-alpha", boxes_alpha)
+            
+            # Ensure overlay window is on top of everything (including background window)
+            select_area_window.attributes("-topmost", True)
+            # Lift overlay window to bring it to front (above background window)
+            select_area_window.lift()
+            select_area_window.update()
+            
+            # Ensure background window stays topmost but below overlay
+            if screenshot_image:
+                # Use Windows API to explicitly set z-order: overlay on top, background below it
+                try:
+                    overlay_hwnd = select_area_window.winfo_id()
+                    background_hwnd = background_window.winfo_id()
+                    # HWND_TOP = 0, but we want overlay to stay on top
+                    # Use SetWindowPos to ensure overlay is above background
+                    win32gui.SetWindowPos(overlay_hwnd, win32con.HWND_TOP, 0, 0, 0, 0, 
+                                         win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+                    win32gui.SetWindowPos(background_hwnd, overlay_hwnd, 0, 0, 0, 0, 
+                                         win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+                except Exception as e:
+                    print(f"Error setting window z-order: {e}")
+                # Both windows are topmost, overlay should be on top
+                # This creates the "frozen screen" effect with screenshot behind edit view
+                background_window.update()
+            
+            # Update button frame to get accurate size before drawing background
+            button_frame.update_idletasks()
+            # Draw button background first so area boxes can be positioned below it
+            draw_button_background()
+            # Draw boxes and buttons on overlay window
+            draw_area_boxes()
+            # Ensure buttons toolbar stays on top with proper z-order
+            canvas.tag_raise("control_buttons", "area_box")
+            canvas.tag_raise("control_buttons", "button_bg_fill")
+            
+            select_area_window.focus_force()
+            try:
+                select_area_window.grab_set()
+            except Exception:
+                pass
+            select_area_window.window_ready = True
+        
+        self.root.after(0, show_window)
+        
+        # Bind Escape globally
+        try:
+            self.root.bind_all("<Escape>", on_escape)
+        except Exception:
+            pass
+
+    def _restore_hotkeys_after_selection(self, restore_focus=True):
+        """Helper method to restore hotkeys after area selection
+        
+        Args:
+            restore_focus: If True, restore focus to the GameReader window. 
+                         If False, skip focus restoration (used when restoring focus to game window instead).
+        """
+        if not hasattr(self, 'hotkeys_disabled_for_selection') or not self.hotkeys_disabled_for_selection:
+            return
+            
+        try:
+            # Use InputManager to allow hotkeys (this is the primary mechanism)
+            InputManager.allow()
+            
+            # Also call restore_all_hotkeys to re-register hooks if needed
+            self.restore_all_hotkeys()
+            self.hotkeys_disabled_for_selection = False
+            print("Hotkeys re-enabled after area selection")
+            
+            # Reset the area selection flag
+            if hasattr(self, 'area_selection_in_progress'):
+                self.area_selection_in_progress = False
+            
+            # Force focus back to the main window only if requested
+            # (For auto-read with freeze, we restore focus to the game window instead)
+            if restore_focus and hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.focus_force()
+                
+        except Exception as e:
+            print(f"Error restoring hotkeys after area selection: {e}")
+            # Ensure the flags are cleared even if there's an error
+            self.hotkeys_disabled_for_selection = False
+            if hasattr(self, 'area_selection_in_progress'):
+                self.area_selection_in_progress = False
+
+    def _create_area_name_dialog(self):
+        """Create a custom dialog for naming areas that stays on top and auto-focuses"""
+        # Create the dialog window
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Area Name")
+        dialog.geometry("250x120")
+        dialog.resizable(False, False)
+        
+        # Make dialog stay on top of main window
+        dialog.transient(self.root)
+        dialog.grab_set()  # Make it modal
+        
+        # Center the dialog on the main window
+        dialog.geometry("+%d+%d" % (
+            self.root.winfo_rootx() + self.root.winfo_width()//2 - 150,
+            self.root.winfo_rooty() + self.root.winfo_height()//2 - 60))
+        
+        # Set the window icon
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                dialog.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting dialog icon: {e}")
+        
+        # Create and pack the label
+        label = tk.Label(dialog, text="Enter a name for this area:", pady=10)
+        label.pack()
+        
+        # Create and pack the entry field with maxlength validation
+        entry = tk.Entry(dialog, width=30)
+        entry.pack(pady=10)
+        
+        # Validation function to limit input to 15 characters
+        def validate_length(P):
+            return len(P) <= 15
+        
+        vcmd = (dialog.register(validate_length), '%P')
+        entry.config(validate='key', validatecommand=vcmd)
+        
+        # Also handle paste and other input methods that might bypass validation
+        def on_text_change(event=None):
+            current_text = entry.get()
+            if len(current_text) > 15:
+                entry.delete(15, tk.END)
+        
+        # Handle paste events specifically
+        def on_paste(event):
+            # Allow the paste to happen first, then trim
+            dialog.after_idle(on_text_change)
+            return None
+        
+        # Bind to various events that might add text
+        entry.bind('<KeyRelease>', on_text_change)
+        entry.bind('<Button-1>', lambda e: dialog.after_idle(on_text_change))
+        entry.bind('<FocusOut>', on_text_change)
+        entry.bind('<<Paste>>', on_paste)
+        
+        # Create button frame
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(pady=10)
+        
+        # Variable to store the result
+        result = [None]
+        
+        def on_ok():
+            name = entry.get().strip()
+            # Ensure it's limited to 15 characters (in case validation was bypassed)
+            if len(name) > 15:
+                name = name[:15]
+            result[0] = name
+            dialog.destroy()
+        
+        def on_enter(event):
+            on_ok()
+        
+        # Bind Enter key
+        entry.bind('<Return>', on_enter)
+        
+        # Create OK button only
+        ok_button = tk.Button(button_frame, text="OK", command=on_ok, width=8)
+        ok_button.pack()
+        
+        # Pre-fill with "Area Name" and focus the entry field
+        entry.insert(0, "Area Name")
+        # Update the dialog to ensure it\'s fully rendered before setting focus
+        dialog.update_idletasks()
+        dialog.update()
+        
+        # Force focus on the entry field and select all text
+        entry.focus_force()
+        entry.select_range(0, tk.END)
+        entry.icursor(tk.END)  # Position cursor at end
+        
+        # Wait for the dialog to close
+        dialog.wait_window()
+        
+        return result[0]
+
+    def _edit_area_name_dialog(self, initial_value=""):
+        """Create a custom dialog for editing area names with adjustable size"""
+        # Create the dialog window
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Area Name")
+        dialog.geometry("80x100")  # Set window size here (width x height) - CHANGE THIS TO ADJUST SIZE
+        dialog.resizable(True, True)  # Allow resizing if desired
+        dialog.minsize(150, 120)  # Set minimum size
+        
+        # Make dialog stay on top of main window
+        dialog.transient(self.root)
+        dialog.grab_set()  # Make it modal
+        
+        # Center the dialog on the main window
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Set the window icon
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
+            if os.path.exists(icon_path):
+                dialog.iconbitmap(icon_path)
+        except Exception as e:
+            print(f"Error setting dialog icon: {e}")
+        
+        # Create and pack the label
+        label = tk.Label(dialog, text="Enter new area name:", pady=10)
+        label.pack()
+        
+        # Create and pack the entry field
+        entry = tk.Entry(dialog, width=30)  # Change width value here to adjust text box size (width is in characters)
+        entry.pack(pady=10, padx=20)  # padx adds horizontal padding around the entry field
+        entry.insert(0, initial_value)
+        entry.select_range(0, tk.END)
+        
+        # Validation function to limit input to 15 characters
+        def validate_length(P):
+            return len(P) <= 15
+        
+        vcmd = (dialog.register(validate_length), '%P')
+        entry.config(validate='key', validatecommand=vcmd)
+        
+        # Also handle paste and other input methods that might bypass validation
+        def on_text_change(event=None):
+            current_text = entry.get()
+            if len(current_text) > 15:
+                entry.delete(15, tk.END)
+        
+        # Handle paste events specifically
+        def on_paste(event):
+            # Allow the paste to happen first, then trim
+            dialog.after_idle(on_text_change)
+            return None
+        
+        # Bind to various events that might add text
+        entry.bind('<KeyRelease>', on_text_change)
+        entry.bind('<Button-1>', lambda e: dialog.after_idle(on_text_change))
+        entry.bind('<FocusOut>', on_text_change)
+        entry.bind('<<Paste>>', on_paste)
+        
+        # Create button frame
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(pady=10)
+        
+        # Variable to store the result
+        result = [None]
+        
+        def on_ok():
+            name = entry.get().strip()
+            # Ensure it's limited to 15 characters (in case validation was bypassed)
+            if len(name) > 15:
+                name = name[:15]
+            result[0] = name
+            dialog.destroy()
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        def on_enter(event):
+            on_ok()
+        
+        # Bind Enter key
+        entry.bind('<Return>', on_enter)
+        # Bind Escape key to Cancel
+        dialog.bind('<Escape>', lambda e: on_cancel())
+        
+        # Create OK and Cancel buttons
+        ok_button = tk.Button(button_frame, text="OK", command=on_ok, width=8)
+        ok_button.pack(side='left', padx=5)
+        cancel_button = tk.Button(button_frame, text="Cancel", command=on_cancel, width=8)
+        cancel_button.pack(side='left', padx=5)
+        
+        # Focus the entry field
+        dialog.update_idletasks()
+        dialog.update()
+        entry.focus_force()
+        
+        # Wait for the dialog to close
+        dialog.wait_window()
+        
+        return result[0]
+
+    def disable_all_hotkeys(self, block_input_manager=True):
+        """Disable all hotkeys for keyboard, mouse, and controller using InputManager.
+        
+        Args:
+            block_input_manager: If True, block InputManager (for area selection, etc.).
+                               If False, only cleanup hooks but allow InputManager (for hotkey assignment).
+        """
+        # Use InputManager to block all hotkey handlers (unless we're in hotkey assignment mode)
+        # During hotkey assignment, we rely on self.setting_hotkey flag instead
+        if block_input_manager:
+            InputManager.block()
+        
+        # Note: We keep the unhook logic for cleanup purposes (e.g., when closing the app),
+        # but the primary blocking mechanism is now InputManager
+        try:
+            # Unhook all keyboard and mouse hooks (for cleanup)
+            keyboard.unhook_all()
+            mouse.unhook_all()
+            
+            # Stop controller monitoring to disable controller hotkeys
+            if hasattr(self, 'controller_handler') and self.controller_handler:
+                self.controller_handler.stop_monitoring()
+            
+            # Only clear lists if they exist and are not empty
+            if hasattr(self, 'keyboard_hooks') and self.keyboard_hooks:
+                self.keyboard_hooks.clear()
+            if hasattr(self, 'mouse_hooks') and self.mouse_hooks:
+                self.mouse_hooks.clear()
+            if hasattr(self, 'hotkeys') and self.hotkeys:
+                self.hotkeys.clear()
+            
+            # Reset hotkey setting state (only if we're blocking InputManager)
+            if block_input_manager:
+                self.setting_hotkey = False
+            
+        except Exception as e:
+            print(f"Warning: Error during hotkey cleanup: {e}")
+            print(f"Current state - keyboard_hooks: {len(getattr(self, 'keyboard_hooks', []))}")
+            print(f"Current state - mouse_hooks: {len(getattr(self, 'mouse_hooks', []))}")
+            print(f"Current state - hotkeys: {len(getattr(self, 'hotkeys', []))}")
+            # Don't fail the entire operation if cleanup fails
+
+    def unhook_mouse(self):
+        try:
+            # Only attempt to unhook and clear if mouse_hooks exists and has items
+            if hasattr(self, 'mouse_hooks') and self.mouse_hooks:
+                mouse.unhook_all()
+                self.mouse_hooks.clear()
+        except Exception as e:
+            print(f"Warning: Error during mouse hook cleanup: {e}")
+            print(f"Mouse hooks list state: {len(getattr(self, 'mouse_hooks', []))}")
+
+    def restore_all_hotkeys(self):
+        """Restore all area and stop hotkeys after area selection is finished/cancelled."""
+        # Don't restore hotkeys if we're in the middle of hotkey assignment
+        # This prevents interrupting the assignment process
+        if hasattr(self, 'setting_hotkey') and self.setting_hotkey:
+            print("DEBUG: Skipping restore_all_hotkeys() - hotkey assignment in progress")
+            return
+        
+        # Use InputManager to allow all hotkey handlers
+        InputManager.allow()
+        
+        # First, clean up any existing hooks
+        try:
+            keyboard.unhook_all()
+            if hasattr(self, 'mouse_hooks'):
+                self.mouse_hooks.clear()
+        except Exception as e:
+            print(f"Error cleaning up hooks during restore: {e}")
+        
+        # Restore the saved mouse hooks
+        if hasattr(self, 'saved_mouse_hooks'):
+            for hook in self.saved_mouse_hooks:
+                try:
+                    mouse.hook(hook)
+                    self.mouse_hooks.append(hook)
+                except Exception as e:
+                    print(f"Error restoring mouse hook: {e}")
+            # Clean up the saved hooks
+            delattr(self, 'saved_mouse_hooks')
+        
+        # Re-register all hotkeys for areas
+        registered_hotkeys = set()  # Track registered hotkeys to prevent duplicates
+        for area_tuple in getattr(self, 'areas', []):
+            if len(area_tuple) >= 9:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area_tuple[:9]
+            else:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _ = area_tuple[:8]
+            if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
+                # Check if this hotkey has already been registered
+                if hotkey_button.hotkey in registered_hotkeys:
+                    area_name = area_name_var.get() if hasattr(area_name_var, 'get') else "Unknown Area"
+                    print(f"Warning: Skipping duplicate hotkey '{hotkey_button.hotkey}' for area '{area_name}'")
+                    continue
+                
+                try:
+                    self.setup_hotkey(hotkey_button, area_frame)
+                    registered_hotkeys.add(hotkey_button.hotkey)
+                except Exception as e:
+                    print(f"Error re-registering hotkey: {e}")
+        
+        # Re-register stop hotkey if it exists
+        if hasattr(self, 'stop_hotkey_button') and hasattr(self.stop_hotkey_button, 'mock_button'):
+            try:
+                self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+            except Exception as e:
+                print(f"Error re-registering stop hotkey: {e}")
+        # Re-register combo hotkeys if automations window exists
+        if hasattr(self, '_automations_window') and self._automations_window:
+            automation_window = self._automations_window
+            if hasattr(automation_window, 'hotkey_combos'):
+                for combo in automation_window.hotkey_combos:
+                    hotkey_button = combo.get('hotkey_button')
+                    if hotkey_button and hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
+                        # Check if this hotkey has already been registered
+                        if hotkey_button.hotkey not in registered_hotkeys:
+                            try:
+                                print(f"DEBUG: Restoring combo hotkey: {hotkey_button.hotkey}")
+                                # Restore the callback if it exists
+                                if combo.get('_hotkey_callback_backup'):
+                                    hotkey_button._combo_callback = combo['_hotkey_callback_backup']
+                                    if hasattr(hotkey_button, '_combo_temp_frame'):
+                                        temp_frame = hotkey_button._combo_temp_frame
+                                    else:
+                                        temp_frame = tk.Frame()
+                                        temp_frame._is_hotkey_combo = True
+                                        temp_frame._combo_ref = combo
+                                        temp_frame._combo_window = automation_window
+                                        hotkey_button._combo_temp_frame = temp_frame
+                                    self.setup_hotkey(hotkey_button, temp_frame)
+                                    registered_hotkeys.add(hotkey_button.hotkey)
+                                    # Also restore to registry
+                                    if hasattr(automation_window, 'combo_callbacks_by_hotkey'):
+                                        automation_window.combo_callbacks_by_hotkey[hotkey_button.hotkey] = combo['_hotkey_callback_backup']
+                            except Exception as e:
+                                print(f"Error re-registering combo hotkey '{hotkey_button.hotkey}': {e}")
+        
+        # Re-register automation window hotkey if it exists
+        if hasattr(self, '_automations_window') and self._automations_window:
+            try:
+                automation_window = self._automations_window
+                if hasattr(automation_window, 'set_hotkey_button'):
+                    hotkey_button = automation_window.set_hotkey_button
+                    if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
+                        # Check if this hotkey has already been registered
+                        if hotkey_button.hotkey not in registered_hotkeys:
+                            print(f"DEBUG: Restoring automation window hotkey: {hotkey_button.hotkey}")
+                            # Use the temp_frame if it exists, otherwise create a dummy one
+                            temp_frame = getattr(hotkey_button, '_automation_temp_frame', None)
+                            if not temp_frame:
+                                temp_frame = tk.Frame()
+                                temp_frame._is_automation_area_hotkey = True
+                                temp_frame._automation_window = automation_window
+                            self.setup_hotkey(hotkey_button, temp_frame)
+                            registered_hotkeys.add(hotkey_button.hotkey)
+                        else:
+                            print(f"DEBUG: Automation window hotkey '{hotkey_button.hotkey}' already registered, skipping")
+            except Exception as e:
+                print(f"Error re-registering automation window hotkey: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Re-register pause hotkey if it exists
+        if hasattr(self, 'pause_hotkey_button') and hasattr(self.pause_hotkey_button, 'mock_button'):
+            try:
+                self.setup_hotkey(self.pause_hotkey_button.mock_button, None)
+            except Exception as e:
+                print(f"Error re-registering pause hotkey: {e}")
+        
+        # Re-register repeat latest hotkey if it exists
+        if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey:
+            if hasattr(self, 'repeat_latest_hotkey_button'):
+                try:
+                    # Ensure the button's hotkey attribute is set (setup_hotkey requires button.hotkey)
+                    if not hasattr(self.repeat_latest_hotkey_button, 'hotkey') or not self.repeat_latest_hotkey_button.hotkey:
+                        self.repeat_latest_hotkey_button.hotkey = self.repeat_latest_hotkey
+                    self.setup_hotkey(self.repeat_latest_hotkey_button, None)
+                    print(f"Restored repeat latest hotkey: {self.repeat_latest_hotkey}")
+                except Exception as e:
+                    print(f"Error re-registering repeat latest hotkey: {e}")
+        
+        # Re-register edit area hotkey if it exists
+        # First try to use the primary mock button (created at startup)
+        if hasattr(self, 'edit_area_hotkey_mock_button') and self.edit_area_hotkey_mock_button:
+            try:
+                self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                print(f"Restored edit area hotkey from edit_area_hotkey_mock_button: {self.edit_area_hotkey}")
+            except Exception as e:
+                print(f"Error re-registering edit area hotkey from mock_button: {e}")
+        # Fallback to button's mock_button if it exists
+        elif hasattr(self, 'edit_area_hotkey_button') and hasattr(self.edit_area_hotkey_button, 'mock_button'):
+            try:
+                self.setup_hotkey(self.edit_area_hotkey_button.mock_button, None)
+                # Also update the primary mock button reference
+                self.edit_area_hotkey_mock_button = self.edit_area_hotkey_button.mock_button
+                print(f"Restored edit area hotkey from button.mock_button: {self.edit_area_hotkey}")
+            except Exception as e:
+                print(f"Error re-registering edit area hotkey from button: {e}")
+        # If we have a hotkey but no mock button, recreate it
+        elif hasattr(self, 'edit_area_hotkey') and self.edit_area_hotkey:
+            try:
+                self.edit_area_hotkey_mock_button = type('MockButton', (), {'hotkey': self.edit_area_hotkey, 'is_edit_area_button': True})
+                self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                # Also update button's mock_button if button exists
+                if hasattr(self, 'edit_area_hotkey_button'):
+                    self.edit_area_hotkey_button.mock_button = self.edit_area_hotkey_mock_button
+                print(f"Recreated and restored edit area hotkey: {self.edit_area_hotkey}")
+            except Exception as e:
+                print(f"Error recreating edit area hotkey: {e}")
+        
+        # Restart controller monitoring if there are any controller hotkeys
+        if hasattr(self, 'controller_handler') and self.controller_handler:
+            # Check if any areas have controller hotkeys
+            has_controller_hotkeys = False
+            for area_tuple in getattr(self, 'areas', []):
+                if len(area_tuple) >= 9:
+                    area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area_tuple[:9]
+                else:
+                    area_frame, hotkey_button, _, area_name_var, _, _, _, _ = area_tuple[:8]
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey and hotkey_button.hotkey.startswith('controller_'):
+                    has_controller_hotkeys = True
+                    break
+            
+            # Also check if stop hotkey is a controller hotkey
+            if hasattr(self, 'stop_hotkey') and self.stop_hotkey and self.stop_hotkey.startswith('controller_'):
+                has_controller_hotkeys = True
+            
+            # Start controller monitoring if needed
+            if has_controller_hotkeys and not self.controller_handler.running:
+                self.controller_handler.start_monitoring()
+
+    def set_hotkey(self, button, area_frame):
+        # AGGRESSIVE CLEANUP: Cancel all existing timers and jobs FIRST to prevent accumulation
+        try:
+            # Cancel any existing preview job
+            if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                try:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                except Exception:
+                    pass
+                self._hotkey_preview_job = None
+            
+            # Cancel any existing finalize timers (stored in combo_state from previous assignments)
+            # We'll create a fresh combo_state, but cancel any lingering timers first
+            if hasattr(button, '_finalize_timer') and button._finalize_timer:
+                try:
+                    self.root.after_cancel(button._finalize_timer)
+                except Exception:
+                    pass
+                button._finalize_timer = None
+        except Exception as e:
+            print(f"Warning: Error cancelling timers: {e}")
+        
+        # Set flag FIRST so existing hotkeys are suppressed (they check this flag and return early)
+        # This is faster than unhook_all() and achieves the same result during the unhook process
+        self.setting_hotkey = True  # Enable hotkey assignment mode before unhooking
+        
+        # Clean up temporary hooks and disable all hotkeys
+        try:
+            if hasattr(button, 'keyboard_hook_temp'):
+                try:
+                    keyboard.unhook(button.keyboard_hook_temp)
+                except Exception:
+                    pass
+                delattr(button, 'keyboard_hook_temp')
+            
+            # ALWAYS clean up release hook, even if it exists - we'll re-register it fresh
+            if hasattr(button, 'keyboard_release_hook_temp'):
+                try:
+                    keyboard.unhook(button.keyboard_release_hook_temp)
+                except Exception:
+                    pass
+                delattr(button, 'keyboard_release_hook_temp')
+            
+            if hasattr(button, 'mouse_hook_temp'):
+                try:
+                    mouse.unhook(button.mouse_hook_temp)
+                except Exception:
+                    pass
+                delattr(button, 'mouse_hook_temp')
+            
+            # During hotkey assignment, don't block InputManager - we rely on self.setting_hotkey flag
+            self.disable_all_hotkeys(block_input_manager=False)
+        except Exception as e:
+            print(f"Warning: Error cleaning up temporary hooks: {e}")
+
+        # Set flags to block any late events from previous assignments
+        self._hotkey_assignment_cancelled = True  # Block old events first
+        # Note: setting_hotkey is already True above, so we don't reset it here
+        
+        # Small delay to let any pending events clear, then start fresh
+        self.root.after(10, lambda: self._start_hotkey_assignment(button, area_frame))
+    
+    def _start_hotkey_assignment(self, button, area_frame):
+        """Internal method to start hotkey assignment after cleanup delay"""
+        self._hotkey_assignment_cancelled = False  # Guard flag to block late events
+        self.setting_hotkey = True
+        print(f"Hotkey assignment mode started for button: {button}")
+
+
+        # Track whether a non-modifier key was pressed during capture (to distinguish bare modifiers)
+        # Also track pending hotkey and timer for delayed assignment
+        combo_state = {
+            'non_modifier_pressed': False, 
+            'held_modifiers': set(),
+            'pending_hotkey': None,  # The hotkey combination being built
+            'pending_base_key': None,  # The base (non-modifier) key for release detection
+            'finalize_timer': None   # Timer ID for delayed finalization
+        }
+
+        # Live preview of currently held modifiers while waiting for a non-modifier key
+        # Use a flag to track if preview is active to prevent multiple instances
+        preview_active = {'active': True}
+        
+        def _update_hotkey_preview():
+            # Check if preview was cancelled or assignment ended
+            if not preview_active.get('active') or self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            try:
+                mods = []
+                # Use scan code detection for more reliable left/right distinction
+                left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                
+                if left_ctrl_pressed or right_ctrl_pressed: mods.append('CTRL')
+                if keyboard.is_pressed('shift'): mods.append('SHIFT')
+                if keyboard.is_pressed('left alt'): mods.append('L-ALT')
+                if keyboard.is_pressed('right alt'): mods.append('R-ALT')
+                if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                    mods.append('WIN')
+                preview = " + ".join(mods)
+                if preview:
+                    button.config(text=f"Set Hotkey: [ {preview} + ]")
+                else:
+                    button.config(text=f"Set Hotkey: [  ]")
+                # Live expand window width if needed
+                self._ensure_window_width()
+            except Exception:
+                pass
+            # Only schedule next update if preview is still active
+            if preview_active.get('active') and not self._hotkey_assignment_cancelled and self.setting_hotkey:
+                try:
+                    self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+                except Exception:
+                    pass
+        
+        # Store preview_active in finish function for cleanup
+        def finish_hotkey_assignment():
+            # --- Re-enable all hotkeys after hotkey assignment is finished/cancelled ---
+            preview_active['active'] = False  # Stop preview updates
+            try:
+                self.restore_all_hotkeys()
+            except Exception as e:
+                print(f"Warning: Error restoring hotkeys: {e}")
+            # Stop live preview updater if running
+            try:
+                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                    self._hotkey_preview_job = None
+            except Exception:
+                pass
+
+        def on_key_press(event):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            # Ignore Escape
+            if event.scan_code == 1:
+                return
+            
+            print(f"Key press event received: {event.name} (type: {type(event).__name__})")
+            
+            # Use scan code and virtual key code for consistent behavior across keyboard layouts
+            scan_code = getattr(event, 'scan_code', None)
+            vk_code = getattr(event, 'vk_code', None)
+            
+            # Get current keyboard layout for consistency
+            current_layout = get_current_keyboard_layout()
+            
+            # Determine key name based on scan code and virtual key code for consistency
+            name = None
+            side = None
+            
+            # Handle modifier keys consistently
+            if scan_code == 29:  # Left Ctrl
+                name = 'ctrl'
+                side = 'left'
+            elif scan_code == 157:  # Right Ctrl
+                name = 'ctrl'
+                side = 'right'
+            elif scan_code == 42:  # Left Shift
+                name = 'shift'
+                side = 'left'
+            elif scan_code == 54:  # Right Shift
+                name = 'shift'
+                side = 'right'
+            elif scan_code == 56:  # Left Alt
+                name = 'left alt'
+                side = 'left'
+            elif scan_code == 184:  # Right Alt
+                name = 'right alt'
+                side = 'right'
+            elif scan_code == 91:  # Left Windows
+                name = 'windows'
+                side = 'left'
+            elif scan_code == 92:  # Right Windows
+                name = 'windows'
+                side = 'right'
+            else:
+                # For non-modifier keys, use the event name but normalize it
+                raw_name = (event.name or '').lower()
+                name = normalize_key_name(raw_name)
+                
+                # For conflicting scan codes (75, 72, 77, 80), check event name FIRST to determine user intent
+                # These scan codes are shared between numpad 2/4/6/8 and arrow keys
+                # During assignment, event name is more reliable for determining what the user wants
+                conflicting_scan_codes = {75: 'left', 72: 'up', 77: 'right', 80: 'down'}
+                is_conflicting = scan_code in conflicting_scan_codes
+                
+                if is_conflicting:
+                    # Check event name first - if it clearly indicates arrow key, use that
+                    arrow_key_names = ['up', 'down', 'left', 'right', 'pil opp', 'pil ned', 'pil venstre', 'pil høyre']
+                    is_arrow_by_name = raw_name in arrow_key_names
+                    
+                    # Check if event name indicates numpad (starts with "numpad " or is a number)
+                    is_numpad_by_name = raw_name.startswith('numpad ') or (raw_name in ['2', '4', '6', '8'] and not is_arrow_by_name)
+                    
+                    if is_arrow_by_name:
+                        # Event name clearly indicates arrow key - use that regardless of NumLock
+                        name = self.arrow_key_scan_codes[scan_code]
+                        print(f"Debug: Detected arrow key by event name: '{name}' (scan code: {scan_code}, event: {raw_name})")
+                    elif is_numpad_by_name:
+                        # Event name indicates numpad key
+                        if scan_code in self.numpad_scan_codes:
+                            sym = self.numpad_scan_codes[scan_code]
+                            name = f"num_{sym}"
+                            print(f"Debug: Detected numpad key by event name: '{name}' (scan code: {scan_code}, event: {raw_name})")
+                        else:
+                            name = self.arrow_key_scan_codes[scan_code]
+                    else:
+                        # Event name is ambiguous - check NumLock state as fallback
+                        try:
+                            import ctypes
+                            VK_NUMLOCK = 0x90
+                            numlock_is_on = bool(ctypes.windll.user32.GetKeyState(VK_NUMLOCK) & 1)
+                            if numlock_is_on:
+                                # NumLock is ON - default to numpad key
+                                if scan_code in self.numpad_scan_codes:
+                                    sym = self.numpad_scan_codes[scan_code]
+                                    name = f"num_{sym}"
+                                    print(f"Debug: Detected numpad key (NumLock ON, ambiguous event): '{name}' (scan code: {scan_code}, event: {raw_name})")
+                                else:
+                                    name = self.arrow_key_scan_codes[scan_code]
+                            else:
+                                # NumLock is OFF - default to arrow key
+                                name = self.arrow_key_scan_codes[scan_code]
+                                print(f"Debug: Detected arrow key (NumLock OFF, ambiguous event): '{name}' (scan code: {scan_code}, event: {raw_name})")
+                        except Exception as e:
+                            # Fallback: default to arrow key
+                            print(f"Debug: Error checking NumLock state: {e}, defaulting to arrow key")
+                            name = self.arrow_key_scan_codes.get(scan_code, raw_name)
+                # Check non-conflicting numpad scan codes
+                elif scan_code in self.numpad_scan_codes:
+                    sym = self.numpad_scan_codes[scan_code]
+                    name = f"num_{sym}"
+                    print(f"Debug: Detected numpad key by scan code: '{name}' (scan code: {scan_code}, event name: {raw_name})")
+                # Check non-conflicting arrow key scan codes
+                elif scan_code in self.arrow_key_scan_codes:
+                    name = self.arrow_key_scan_codes[scan_code]
+                    print(f"Debug: Detected arrow key by scan code: '{name}' (scan code: {scan_code}, event name: {raw_name})")
+                # Then check if this is a regular keyboard number by scan code
+                elif scan_code in self.keyboard_number_scan_codes:
+                    # Regular keyboard numbers use the number directly
+                    name = self.keyboard_number_scan_codes[scan_code]
+                # Then check special keys by scan code
+                elif scan_code in self.special_key_scan_codes:
+                    name = self.special_key_scan_codes[scan_code]
+                # Fallback to event name detection
+                # First check if this is an arrow key by event name (support multiple languages)
+                elif raw_name in ['up', 'down', 'left', 'right'] or raw_name in ['pil opp', 'pil ned', 'pil venstre', 'pil høyre']:
+                    # Convert Norwegian arrow key names to English
+                    if raw_name == 'pil opp':
+                        name = 'up'
+                    elif raw_name == 'pil ned':
+                        name = 'down'
+                    elif raw_name == 'pil venstre':
+                        name = 'left'
+                    elif raw_name == 'pil høyre':
+                        name = 'right'
+                    else:
+                        name = raw_name
+                # Then check if this is a numpad key by event name
+                elif raw_name.startswith('numpad ') or raw_name in ['numpad 0', 'numpad 1', 'numpad 2', 'numpad 3', 'numpad 4', 'numpad 5', 'numpad 6', 'numpad 7', 'numpad 8', 'numpad 9', 'numpad *', 'numpad +', 'numpad -', 'numpad .', 'numpad /', 'numpad enter']:
+                    # Convert numpad event name to our format
+                    if raw_name == 'numpad *':
+                        name = 'num_multiply'
+                    elif raw_name == 'numpad +':
+                        name = 'num_add'
+                    elif raw_name == 'numpad -':
+                        name = 'num_subtract'
+                    elif raw_name == 'numpad .':
+                        name = 'num_.'
+                    elif raw_name == 'numpad /':
+                        name = 'num_divide'
+                    elif raw_name == 'numpad enter':
+                        name = 'num_enter'
+                    else:
+                        # Extract the number from 'numpad X'
+                        num = raw_name.replace('numpad ', '')
+                        name = f"num_{num}"
+                # Then check special keys by event name
+                elif raw_name in ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+                                 'num lock', 'scroll lock', 'insert', 'home', 'end', 'page up', 'page down',
+                                 'delete', 'tab', 'enter', 'backspace', 'space', 'escape']:
+                    name = raw_name
+
+            # Debug: Show what name was determined
+            print(f"Debug: Final determined name: '{name}' (scan code: {scan_code})")
+            if scan_code in [29, 157]:
+                print(f"Debug: Ctrl key detection - scan code {scan_code} -> '{name}'")
+                if scan_code in [29, 157] and name != 'ctrl':
+                    print(f"ERROR: Ctrl scan code {scan_code} detected but name is '{name}' instead of 'ctrl'")
+            
+            # Track modifiers as they're pressed and mark non-modifiers
+            if name not in ('ctrl','alt','left alt','right alt','shift','windows'):
+                combo_state['non_modifier_pressed'] = True
+                print(f"Debug: Non-modifier key detected: '{name}'")
+            else:
+                # Add modifier to our tracking set
+                combo_state['held_modifiers'].add(name)
+                print(f"Debug: Modifier key detected: '{name}', held modifiers: {combo_state['held_modifiers']}")
+            if name in ('ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows'):
+                # Allow assigning a bare modifier when released, if user doesn't press another key
+                # Start a short timer to check if still only this modifier is held
+                def _assign_bare_modifier(modifier_name):
+                    if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                        return
+                    try:
+                        held = []
+                        # Use scan code detection for more reliable left/right distinction
+                        left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                        
+                        if left_ctrl_pressed or right_ctrl_pressed: held.append('ctrl')
+                        if keyboard.is_pressed('shift'): held.append('shift')
+                        if keyboard.is_pressed('left alt'): held.append('left alt')
+                        if keyboard.is_pressed('right alt'): held.append('right alt')
+                        if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                            held.append('windows')
+                        # Only proceed if exactly one modifier is still held and matches side/base
+                        if len(held) == 1:
+                            only = held[0]
+                            # Determine base from modifier_name
+                            base = None
+                            if 'ctrl' in modifier_name: base = 'ctrl'
+                            elif 'alt' in modifier_name: base = 'alt'
+                            elif 'shift' in modifier_name: base = 'shift'
+                            elif 'windows' in modifier_name: base = 'windows'
+                            
+                            # Accept if same base and, when available, same side
+                            if (base == 'ctrl' and only == 'ctrl') or \
+                               (base == 'alt' and (only in ['left alt','right alt'])) or \
+                               (base == 'shift' and only == 'shift') or \
+                               (base == 'windows' and only == 'windows'):
+                                key_name = only
+                            else:
+                                return
+
+                            # Prevent duplicates: Stop hotkey
+                            if getattr(self, 'stop_hotkey', None) == key_name:
+                                self.setting_hotkey = False
+                                self._hotkey_assignment_cancelled = True
+                                try:
+                                    if hasattr(button, 'keyboard_hook_temp'):
+                                        keyboard.unhook(button.keyboard_hook_temp)
+                                        delattr(button, 'keyboard_hook_temp')
+                                    if hasattr(button, 'mouse_hook_temp'):
+                                        mouse.unhook(button.mouse_hook_temp)
+                                        delattr(button, 'mouse_hook_temp')
+                                except Exception:
+                                    pass
+                                finish_hotkey_assignment()
+                                try:
+                                    messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+                                except Exception:
+                                    pass
+                                return
+
+                            # Prevent duplicates: other areas
+                            for area in self.areas:
+                                if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == key_name:
+                                    self.setting_hotkey = False
+                                    self._hotkey_assignment_cancelled = True
+                                    try:
+                                        if hasattr(button, 'keyboard_hook_temp'):
+                                            keyboard.unhook(button.keyboard_hook_temp)
+                                            delattr(button, 'keyboard_hook_temp')
+                                        if hasattr(button, 'mouse_hook_temp'):
+                                            mouse.unhook(button.mouse_hook_temp)
+                                            delattr(button, 'mouse_hook_temp')
+                                    except Exception:
+                                        pass
+                                    finish_hotkey_assignment()
+                                    area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                                    show_thinkr_warning(self, area_name)
+                                    return
+
+                            button.hotkey = key_name
+                            # Determine which hotkey is being changed
+                            hotkey_name = None
+                            if hasattr(button, 'is_stop_button'):
+                                hotkey_name = 'Stop Hotkey'
+                            elif hasattr(button, 'is_pause_button'):
+                                hotkey_name = 'Pause/Play Hotkey'
+                            elif hasattr(button, 'is_edit_area_button'):
+                                hotkey_name = 'Editor Toggle Hotkey'
+                            elif area_frame is not None:
+                                # This is an area hotkey - find the area name
+                                for area in self.areas:
+                                    if area[0] == area_frame:
+                                        area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                                        hotkey_name = f"Area: {area_name}"
+                                        break
+                            
+                            if hotkey_name:
+                                self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+                            else:
+                                self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
+                            # Display mapping
+                            disp = key_name.upper().replace('LEFT ALT','L-ALT').replace('RIGHT ALT','R-ALT') \
+                                                .replace('WINDOWS','WIN').replace('CTRL','CTRL')
+                            display_name = disp
+                            button.config(text=f"Set Hotkey: [ {display_name} ]")
+                            self.setup_hotkey(button, area_frame)
+                            # Cleanup temp hooks and preview
+                            try:
+                                if hasattr(button, 'keyboard_hook_temp'):
+                                    keyboard.unhook(button.keyboard_hook_temp)
+                                    delattr(button, 'keyboard_hook_temp')
+                                if hasattr(button, 'mouse_hook_temp'):
+                                    mouse.unhook(button.mouse_hook_temp)
+                                    delattr(button, 'mouse_hook_temp')
+                            except Exception:
+                                pass
+                            # Don't call restore_all_hotkeys - we just registered the hotkey
+                            try:
+                                self.stop_speaking()
+                            except Exception:
+                                pass
+                            try:
+                                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                                    self.root.after_cancel(self._hotkey_preview_job)
+                                    self._hotkey_preview_job = None
+                            except Exception:
+                                pass
+                            self.setting_hotkey = False
+                            return
+                    except Exception:
+                        pass
+                # Delay a bit to allow combination keys; if user presses another key quickly, normal path will handle it
+                # Using 300ms to give user enough time to press all keys in a multi-key combination (reduced from 800ms)
+                try:
+                    print(f"Debug: Setting timer for _assign_bare_modifier with modifier_name: '{name}'")
+                    self.root.after(300, lambda: _assign_bare_modifier(name))
+                    print(f"Debug: Timer set successfully for {name}")
+                except Exception as e:
+                    print(f"Debug: Error setting timer: {e}")
+                return
+
+            # Only build combination if a non-modifier key was pressed
+            # (Modifier keys alone are handled by the timer above)
+            if not combo_state['non_modifier_pressed']:
+                print(f"Debug: Skipping combination building - only modifier key pressed")
+                return
+            
+            print(f"Debug: Building combination for non-modifier key")
+
+            # Build combination string from tracked held modifiers + key
+            try:
+                # Use our tracked modifiers instead of keyboard.is_pressed()
+                mods = list(combo_state['held_modifiers'])
+                
+                # Debug output
+                print(f"Debug: Pressed key '{name}', tracked modifiers: {mods}")
+            except Exception:
+                mods = []
+
+            # The name is already determined by event name detection above, so use it directly
+            base_key = name
+
+            # Check if this is a mouse button (button1 or button2) and validate against checkbox
+            # Check if base_key is button1 or button2, or contains them (for combinations)
+            is_mouse_button = base_key in ['button1', 'button2'] or 'button1' in base_key or 'button2' in base_key
+            if is_mouse_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+                if not allow_mouse_buttons:
+                    # Reset preview and show warning
+                    if hasattr(button, 'hotkey') and button.hotkey:
+                        display_name = self._get_display_hotkey(button)
+                        button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                    else:
+                        button.config(text="Set Hotkey")
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    return
+
+            # If base_key itself is a modifier, include it if not already in mods; otherwise avoid duplicate
+            if base_key in ("ctrl", "shift", "alt", "windows", "left alt", "right alt"):
+                combo_parts = (mods + [base_key]) if base_key not in mods else mods[:]
+            else:
+                combo_parts = mods + [base_key]
+            key_name = "+".join(p for p in combo_parts if p)
+            
+            # Debug output
+            print(f"Debug: Final key combination: '{key_name}' (from parts: {combo_parts})")
+
+            # Store pending hotkey and update preview
+            combo_state['pending_hotkey'] = key_name
+            combo_state['pending_base_key'] = base_key  # Store the base key for release detection
+            
+            # Show preview of the pending hotkey
+            if key_name.startswith('num_'):
+                preview_name = self._convert_numpad_to_display(key_name)
+            else:
+                preview_name = key_name.replace('numpad ', 'NUMPAD ') \
+                                       .replace('ctrl','CTRL') \
+                                       .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                       .replace('windows','WIN') \
+                                       .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+            button.config(text=f"Set Hotkey: [ {preview_name.upper()} ]")
+            print(f"Debug: Updated preview to '{preview_name.upper()}', will finalize in 250ms or on key release")
+            
+            # Cancel any existing finalization timer
+            if combo_state['finalize_timer'] is not None:
+                try:
+                    self.root.after_cancel(combo_state['finalize_timer'])
+                    print(f"Debug: Cancelled previous finalization timer")
+                except Exception:
+                    pass
+            
+            # Start new finalization timer - 250ms delay before accepting the hotkey (reduced from 800ms for better responsiveness)
+            def _finalize_hotkey():
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                    return
+                
+                pending_key = combo_state['pending_hotkey']
+                if not pending_key:
+                    return
+                
+                print(f"Debug: Finalizing hotkey: '{pending_key}'")
+                
+                # Prevent duplicates against Stop hotkey
+                if getattr(self, 'stop_hotkey', None) == pending_key:
+                    # Unhook temp hooks and set flags BEFORE showing the warning
+                    preview_active['active'] = False  # Stop preview updates
+                    self.setting_hotkey = False
+                    self._hotkey_assignment_cancelled = True
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'keyboard_release_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_release_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_release_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        try:
+                            mouse.unhook(button.mouse_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'mouse_hook_temp')
+                    finish_hotkey_assignment()
+                    # Reset label text
+                    if hasattr(button, 'hotkey') and button.hotkey:
+                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
+                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
+                    else:
+                        button.config(text="Set Hotkey")
+                    show_thinkr_warning(self, "Stop Hotkey")
+                    return
+
+                # Prevent duplicates against Repeat Latest Scan hotkey
+                if getattr(self, 'repeat_latest_hotkey', None) == pending_key and not hasattr(button, 'is_repeat_latest_button'):
+                    # Unhook temp hooks and set flags BEFORE showing the warning
+                    preview_active['active'] = False  # Stop preview updates
+                    self.setting_hotkey = False
+                    self._hotkey_assignment_cancelled = True
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'keyboard_release_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_release_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_release_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        try:
+                            mouse.unhook(button.mouse_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'mouse_hook_temp')
+                    finish_hotkey_assignment()
+                    show_thinkr_warning(self, "Repeat Last Scan Hotkey")
+                    # Reset label text
+                    if hasattr(button, 'hotkey') and button.hotkey:
+                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
+                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
+                    else:
+                        button.config(text="Set Hotkey")
+                    return
+
+                # Prevent duplicates against Pause/Play hotkey
+                if getattr(self, 'pause_hotkey', None) == pending_key and not hasattr(button, 'is_pause_button'):
+                    # Unhook temp hooks and set flags BEFORE showing the warning
+                    preview_active['active'] = False  # Stop preview updates
+                    self.setting_hotkey = False
+                    self._hotkey_assignment_cancelled = True
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'keyboard_release_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_release_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_release_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        try:
+                            mouse.unhook(button.mouse_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'mouse_hook_temp')
+                    finish_hotkey_assignment()
+                    show_thinkr_warning(self, "Pause/Play Hotkey")
+                    # Reset label text
+                    if hasattr(button, 'hotkey') and button.hotkey:
+                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
+                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
+                    else:
+                        button.config(text="Set Hotkey")
+                    return
+
+                # Disallow duplicate hotkeys
+                duplicate_found = False
+                area_name = "Unknown Area"
+                for area in self.areas:
+                    if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == pending_key:
+                        duplicate_found = True
+                        area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                        break
+
+                if duplicate_found:
+                    # Unhook temp hooks and set flags BEFORE showing the warning
+                    preview_active['active'] = False  # Stop preview updates
+                    self.setting_hotkey = False
+                    self._hotkey_assignment_cancelled = True  # Block all further events
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'keyboard_release_hook_temp'):
+                        try:
+                            keyboard.unhook(button.keyboard_release_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'keyboard_release_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        try:
+                            mouse.unhook(button.mouse_hook_temp)
+                        except Exception:
+                            pass
+                        delattr(button, 'mouse_hook_temp')
+                    finish_hotkey_assignment()
+                    # Now show the warning dialog (no hooks are active)
+                    if hasattr(button, 'hotkey'):
+                        display_name = self._get_display_hotkey(button)
+                        button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                    else:
+                        button.config(text="Set Hotkey")
+                    show_thinkr_warning(self, area_name)
+                    return
+                
+                # Final validation: Check if this is a mouse button (button1 or button2) and validate against checkbox
+                # Check if pending_key is exactly button1/button2, or contains them as part of a combination
+                is_mouse_button = pending_key in ['button1', 'button2'] or 'button1' in pending_key or 'button2' in pending_key
+                if is_mouse_button:
+                    # Get the current state of the allow_mouse_buttons checkbox
+                    allow_mouse_buttons = False
+                    if hasattr(self, 'allow_mouse_buttons_var'):
+                        try:
+                            allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                        except Exception as e:
+                            print(f"Error getting allow_mouse_buttons_var: {e}")
+                    
+                    if not allow_mouse_buttons:
+                        # Unhook temp hooks and set flags BEFORE showing the warning
+                        preview_active['active'] = False  # Stop preview updates
+                        self.setting_hotkey = False
+                        self._hotkey_assignment_cancelled = True
+                        if hasattr(button, 'keyboard_hook_temp'):
+                            try:
+                                keyboard.unhook(button.keyboard_hook_temp)
+                            except Exception:
+                                pass
+                            delattr(button, 'keyboard_hook_temp')
+                        if hasattr(button, 'keyboard_release_hook_temp'):
+                            try:
+                                keyboard.unhook(button.keyboard_release_hook_temp)
+                            except Exception:
+                                pass
+                            delattr(button, 'keyboard_release_hook_temp')
+                        if hasattr(button, 'mouse_hook_temp'):
+                            try:
+                                mouse.unhook(button.mouse_hook_temp)
+                            except Exception:
+                                pass
+                            delattr(button, 'mouse_hook_temp')
+                        finish_hotkey_assignment()
+                        # Reset label text
+                        if hasattr(button, 'hotkey') and button.hotkey:
+                            display_name = self._get_display_hotkey(button)
+                            button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                        else:
+                            button.config(text="Set Hotkey")
+                        if not hasattr(self, '_mouse_button_error_shown'):
+                            messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                            self._mouse_button_error_shown = True
+                        return
+                    
+                # Only proceed with setting hotkey if no duplicate was found and mouse button validation passed
+                # Clear old hotkey first to prevent conflicts
+                old_hotkey = getattr(button, 'hotkey', None)
+                if old_hotkey:
+                    # Unregister old hotkey before setting new one
+                    try:
+                        if hasattr(button, 'keyboard_hook'):
+                            if hasattr(button.keyboard_hook, 'remove'):
+                                button.keyboard_hook.remove()
+                            else:
+                                keyboard.unhook(button.keyboard_hook)
+                            delattr(button, 'keyboard_hook')
+                        if hasattr(button, 'mouse_hook_id'):
+                            mouse.unhook(button.mouse_hook_id)
+                            delattr(button, 'mouse_hook_id')
+                    except Exception as e:
+                        print(f"Debug: Error clearing old hotkey: {e}")
+                
+                button.hotkey = pending_key
+                
+                # Determine which hotkey is being changed
+                hotkey_name = None
+                if hasattr(button, 'is_repeat_latest_button'):
+                    self.repeat_latest_hotkey = pending_key
+                    # Also ensure the persistent button has the hotkey
+                    if hasattr(self, 'repeat_latest_hotkey_button'):
+                        self.repeat_latest_hotkey_button.hotkey = pending_key
+                    # Save to settings
+                    self._save_repeat_latest_hotkey(pending_key)
+                    hotkey_name = 'Repeat Last Scan Hotkey'
+                elif hasattr(button, 'is_stop_button'):
+                    hotkey_name = 'Stop Hotkey'
+                elif hasattr(button, 'is_pause_button'):
+                    hotkey_name = 'Pause/Play Hotkey'
+                elif hasattr(button, 'is_edit_area_button'):
+                    hotkey_name = 'Editor Toggle Hotkey'
+                elif area_frame is not None:
+                    # This is an area hotkey - find the area name
+                    for area in self.areas:
+                        if area[0] == area_frame:
+                            area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                            hotkey_name = f"Area: {area_name}"
+                            break
+                
+                if hotkey_name:
+                    self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+                else:
+                    self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
+                # Display: make NUMPAD look nice and uppercase
+                # Display nicer labels for sided modifiers
+                # Convert numpad keys to display format
+                if pending_key.startswith('num_'):
+                    display_name = self._convert_numpad_to_display(pending_key)
+                elif pending_key.startswith('controller_'):
+                    # Extract controller button name for display
+                    btn_name = pending_key.replace('controller_', '')
+                    # Handle D-Pad names specially
+                    if btn_name.startswith('dpad_'):
+                        dpad_name = btn_name.replace('dpad_', '')
+                        display_name = f"D-Pad {dpad_name.title()}"
+                    else:
+                        display_name = btn_name
+                else:
+                    display_name = pending_key.replace('numpad ', 'NUMPAD ') \
+                                                         .replace('ctrl','CTRL') \
+                    .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                    .replace('windows','WIN') \
+                    .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+
+                self.setup_hotkey(button, area_frame)
+                self.setting_hotkey = False
+                print(f"Hotkey assignment completed for button: {button}")
+                
+                # Expand window width if needed for longer hotkey text
+                self._ensure_window_width()
+
+                # Unhook both temp hooks if they exist
+                if hasattr(button, 'keyboard_hook_temp'):
+                    try:
+                        keyboard.unhook(button.keyboard_hook_temp)
+                    except Exception:
+                        pass
+                    delattr(button, 'keyboard_hook_temp')
+                if hasattr(button, 'keyboard_release_hook_temp'):
+                    try:
+                        keyboard.unhook(button.keyboard_release_hook_temp)
+                    except Exception:
+                        pass
+                    delattr(button, 'keyboard_release_hook_temp')
+                if hasattr(button, 'mouse_hook_temp'):
+                    try:
+                        mouse.unhook(button.mouse_hook_temp)
+                    except Exception:
+                        pass
+                    delattr(button, 'mouse_hook_temp')
+
+                # Don't call restore_all_hotkeys here - we just registered the hotkey above
+                # restore_all_hotkeys would unhook_all() and re-register everything, causing duplicates
+                # Just clean up the preview and stop speaking if needed
+                try:
+                    self.stop_speaking()  # Stop the speech
+                except Exception as e:
+                    print(f"Error during forced stop: {e}")
+                
+                # Cleanup preview
+                preview_active['active'] = False  # Stop preview updates
+                try:
+                    if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                        self.root.after_cancel(self._hotkey_preview_job)
+                        self._hotkey_preview_job = None
+                except Exception:
+                    pass
+                # Guard: prevent any further hotkey assignment callbacks
+                self.setting_hotkey = False
+            
+            # Schedule finalization after 250ms delay (reduced from 800ms for better responsiveness)
+            combo_state['finalize_timer'] = self.root.after(250, _finalize_hotkey)
+            print(f"Debug: Scheduled finalization timer (250ms)")
+            
+            # Also set up key release handler for immediate finalization when non-modifier key is released
+            # This provides instant feedback when user releases the key combination
+            def on_key_release(event):
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                    return
+                
+                # Only finalize if we have a pending hotkey with a non-modifier key
+                if not (combo_state.get('pending_hotkey') and combo_state.get('non_modifier_pressed')):
+                    return
+                
+                # Ignore modifier key releases - we only care about the base (non-modifier) key
+                raw_name = (event.name or '').lower()
+                scan_code = getattr(event, 'scan_code', None)
+                
+                # Check if this is a modifier key
+                is_modifier = False
+                if scan_code in [29, 157, 42, 54, 56, 184, 91, 92]:  # Ctrl, Shift, Alt, Windows keys
+                    is_modifier = True
+                elif raw_name in ('ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows', 'left windows', 'right windows'):
+                    is_modifier = True
+                
+                # Only proceed if this is NOT a modifier (i.e., it's the base key being released)
+                if not is_modifier:
+                    # Cancel the timer since we're finalizing now
+                    if combo_state.get('finalize_timer'):
+                        try:
+                            self.root.after_cancel(combo_state['finalize_timer'])
+                        except Exception:
+                            pass
+                        combo_state['finalize_timer'] = None
+                    
+                    # Finalize immediately when base key is released
+                    print(f"Debug: Base key released, finalizing hotkey immediately")
+                    _finalize_hotkey()
+            
+            # Register key release handler for immediate finalization (always register fresh)
+            try:
+                button.keyboard_release_hook_temp = keyboard.on_release(on_key_release)
+            except Exception as e:
+                print(f"Debug: Could not set up key release handler: {e}")
+
+            return
+
+        def on_mouse_click(event):
+            # Only handle button down events when in hotkey setting mode
+            if not self.setting_hotkey or not isinstance(event, mouse.ButtonEvent) or event.event_type != mouse.DOWN:
+                return
+            
+            # List of all potential names for left and right mouse buttons
+            LEFT_MOUSE_BUTTONS = [
+                '1', 'left', 'primary', 'select', 'action', 'button1', 'mouse1'
+            ]
+            RIGHT_MOUSE_BUTTONS = [
+                '2', 'right', 'secondary', 'context', 'alternate', 'button2', 'mouse2'
+            ]
+            
+            # Get the button name from the event
+            button_name = str(event.button).lower()
+            
+            # Use the button identifier directly from the mouse library
+            # This could be a number (1, 2, 3) or a string ('x', 'wheel', etc.)
+            button_identifier = event.button
+            
+            # Check if this is a left or right mouse button
+            is_left_button = button_identifier == 1 or str(button_identifier).lower() in ['left', 'primary', 'select', 'action', 'button1', 'mouse1']
+            is_right_button = button_identifier == 2 or str(button_identifier).lower() in ['right', 'secondary', 'context', 'alternate', 'button2', 'mouse2']
+            
+            # Check if this is a left/right mouse button
+            if is_left_button or is_right_button:
+                # Get the current state of the allow_mouse_buttons checkbox
+                allow_mouse_buttons = False
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    try:
+                        allow_mouse_buttons = self.allow_mouse_buttons_var.get()
+                    except Exception as e:
+                        print(f"Error getting allow_mouse_buttons_var: {e}")
+                
+
+                
+                if not allow_mouse_buttons:
+
+                    if not hasattr(self, '_mouse_button_error_shown'):
+                        messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                        self._mouse_button_error_shown = True
+                    return
+                
+                # If we get here, mouse buttons are allowed
+                button_name = f"button{button_identifier}"
+    
+                # Create a mock keyboard event for the mouse button
+                mock_event = type('MockEvent', (), {
+                    'name': button_name,
+                    'scan_code': None,
+                    'event_type': 'down'
+                })
+                
+                # Store the original button identifier for the mouse hook
+                button.original_button_id = button_identifier
+                
+                on_key_press(mock_event)
+                return
+            
+            # Create a mock keyboard event
+            mock_event = type('MockEvent', (), {
+                'name': f'button{button_identifier}',  # Use the actual button identifier
+                'scan_code': None
+            })
+            
+            # Store the original button identifier for the mouse hook
+            button.original_button_id = button_identifier
+            
+            on_key_press(mock_event)
+
+        def on_controller_button_press(event):
+            """Controller support disabled - pygame removed to reduce Windows security flags"""
+            print("Controller support disabled - pygame removed to reduce Windows security flags")
+
+        def on_controller_hat_press(event):
+            """Controller support disabled - pygame removed to reduce Windows security flags"""
+            print("Controller support disabled - pygame removed to reduce Windows security flags")
+
+
+
+        # Clean up previous hooks
+        if hasattr(button, 'keyboard_hook'):
+            try:
+                hook = button.keyboard_hook
+                # Handle different hook types from keyboard library:
+                # 1. If it has a remove method, it's an add_hotkey hook object - call remove()
+                if hasattr(hook, 'remove') and callable(getattr(hook, 'remove', None)):
+                    hook.remove()
+                # 2. If it's callable but not a hook object, try remove_hotkey (for add_hotkey return values)
+                elif callable(hook):
+                    try:
+                        keyboard.remove_hotkey(hook)
+                    except:
+                        # If remove_hotkey fails, try unhook
+                        try:
+                            keyboard.unhook(hook)
+                        except:
+                            pass  # Ignore if it can't be unhooked
+                # 3. Otherwise try remove_hotkey
+                else:
+                    try:
+                        keyboard.remove_hotkey(hook)
+                    except:
+                        try:
+                            keyboard.unhook(hook)
+                        except:
+                            pass
+                delattr(button, 'keyboard_hook')
+            except Exception:
+                # Silently ignore cleanup errors - hook may already be removed
+                pass
+        if hasattr(button, 'mouse_hook_id'):
+            try:
+                mouse.unhook(button.mouse_hook_id)
+                delattr(button, 'mouse_hook_id')
+            except Exception as e:
+                print(f"Error cleaning up mouse hook ID: {e}")
+        if hasattr(button, 'mouse_hook'):
+            try:
+                delattr(button, 'mouse_hook')
+            except Exception as e:
+                print(f"Error cleaning up mouse hook function: {e}")
+        button.config(text="Press any key or combination...")
+        self.root.update_idletasks()  # Force immediate UI update
+        
+        # Set flag FIRST so existing hotkeys are suppressed (they check this flag and return early)
+        # This is faster than unhook_all() and achieves the same result
+        self.setting_hotkey = True  # Enable hotkey assignment mode before installing hooks
+        
+        # Note: We skip keyboard.unhook_all() here because:
+        # 1. It's a blocking operation that can take 100-500ms+ with many hotkeys
+        # 2. Existing hotkey handlers already check self.setting_hotkey and return early
+        # 3. This makes the UI responsive immediately
+        # If needed, we can do unhook_all() asynchronously in the background, but it's not necessary
+        
+        # Live preview of currently held modifiers
+        def _update_hotkey_preview():
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            try:
+                mods = []
+                # Use scan code detection for more reliable left/right distinction
+                left_ctrl_pressed, right_ctrl_pressed = detect_ctrl_keys()
+                
+                if left_ctrl_pressed or right_ctrl_pressed: mods.append('CTRL')
+                if keyboard.is_pressed('shift'): mods.append('SHIFT')
+                if keyboard.is_pressed('left alt'): mods.append('L-ALT')
+                if keyboard.is_pressed('right alt'): mods.append('R-ALT')
+                if keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows') or keyboard.is_pressed('windows'):
+                    mods.append('WIN')
+                preview = " + ".join(mods)
+                if preview:
+                    button.config(text=f"Press key: [ {preview} + ]")
+                else:
+                    button.config(text="Press any key or combination...")
+                # Live expand window width if needed
+                self._ensure_window_width()
+            except Exception:
+                pass
+            # Schedule next update
+            try:
+                self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+            except Exception:
+                pass
+        
+        # Start live preview
+        try:
+            self._hotkey_preview_job = self.root.after(80, _update_hotkey_preview)
+        except Exception:
+            pass
+        
+        button.keyboard_hook_temp = keyboard.on_press(on_key_press)
+        button.mouse_hook_temp = mouse.hook(on_mouse_click)
+        
+        # Start controller monitoring for hotkey assignment if controller support is available
+        if CONTROLLER_AVAILABLE:
+            self._start_controller_hotkey_monitoring(button, area_frame, finish_hotkey_assignment)
+
+        # Also listen for Shift key release to allow assigning bare SHIFT reliably
+        def on_shift_release(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            # Determine which shift key was released from event name if available
+            side_label = 'left'
+            try:
+                raw = (getattr(_e, 'name', '') or '').lower()
+                if 'right' in raw or 'right shift' in raw:
+                    side_label = 'right'
+            except Exception:
+                pass
+            # Assign bare sided SHIFT
+            key_name = f"{side_label} shift"
+            # Prevent duplicates: Stop hotkey
+            if getattr(self, 'stop_hotkey', None) == key_name:
+                # Cleanup temp hooks and end assignment with warning
+                try:
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        keyboard.unhook(button.keyboard_hook_temp)
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        mouse.unhook(button.mouse_hook_temp)
+                        delattr(button, 'mouse_hook_temp')
+                    if hasattr(button, 'shift_release_hooks'):
+                        for h in button.shift_release_hooks:
+                            try:
+                                keyboard.unhook(h)
+                            except Exception:
+                                pass
+                        delattr(button, 'shift_release_hooks')
+                    if hasattr(button, 'ctrl_release_hooks'):
+                        for h in button.ctrl_release_hooks:
+                            try:
+                                keyboard.unhook(h)
+                            except Exception:
+                                pass
+                        delattr(button, 'ctrl_release_hooks')
+                except Exception:
+                    pass
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+                try:
+                    messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+                except Exception:
+                    pass
+                return
+            # Prevent duplicates: other areas
+            for area in self.areas:
+                if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == key_name:
+                    try:
+                        if hasattr(button, 'keyboard_hook_temp'):
+                            keyboard.unhook(button.keyboard_hook_temp)
+                            delattr(button, 'keyboard_hook_temp')
+                        if hasattr(button, 'mouse_hook_temp'):
+                            mouse.unhook(button.mouse_hook_temp)
+                            delattr(button, 'mouse_hook_temp')
+                        if hasattr(button, 'shift_release_hooks'):
+                            for h in button.shift_release_hooks:
+                                try:
+                                    keyboard.unhook(h)
+                                except Exception:
+                                    pass
+                            delattr(button, 'shift_release_hooks')
+                        if hasattr(button, 'ctrl_release_hooks'):
+                            for h in button.ctrl_release_hooks:
+                                try:
+                                    keyboard.unhook(h)
+                                except Exception:
+                                    pass
+                            delattr(button, 'ctrl_release_hooks')
+                    except Exception:
+                        pass
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                    show_thinkr_warning(self, area_name)
+                    return
+            button.hotkey = key_name
+            # Determine which hotkey is being changed
+            hotkey_name = None
+            if area_frame is not None:
+                # This is an area hotkey - find the area name
+                for area in self.areas:
+                    if area[0] == area_frame:
+                        area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                        hotkey_name = f"Area: {area_name}"
+                        break
+            
+            if hotkey_name:
+                self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+            else:
+                self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
+            button.config(text=f"Set Hotkey: [ {'L-SHIFT' if side_label=='left' else 'R-SHIFT'} ]")
+            self.setup_hotkey(button, area_frame)
+            # Clean up temp hooks (keyboard/mouse/shift release hooks)
+            try:
+                if hasattr(button, 'keyboard_hook_temp'):
+                    keyboard.unhook(button.keyboard_hook_temp)
+                    delattr(button, 'keyboard_hook_temp')
+                if hasattr(button, 'mouse_hook_temp'):
+                    mouse.unhook(button.mouse_hook_temp)
+                    delattr(button, 'mouse_hook_temp')
+                if hasattr(button, 'shift_release_hooks'):
+                    for h in button.shift_release_hooks:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(button, 'shift_release_hooks')
+                if hasattr(button, 'ctrl_release_hooks'):
+                    for h in button.ctrl_release_hooks:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(button, 'ctrl_release_hooks')
+            except Exception:
+                pass
+            self.setting_hotkey = False
+            finish_hotkey_assignment()
+
+        try:
+            button.shift_release_hooks = [
+                keyboard.on_release_key('left shift', on_shift_release),
+                keyboard.on_release_key('right shift', on_shift_release),
+            ]
+        except Exception:
+            button.shift_release_hooks = []
+        
+        # Also listen for Ctrl key release to allow assigning bare CTRL reliably
+        def on_ctrl_release(_e):
+            if self._hotkey_assignment_cancelled or not self.setting_hotkey:
+                return
+            if combo_state.get('non_modifier_pressed'):
+                return
+            # Determine which ctrl key was released using scan code for reliability
+            side_label = 'left'
+            try:
+                scan_code = getattr(_e, 'scan_code', None)
+                if scan_code == 157:  # Right Ctrl scan code
+                    side_label = 'right'
+                elif scan_code == 29:  # Left Ctrl scan code
+                    side_label = 'left'
+                else:
+                    # Fallback to event name if scan code is not available
+                    raw = (getattr(_e, 'name', '') or '').lower()
+                    if 'right' in raw or 'right ctrl' in raw:
+                        side_label = 'right'
+            except Exception:
+                pass
+            # Assign bare CTRL (no longer sided)
+            key_name = "ctrl"
+            # Prevent duplicates: Stop hotkey
+            if getattr(self, 'stop_hotkey', None) == key_name:
+                # Cleanup temp hooks and end assignment with warning
+                try:
+                    if hasattr(button, 'keyboard_hook_temp'):
+                        keyboard.unhook(button.keyboard_hook_temp)
+                        delattr(button, 'keyboard_hook_temp')
+                    if hasattr(button, 'mouse_hook_temp'):
+                        mouse.unhook(button.mouse_hook_temp)
+                        delattr(button, 'mouse_hook_temp')
+                    if hasattr(button, 'ctrl_release_hooks'):
+                        for h in button.ctrl_release_hooks:
+                            try:
+                                keyboard.unhook(h)
+                            except Exception:
+                                pass
+                        delattr(button, 'ctrl_release_hooks')
+                except Exception:
+                    pass
+                self.setting_hotkey = False
+                finish_hotkey_assignment()
+                try:
+                    messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+                except Exception:
+                    pass
+                return
+            # Prevent duplicates: other areas
+            for area in self.areas:
+                if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == key_name:
+                    try:
+                        if hasattr(button, 'keyboard_hook_temp'):
+                            keyboard.unhook(button.keyboard_hook_temp)
+                            delattr(button, 'keyboard_hook_temp')
+                        if hasattr(button, 'mouse_hook_temp'):
+                            mouse.unhook(button.mouse_hook_temp)
+                            delattr(button, 'mouse_hook_temp')
+                        if hasattr(button, 'ctrl_release_hooks'):
+                            for h in button.ctrl_release_hooks:
+                                try:
+                                    keyboard.unhook(h)
+                                except Exception:
+                                    pass
+                            delattr(button, 'ctrl_release_hooks')
+                    except Exception:
+                        pass
+                    self.setting_hotkey = False
+                    finish_hotkey_assignment()
+                    area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                    show_thinkr_warning(self, area_name)
+                    return
+            button.hotkey = key_name
+            # Determine which hotkey is being changed
+            hotkey_name = None
+            if area_frame is not None:
+                # This is an area hotkey - find the area name
+                for area in self.areas:
+                    if area[0] == area_frame:
+                        area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                        hotkey_name = f"Area: {area_name}"
+                        break
+            
+            if hotkey_name:
+                self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+            else:
+                self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
+            button.config(text=f"Set Hotkey: [ CTRL ]")
+            self.setup_hotkey(button, area_frame)
+            # Clean up temp hooks (keyboard/mouse/ctrl release hooks)
+            try:
+                if hasattr(button, 'keyboard_hook_temp'):
+                    keyboard.unhook(button.keyboard_hook_temp)
+                    delattr(button, 'keyboard_hook_temp')
+                if hasattr(button, 'mouse_hook_temp'):
+                    mouse.unhook(button.mouse_hook_temp)
+                    delattr(button, 'mouse_hook_temp')
+                if hasattr(button, 'ctrl_release_hooks'):
+                    for h in button.ctrl_release_hooks:
+                        try:
+                            keyboard.unhook(h)
+                        except Exception:
+                            pass
+                    delattr(button, 'ctrl_release_hooks')
+            except Exception:
+                pass
+            # Don't call restore_all_hotkeys - we just registered the hotkey
+            try:
+                self.stop_speaking()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
+                    self.root.after_cancel(self._hotkey_preview_job)
+                    self._hotkey_preview_job = None
+            except Exception:
+                pass
+            self.setting_hotkey = False
+        
+        try:
+            button.ctrl_release_hooks = [
+                keyboard.on_release_key('ctrl', on_ctrl_release),
+            ]
+        except Exception:
+            button.ctrl_release_hooks = []
+        
+        # Set 4-second timeout for hotkey setting
+        def unhook_mouse():
+            try:
+                # Safely clean up mouse hook
+                if hasattr(button, 'mouse_hook_temp') and button.mouse_hook_temp is not None:
+                    try:
+                        # Best-effort unhook if possible
+                        try:
+                            mouse.unhook(button.mouse_hook_temp)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"Warning: Error unhooking mouse: {e}")
+                    finally:
+                        # Always clean up the attribute to prevent memory leaks
+                        if hasattr(button, 'mouse_hook_temp'):
+                            delattr(button, 'mouse_hook_temp')
+                
+                # Safely clean up keyboard hook
+                if hasattr(button, 'keyboard_hook_temp') and button.keyboard_hook_temp is not None:
+                    try:
+                        # Check if the hook is still active before trying to remove it
+                        if hasattr(keyboard, '_listener') and hasattr(keyboard._listener, 'running') and keyboard._listener.running:
+                            keyboard.unhook(button.keyboard_hook_temp)
+                    except Exception as e:
+                        print(f"Warning: Error unhooking keyboard: {e}")
+                    finally:
+                        # Always clean up the attribute to prevent memory leaks
+                        if hasattr(button, 'keyboard_hook_temp'):
+                            delattr(button, 'keyboard_hook_temp')
+                # Clean up shift release hooks
+                if hasattr(button, 'shift_release_hooks'):
+                    try:
+                        for h in button.shift_release_hooks:
+                            try:
+                                keyboard.unhook(h)
+                            except Exception:
+                                pass
+                    finally:
+                        delattr(button, 'shift_release_hooks')
+                
+                # Clean up ctrl release hooks
+                if hasattr(button, 'ctrl_release_hooks'):
+                    try:
+                        for h in button.ctrl_release_hooks:
+                            try:
+                                keyboard.unhook(h)
+                            except Exception:
+                                pass
+                    finally:
+                        delattr(button, 'ctrl_release_hooks')
+                
+                self.setting_hotkey = False
+                self._hotkey_assignment_cancelled = True
+                if not hasattr(button, 'hotkey') or not button.hotkey:
+                    button.config(text="Set Hotkey")
+                else:
+                    # Restore the previous hotkey display
+                    display_name = self._hotkey_to_display_name(button.hotkey)
+                    button.config(text=f"Set Hotkey: [ {display_name} ]")
+                # Restore all hotkeys when timer expires
+                finish_hotkey_assignment()
+            except Exception as e:
+                print(f"Warning: Error during hook cleanup: {e}")
+                if not hasattr(button, 'hotkey') or not button.hotkey:
+                    button.config(text="Set Hotkey")
+                else:
+                    # Restore the previous hotkey display
+                    display_name = self._hotkey_to_display_name(button.hotkey)
+                    button.config(text=f"Set Hotkey: [ {display_name} ]")
+                # Restore all hotkeys even if there was an error
+                try:
+                    finish_hotkey_assignment()
+                except Exception:
+                    pass
+        self.root.after(4000, unhook_mouse)
+
+    def _start_controller_hotkey_monitoring(self, button, area_frame, finish_hotkey_assignment):
+        """Start monitoring controller input for hotkey assignment"""
+        if not CONTROLLER_AVAILABLE:
+            return
+            
+        def monitor_controller():
+            try:
+                button_name = self.controller_handler.wait_for_button_press(timeout=15)
+                if button_name and not self._hotkey_assignment_cancelled:
+                    key_name = f"controller_{button_name}"
+                    
+                    # Check if this controller button is already used by any area
+                    for area in self.areas:
+                        if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == key_name:
+                            show_thinkr_warning(self, area[3].get())
+                            self._hotkey_assignment_cancelled = True
+                            finish_hotkey_assignment()
+                            return
+                    
+                    # Check if it conflicts with stop hotkey
+                    if getattr(self, 'stop_hotkey', None) == key_name:
+                        messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
+                        self._hotkey_assignment_cancelled = True
+                        finish_hotkey_assignment()
+                        return
+                    
+                    # Set the hotkey
+                    button.hotkey = key_name
+                    # Determine which hotkey is being changed
+                    hotkey_name = None
+                    if area_frame is not None:
+                        # This is an area hotkey - find the area name
+                        for area in self.areas:
+                            if area[0] == area_frame:
+                                area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                                hotkey_name = f"Area: {area_name}"
+                                break
+                    
+                    if hotkey_name:
+                        self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+                    else:
+                        self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
+                    button.config(text=f"Hotkey: [ Controller {button_name} ]")
+                    self.setup_hotkey(button, area_frame)
+                    print(f"Set hotkey: {key_name}\n--------------------------")
+                    
+                    # Mark assignment as cancelled immediately so the button can be used right away
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    
+                    finish_hotkey_assignment()
+                else:
+                    # Timeout or cancelled - do nothing, let keyboard/mouse handle it
+                    pass
+            except Exception as e:
+                print(f"Error in controller monitoring: {e}")
+                # Don't call finish_hotkey_assignment here, let keyboard/mouse handle it
+        
+        # Start controller monitoring in background
+        threading.Thread(target=monitor_controller, daemon=True).start()
+
+    def _start_controller_stop_hotkey_monitoring(self, finish_hotkey_assignment):
+        """Start monitoring controller input for stop hotkey assignment"""
+        if not CONTROLLER_AVAILABLE:
+            return
+            
+        def monitor_controller():
+            try:
+                button_name = self.controller_handler.wait_for_button_press(timeout=15)
+                if button_name and not self._hotkey_assignment_cancelled:
+                    key_name = f"controller_{button_name}"
+                    
+                    # Check if this controller button is already used by any area
+                    for area in self.areas:
+                        area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                        if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == key_name:
+                            show_thinkr_warning(self, area_name_var.get())
+                            self._hotkey_assignment_cancelled = True
+                            finish_hotkey_assignment()
+                            return
+                    
+                    # Remove existing stop hotkey if it exists
+                    if hasattr(self, 'stop_hotkey'):
+                        try:
+                            if hasattr(self.stop_hotkey_button, 'mock_button'):
+                                self._cleanup_hooks(self.stop_hotkey_button.mock_button)
+                        except Exception as e:
+                            print(f"Error cleaning up stop hotkey hooks: {e}")
+                    
+                    self.stop_hotkey = key_name
+                    self._set_unsaved_changes('hotkey_changed', 'Stop Hotkey')  # Mark as unsaved when stop hotkey changes
+                    # Save to settings file (APP_SETTINGS_PATH)
+                    self._save_stop_hotkey(key_name)
+                    
+                    # Create a mock button object to use with setup_hotkey
+                    mock_button = type('MockButton', (), {'hotkey': key_name, 'is_stop_button': True})
+                    self.stop_hotkey_button.mock_button = mock_button
+                    
+                    # Setup the hotkey
+                    self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
+                    
+                    display_name = f"Controller {button_name}"
+                    self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name.upper()} ]")
+                    print(f"Set Stop hotkey: {key_name}\n--------------------------")
+                    
+                    # Mark assignment as cancelled immediately so the button can be used right away
+                    self._hotkey_assignment_cancelled = True
+                    self.setting_hotkey = False
+                    
+                    finish_hotkey_assignment()
+                    # Expand window width if needed for longer hotkey text
+                    self.root.after(100, self._ensure_window_width)
+                else:
+                    # Timeout or cancelled - do nothing, let keyboard/mouse handle it
+                    pass
+            except Exception as e:
+                print(f"Error in controller monitoring: {e}")
+                # Don't call finish_hotkey_assignment here, let keyboard/mouse handle it
+        
+        # Start controller monitoring in background
+        threading.Thread(target=monitor_controller, daemon=True).start()
+
+
+
+    def _check_controller_hotkeys(self, button_name):
+        """Check if a controller button press should trigger any hotkeys"""
+        # Check if input is allowed (centralized check for all input types)
+        if not InputManager.is_allowed():
+            return
+        
+        try:
+            # Check area hotkeys
+            for area in self.areas:
+                area_frame, hotkey_button, _, area_name_var, _, _, _, _, _ = area[:9] if len(area) >= 9 else area[:8] + (None,)
+                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey is not None and hotkey_button.hotkey.startswith('controller_'):
+                    controller_button = hotkey_button.hotkey.replace('controller_', '')
+                    if controller_button == button_name:
+                        print(f"Controller hotkey triggered for area: {area_name_var.get()}")
+                        # Trigger the hotkey action
+                        if hasattr(hotkey_button, 'controller_hook'):
+                            hotkey_button.controller_hook()
+                        break
+            
+            # Check stop hotkey
+            if hasattr(self, 'stop_hotkey') and self.stop_hotkey is not None and self.stop_hotkey.startswith('controller_'):
+                controller_button = self.stop_hotkey.replace('controller_', '')
+                if controller_button == button_name:
+                    print(f"Controller stop hotkey triggered")
+                    self.stop_speaking()
+            
+            # Check pause hotkey
+            if hasattr(self, 'pause_hotkey') and self.pause_hotkey is not None and self.pause_hotkey.startswith('controller_'):
+                controller_button = self.pause_hotkey.replace('controller_', '')
+                if controller_button == button_name:
+                    print(f"Controller pause hotkey triggered")
+                    self.toggle_pause_resume()
+                    
+        except Exception as e:
+            print(f"Error checking controller hotkeys: {e}")
+
+    def _save_automations_to_layout(self, layout, file_path, prompt_user=True):
+        """Helper function to save automations data and images to layout
+        
+        Args:
+            layout: The layout dictionary to add automations to
+            file_path: Path to the layout file (used for image folder path)
+            prompt_user: If True, prompt user about folder creation. If False, silently create.
+        """
+        # Check if automations window exists and is valid
+        window_exists = False
+        automation_window = None
+        
+        if hasattr(self, '_automations_window') and self._automations_window:
+            try:
+                # Check if window still exists (not destroyed)
+                if hasattr(self._automations_window, 'window') and self._automations_window.window.winfo_exists():
+                    window_exists = True
+                    automation_window = self._automations_window
+                # Fallback: if we can access automations list, try to save anyway
+                # (window might be in a transitional state but data is still valid)
+                elif hasattr(self._automations_window, 'automations'):
+                    # Try to access the automations list to verify it's valid
+                    try:
+                        _ = len(self._automations_window.automations)
+                        window_exists = True
+                        automation_window = self._automations_window
+                        print("Warning: Automations window state unclear, but automations data accessible - attempting to save")
+                    except:
+                        pass
+            except Exception as e:
+                # Window reference is invalid
+                print(f"Warning: Could not validate automations window: {e}")
+                pass
+        
+        # If window doesn't exist, preserve existing automations from layout file
+        if not window_exists:
+            # Try to preserve existing automations from the target file (if it exists)
+            # or from the currently loaded layout file (if saving to a new file)
+            files_to_try = []
+            if file_path and os.path.exists(file_path):
+                files_to_try.append(file_path)
+            # Also try the currently loaded layout file (if different from target)
+            current_layout_file = getattr(self, 'layout_file', None)
+            if current_layout_file:
+                current_file = current_layout_file.get() if hasattr(current_layout_file, 'get') else current_layout_file
+                if current_file and os.path.exists(current_file) and current_file != file_path:
+                    files_to_try.append(current_file)
+            
+            # Try each file in order
+            for file_to_try in files_to_try:
+                try:
+                    with open(file_to_try, 'r', encoding='utf-8') as f:
+                        existing_layout = json.load(f)
+                        existing_automations = existing_layout.get("automations")
+                        if existing_automations:
+                            # Preserve existing automations data
+                            layout["automations"] = existing_automations
+                            print(f"Automations window closed - preserving existing automations from layout file: {os.path.basename(file_to_try)}")
+                            return
+                except Exception as e:
+                    print(f"Warning: Could not read layout file to preserve automations ({file_to_try}): {e}")
+                    continue
+            
+            # No existing automations to preserve - set empty arrays
+            layout["automations"] = {"detection_areas": [], "hotkey_combos": []}
+            return
+        
+        # Window exists and is valid - save current automations
+        layout["automations"] = {
+            "detection_areas": [],
+            "hotkey_combos": [],
+            "top_level_settings": {}
+        }
+        
+        # Save top-level settings (freeze screen and hotkey)
+        top_level_settings = {}
+        if hasattr(automation_window, 'freeze_screen_var'):
+            top_level_settings['freeze_screen'] = automation_window.freeze_screen_var.get()
+        if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+            if hasattr(automation_window.set_hotkey_button, 'hotkey') and automation_window.set_hotkey_button.hotkey:
+                top_level_settings['detection_area_hotkey'] = automation_window.set_hotkey_button.hotkey
+        layout["automations"]["top_level_settings"] = top_level_settings
+        
+        print(f"Saving automations: {len(automation_window.automations)} detection areas, {len(automation_window.hotkey_combos)} hotkey combos")
+        
+        # Save detection areas
+        for automation in automation_window.automations:
+            coords = automation.get('image_area_coords')
+            print(f"Saving automation '{automation['name']}':")
+            print(f"  - image_area_coords: {coords}")
+            print(f"  - reference_image exists: {automation.get('reference_image') is not None}")
+            
+            automation_data = {
+                "id": automation['id'],
+                "name": automation['name'],
+                "image_area_coords": coords,
+                "hotkey": automation.get('hotkey'),
+                "match_percent": automation['match_percent'].get() if hasattr(automation['match_percent'], 'get') else automation.get('match_percent', 80.0),
+                "comparison_method": automation['comparison_method'].get() if hasattr(automation['comparison_method'], 'get') else automation.get('comparison_method', 'SSIM'),
+                "target_read_area": automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else automation.get('target_read_area', ''),
+                "only_read_if_text": automation['only_read_if_text'].get() if hasattr(automation['only_read_if_text'], 'get') else automation.get('only_read_if_text', False),
+                "read_after_ms": automation['read_after_ms'].get() if hasattr(automation['read_after_ms'], 'get') else automation.get('read_after_ms', 0)
+            }
+            layout["automations"]["detection_areas"].append(automation_data)
+        
+        # Save hotkey combos
+        for combo in automation_window.hotkey_combos:
+            # Convert areas to serializable format (extract values from StringVar and IntVar)
+            areas_data = []
+            for area_entry in combo.get('areas', []):
+                area_name = area_entry['area_name'].get() if hasattr(area_entry['area_name'], 'get') else area_entry.get('area_name', '')
+                timer_ms = area_entry['timer_ms'].get() if hasattr(area_entry['timer_ms'], 'get') else area_entry.get('timer_ms', 0)
+                areas_data.append({
+                    'area_name': area_name,
+                    'timer_ms': timer_ms
+                })
+            
+            combo_data = {
+                "id": combo['id'],
+                "name": combo['name'],
+                "hotkey": combo.get('hotkey'),
+                "areas": areas_data
+            }
+            layout["automations"]["hotkey_combos"].append(combo_data)
+        
+        # Save images if file_path is provided
+        if file_path and automation_window.automations:
+            # Get layout name (filename without extension)
+            layout_name = os.path.splitext(os.path.basename(file_path))[0]
+            
+            # Create detection images folder path
+            detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
+            
+            # Check if folder needs to be created
+            if not os.path.exists(detection_images_dir):
+                if prompt_user:
+                    # Prompt user about folder creation
+                    response = messagebox.askyesno(
+                        "Create Detection Images Folder",
+                        f"The detection images folder will be created at:\n{detection_images_dir}\n\n"
+                        f"This folder will store reference images for detection areas.\n\n"
+                        f"Create this folder now?",
+                        icon='question'
+                    )
+                    if not response:
+                        print("User cancelled detection images folder creation")
+                        return
+                else:
+                    # Auto-save: silently create folder
+                    print(f"Auto-creating detection images folder: {detection_images_dir}")
+            
+            # Create the folder if it doesn't exist
+            os.makedirs(detection_images_dir, exist_ok=True)
+            
+            # Save reference images for each automation
+            for automation in automation_window.automations:
+                if automation.get('reference_image') is not None:
+                    # Use the automation name as filename (sanitize for filesystem)
+                    safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
+                    image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
+                    try:
+                        automation['reference_image'].save(image_path, 'PNG')
+                        print(f"Saved detection image: {image_path}")
+                    except Exception as e:
+                        print(f"Error saving detection image for {automation['name']}: {e}")
+
+    def _load_automations_from_layout(self, layout, file_path):
+        """Helper function to load automations data and images from layout
+        
+        Args:
+            layout: The layout dictionary containing automations data
+            file_path: Path to the layout file (used for image folder path)
+        """
+        # Check if automations data exists in layout
+        automations_data = layout.get("automations")
+        if not automations_data:
+            # No automations in layout, clear existing automations if window exists
+            if hasattr(self, '_automations_window') and self._automations_window:
+                automation_window = self._automations_window
+                try:
+                    # Check if window still exists
+                    if automation_window.window.winfo_exists():
+                        automation_window.automations = []
+                        automation_window.hotkey_combos = []
+                        # Clear UI - use try/except to handle any widget access errors
+                        try:
+                            scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
+                            if scrollable_frame:
+                                # Get children list first to avoid modification during iteration
+                                children = list(scrollable_frame.winfo_children())
+                                for widget in children:
+                                    try:
+                                        widget.destroy()
+                                    except:
+                                        pass  # Widget may already be destroyed
+                        except Exception as e:
+                            print(f"Error clearing automations UI: {e}")
+                except:
+                    pass  # Window may have been destroyed
+            return
+        
+        # Load automations even if window is not open - this ensures hotkeys work on startup
+        # If window doesn't exist, create a minimal instance just for data storage and hotkey registration
+        if not hasattr(self, '_automations_window') or not self._automations_window:
+            # Create automations window instance (but don't show it) so we can load automations and register hotkeys
+            print("Automations window not open - creating instance to load automations and register hotkeys")
+            from gametextreader.windows.automations_window import AutomationsWindow
+            self._automations_window = AutomationsWindow(self.root, self)
+            # Hide the window immediately so it's not visible
+            self._automations_window.window.withdraw()
+            print("Automations window created (hidden) for hotkey registration")
+        
+        automation_window = self._automations_window
+        
+        # Check if window still exists
+        try:
+            if not automation_window.window.winfo_exists():
+                print("Automations window was destroyed - cannot load automations")
+                return
+        except:
+            print("Automations window is invalid - cannot load automations")
+            return
+        
+        # Load top-level settings (freeze screen and hotkey) from layout file
+        top_level_settings = automations_data.get("top_level_settings", {})
+        if top_level_settings:
+            # Restore freeze screen checkbox
+            if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
+                automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
+                print(f"Restored freeze screen setting: {top_level_settings['freeze_screen']}")
+            
+            # Restore detection area hotkey
+            if 'detection_area_hotkey' in top_level_settings:
+                detection_hotkey = top_level_settings['detection_area_hotkey']
+                print(f"Restoring detection area hotkey: {detection_hotkey}")
+                
+                # Create a temporary frame for compatibility with hotkey system
+                temp_frame = tk.Frame()
+                temp_frame._is_automation_area_hotkey = True
+                temp_frame._automation_window = automation_window
+                
+                # Create callback for when hotkey is pressed
+                def hotkey_callback():
+                    if hasattr(automation_window.game_text_reader, 'area_selection_in_progress') and automation_window.game_text_reader.area_selection_in_progress:
+                        return
+                    automation_window.start_area_selection_for_automations()
+                    if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                        automation_window.set_hotkey_button._automation_callback = hotkey_callback
+                
+                # Store callback on button
+                if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                    automation_window.set_hotkey_button.hotkey = detection_hotkey
+                    automation_window.set_hotkey_button._automation_callback = hotkey_callback
+                    automation_window.set_hotkey_button._automation_temp_frame = temp_frame
+                    automation_window._area_selection_hotkey_callback = hotkey_callback
+                    automation_window._area_selection_hotkey_button = automation_window.set_hotkey_button
+                    
+                    # Update button display
+                    display_name = detection_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    automation_window.set_hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                    
+                    # Register the hotkey
+                    try:
+                        self.setup_hotkey(automation_window.set_hotkey_button, None)
+                        print(f"✓ Successfully restored detection area hotkey: {detection_hotkey}")
+                    except Exception as e:
+                        print(f"✗ Error registering detection area hotkey: {e}")
+        
+        # Clear existing automations
+        automation_window.automations = []
+        automation_window.hotkey_combos = []
+        
+        # Clear UI - use try/except to handle any widget access errors
+        try:
+            scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
+            if scrollable_frame:
+                # Get children list first to avoid modification during iteration
+                children = list(scrollable_frame.winfo_children())
+                for widget in children:
+                    try:
+                        widget.destroy()
+                    except:
+                        pass  # Widget may already be destroyed
+        except Exception as e:
+            print(f"Error clearing automations UI: {e}")
+            # Continue anyway - we'll recreate the UI
+        
+        # Load detection areas
+        detection_areas = automations_data.get("detection_areas", [])
+        for area_data in detection_areas:
+            # Get coordinates from saved data
+            saved_coords = area_data.get('image_area_coords')
+            print(f"Loading automation '{area_data.get('name', 'Unknown')}':")
+            print(f"  - Saved coords in JSON: {saved_coords}")
+            print(f"  - Coords type: {type(saved_coords)}")
+            
+            # Create automation with saved data
+            automation = {
+                'id': area_data.get('id', len(automation_window.automations)),
+                'name': area_data.get('name', f"Detection Area: {chr(65 + len(automation_window.automations))}"),
+                'image_area_coords': saved_coords,  # Load coordinates from saved data
+                'reference_image': None,  # Will load from file
+                'hotkey': area_data.get('hotkey'),
+                'hotkey_button': None,
+                'match_percent': tk.DoubleVar(value=area_data.get('match_percent', 80.0)),
+                'comparison_method': tk.StringVar(value=area_data.get('comparison_method', 'SSIM')),
+                'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
+                'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
+                'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
+                'timer_active': False,
+                'timer_start_time': None,
+                'was_matching': False,
+                'has_triggered': False,
+                'frame': None
+            }
+            
+            # Load reference image from file
+            if file_path:
+                layout_name = os.path.splitext(os.path.basename(file_path))[0]
+                detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
+                safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
+                image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
+                
+                print(f"Loading automation '{automation['name']}':")
+                print(f"  - Image path: {image_path}")
+                print(f"  - Image exists: {os.path.exists(image_path)}")
+                print(f"  - Has coords: {automation.get('image_area_coords') is not None}")
+                
+                if os.path.exists(image_path):
+                    try:
+                        automation['reference_image'] = Image.open(image_path).copy()
+                        print(f"  ✓ Loaded detection image: {image_path}")
+                    except Exception as e:
+                        print(f"  ✗ Error loading detection image: {e}")
+                else:
+                    print(f"  ✗ Image file not found: {image_path}")
+            
+            # Debug: Check what was loaded
+            target_area_value = automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else str(automation['target_read_area'])
+            print(f"  - Target read area: '{target_area_value}'")
+            print(f"  - Has reference_image: {automation.get('reference_image') is not None}")
+            print(f"  - Has image_area_coords: {automation.get('image_area_coords') is not None}")
+            
+            automation_window.automations.append(automation)
+            automation_window.create_automation_ui(automation)
+            
+            # Update preview if image was loaded
+            if automation.get('reference_image'):
+                automation_window.update_preview(automation, automation['reference_image'])
+            
+            # Set up hotkey if it exists
+            if automation.get('hotkey'):
+                print(f"  - Setting up hotkey: {automation['hotkey']}")
+                automation_window.update_hotkey_display(automation)
+                # Register the hotkey so it actually works
+                # Create a temporary frame for compatibility with hotkey system
+                temp_frame = tk.Frame()
+                temp_frame._is_automation_hotkey = True
+                temp_frame._automation_ref = automation
+                temp_frame._automation_window = automation_window
+                
+                # Create callback for when hotkey is pressed
+                def hotkey_callback():
+                    # When hotkey is pressed, trigger area selection for this specific automation
+                    print(f"AUTOMATION: Hotkey pressed for {automation['name']}, triggering area selection")
+                    # Use the same approach as set_automation_hotkey - trigger area selection
+                    # This will allow the user to set/update the image area for this automation
+                    automation_window.start_area_selection_for_automations()
+                
+                # Store callback in automation
+                automation['hotkey_callback'] = hotkey_callback
+                
+                # Store callback in registry for persistence (works even when window is closed)
+                if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
+                    automation_window.automation_callbacks_by_hotkey[automation['hotkey']] = hotkey_callback
+                    print(f"  - Stored automation callback in registry for hotkey '{automation['hotkey']}'")
+                    print(f"  - Registry now has {len(automation_window.automation_callbacks_by_hotkey)} automation callback(s)")
+                    print(f"  - Registry keys: {list(automation_window.automation_callbacks_by_hotkey.keys())}")
+                else:
+                    print(f"  - WARNING: automation_window does not have automation_callbacks_by_hotkey attribute!")
+                
+                # Create a mock button for hotkey registration (automations don't have hotkey buttons in UI)
+                # We'll use a simple object to hold the hotkey
+                class MockHotkeyButton:
+                    def __init__(self, hotkey):
+                        self.hotkey = hotkey
+                        self._automation_callback = hotkey_callback
+                        self._automation_temp_frame = temp_frame
+                        self._automation_ref = automation
+                
+                mock_button = MockHotkeyButton(automation['hotkey'])
+                automation['hotkey_button'] = mock_button
+                
+                # Register the hotkey
+                try:
+                    print(f"  - Calling setup_hotkey for {automation['hotkey']}...")
+                    self.setup_hotkey(mock_button, None)
+                    print(f"  ✓ Successfully registered automation hotkey: {automation['hotkey']} for {automation['name']}")
+                except Exception as e:
+                    print(f"  ✗ Error registering automation hotkey for {automation['name']}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"  - No hotkey for this automation")
+        
+        # Load hotkey combos
+        hotkey_combos = automations_data.get("hotkey_combos", [])
+        for combo_data in hotkey_combos:
+            combo = {
+                'id': combo_data.get('id', len(automation_window.hotkey_combos)),
+                'name': combo_data.get('name', f"Area Combo: {chr(65 + len(automation_window.hotkey_combos))}"),
+                'hotkey': combo_data.get('hotkey'),
+                'areas': combo_data.get('areas', []),
+                'frame': None,
+                'is_triggering': False,
+                'current_area_index': 0
+            }
+            
+            automation_window.hotkey_combos.append(combo)
+            automation_window.create_hotkey_combo_ui(combo)
+            
+            # Restore areas for the combo
+            if combo.get('areas'):
+                # Clear the areas list since create_hotkey_combo_ui might have initialized it
+                combo['areas'] = []
+                for saved_area_entry in combo_data.get('areas', []):
+                    # Add area to combo (this creates a new entry)
+                    automation_window.add_area_to_combo(combo)
+                    # Get the last added entry and set its values
+                    if combo['areas']:
+                        area_entry = combo['areas'][-1]
+                        area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
+                        area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
+            
+            # Set hotkey if it exists
+            if combo.get('hotkey'):
+                # Find the hotkey button and set it up
+                hotkey_button = combo.get('hotkey_button')
+                if hotkey_button:
+                    hotkey_button.hotkey = combo['hotkey']
+                    # Update button display
+                    display_name = combo['hotkey'].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                    # Set up the hotkey through the game_text_reader
+                    # Create a temporary frame for compatibility
+                    temp_frame = tk.Frame()
+                    temp_frame._is_hotkey_combo = True
+                    temp_frame._combo_ref = combo
+                    temp_frame._combo_window = automation_window
+                    hotkey_button._combo_temp_frame = temp_frame
+                    # Set up the hotkey callback
+                    def hotkey_callback():
+                        automation_window.trigger_hotkey_combo(combo)
+                    hotkey_button._combo_callback = hotkey_callback
+                    # Register the callback in the registry
+                    automation_window.combo_callbacks_by_hotkey[combo['hotkey']] = hotkey_callback
+                    # Set up the hotkey
+                    self.setup_hotkey(hotkey_button, None)
+        
+        # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
+        if automation_window:
+            automation_window._has_unsaved_changes = False
+        
+        print(f"Loaded {len(detection_areas)} detection areas and {len(hotkey_combos)} hotkey combos from layout")
+
+    def save_layout(self):
+        # Check if there are no areas
+        if not self.areas:
+            messagebox.showerror("Error", "There is nothing to save.")
+            return
+
+        # Check if all areas have coordinates set, but ignore Auto Read
+        for area_frame, _, _, area_name_var, _, _, _, _, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                continue
+            if not hasattr(area_frame, 'area_coords'):
+                messagebox.showerror("Error", f"Area '{area_name}' does not have a defined area, remove it or configure before saving.")
+                return
+
+        # Build layout in the specified order:
+        # 1. Program Volume
+        # 2. Ignore Word list
+        # 3. The different checkboxes
+        # 4. Stop Hotkey
+        # 5. Auto Read areas including Stop Read on new select
+        # 6. Read Areas
+        # 7. Automations
+        
+        layout = {
+            "version": APP_VERSION,
+            "volume": self.volume.get(),  # 1. Program Volume
+            "bad_word_list": self.bad_word_list.get(),  # 2. Ignore Word list
+            # 3. The different checkboxes
+            "ignore_usernames": self.ignore_usernames_var.get(),
+            "ignore_previous": self.ignore_previous_var.get(),
+            "ignore_gibberish": self.ignore_gibberish_var.get(),
+            "pause_at_punctuation": self.pause_at_punctuation_var.get(),
+            "better_unit_detection": self.better_unit_detection_var.get(),
+            "read_game_units": self.read_game_units_var.get(),
+            "fullscreen_mode": self.fullscreen_mode_var.get(),
+            "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
+            "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "stop_hotkey": self.stop_hotkey,  # 4. Stop Hotkey
+            "pause_hotkey": self.pause_hotkey,  # 4b. Pause/Play Hotkey
+            "edit_area_hotkey": self.edit_area_hotkey,  # 4c. Edit Area Hotkey
+            "repeat_latest_hotkey": self.repeat_latest_hotkey,  # 4d. Repeat Latest Hotkey
+            "edit_area_screenshot_bg": self.edit_area_screenshot_bg,  # 4e. Freeze screen when editor opens
+            "edit_area_alpha": self.edit_area_alpha,  # 4f. Editor alpha level
+            # 5. Auto Read areas including Stop Read on new select
+            "auto_read_areas": {
+                "stop_read_on_select": getattr(self, 'interrupt_on_new_scan_var', tk.BooleanVar(value=True)).get(),
+                "areas": []
+            },
+            "areas": []  # 6. Read Areas
+        }
+        
+        # Collect Auto Read areas
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                # Save the full voice name, not the display name
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                auto_read_info = {
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "freeze_screen": freeze_screen_var.get() if freeze_screen_var and hasattr(freeze_screen_var, 'get') else False,
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                # Include coordinates if they exist
+                if hasattr(area_frame, 'area_coords'):
+                    auto_read_info["coords"] = area_frame.area_coords
+                layout["auto_read_areas"]["areas"].append(auto_read_info)
+        
+        # Collect regular Read Areas (non-Auto Read)
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, _ in self.areas:
+            area_name = area_name_var.get()
+            # Skip Auto Read areas
+            if area_name.startswith("Auto Read"):
+                continue
+                
+            if hasattr(area_frame, 'area_coords'):
+                # Save the full voice name, not the display name
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                area_info = {
+                    "coords": area_frame.area_coords,
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                layout["areas"].append(area_info)
+
+        # Get the current file path for the initial filename and directory
+        current_file = self.layout_file.get()
+        
+        # Use the directory of the currently loaded file, or fall back to default
+        if current_file and os.path.exists(os.path.dirname(current_file)):
+            initial_dir = os.path.dirname(current_file)
+            initial_file = os.path.basename(current_file)
+        else:
+            # Fall back to default app Layouts folder
+            default_dir = APP_LAYOUTS_DIR
+            os.makedirs(default_dir, exist_ok=True)
+            initial_dir = default_dir
+            initial_file = ""
+
+        # Show Save As dialog with the current file pre-selected
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialdir=initial_dir,
+            initialfile=initial_file
+        )
+
+        if not file_path:  # User cancelled
+            return
+
+        try:
+            # Save automations and images (this will add automations to layout dict)
+            self._save_automations_to_layout(layout, file_path)
+            
+            # Reset unsaved changes flag in automations window if it exists
+            if hasattr(self, '_automations_window') and self._automations_window:
+                self._automations_window._has_unsaved_changes = False
+            
+            # Save the layout
+            with open(file_path, 'w') as f:
+                json.dump(layout, f, indent=4)
+            
+            # Store the full path in layout_file
+            self.layout_file.set(file_path)
+            
+            # Reset unsaved changes flag AFTER successful save
+            self._has_unsaved_changes = False
+            # Reset change tracking
+            self._unsaved_changes = {
+                'added_areas': set(),
+                'removed_areas': set(),
+                'hotkey_changes': set(),
+                'additional_options': False,
+                'area_settings': set(),
+            }
+            
+            # Save the layout path to settings for auto-loading on next startup
+            self.save_last_layout_path(file_path)
+            
+            # Show feedback in status label
+            if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                self.root.after_cancel(self._feedback_timer)
+            
+            # Show save success message
+            self.status_label.config(text=f"Layout saved to: {os.path.basename(file_path)}", fg="black")
+            self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+            
+            print(f"Layout saved to {file_path}\n--------------------------")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save layout: {str(e)}")
+            print(f"Error saving layout: {e}")
+
+    def save_layout_auto(self):
+        """Auto-save layout to the current layout file without showing a dialog."""
+        # Check if there are no areas
+        if not self.areas:
+            return  # Silently return if nothing to save
+        
+        # Check if a layout file is loaded
+        current_file = self.layout_file.get()
+        if not current_file or not os.path.exists(current_file):
+            return  # No layout file loaded, silently return
+        
+        # Check if all areas have coordinates set, but ignore Auto Read
+        for area_frame, _, _, area_name_var, _, _, _, _, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                continue
+            if not hasattr(area_frame, 'area_coords'):
+                return  # Silently return if areas aren't configured
+        
+        # Build layout (same as save_layout)
+        layout = {
+            "version": APP_VERSION,
+            "volume": self.volume.get(),
+            "bad_word_list": self.bad_word_list.get(),
+            "ignore_usernames": self.ignore_usernames_var.get(),
+            "ignore_previous": self.ignore_previous_var.get(),
+            "ignore_gibberish": self.ignore_gibberish_var.get(),
+            "pause_at_punctuation": self.pause_at_punctuation_var.get(),
+            "better_unit_detection": self.better_unit_detection_var.get(),
+            "read_game_units": self.read_game_units_var.get(),
+            "fullscreen_mode": self.fullscreen_mode_var.get(),
+            "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
+            "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "stop_hotkey": self.stop_hotkey,
+            "pause_hotkey": self.pause_hotkey,
+            "edit_area_hotkey": self.edit_area_hotkey,  # 4c. Edit Area Hotkey
+            "repeat_latest_hotkey": self.repeat_latest_hotkey,  # 4d. Repeat Latest Hotkey
+            "edit_area_screenshot_bg": self.edit_area_screenshot_bg,  # 4e. Freeze screen when editor opens
+            "edit_area_alpha": self.edit_area_alpha,  # 4f. Editor alpha level
+            "auto_read_areas": {
+                "stop_read_on_select": getattr(self, 'interrupt_on_new_scan_var', tk.BooleanVar(value=True)).get(),
+                "areas": []
+            },
+            "areas": []
+        }
+        
+        # Collect Auto Read areas
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                auto_read_info = {
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "freeze_screen": freeze_screen_var.get() if freeze_screen_var and hasattr(freeze_screen_var, 'get') else False,
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                if hasattr(area_frame, 'area_coords'):
+                    auto_read_info["coords"] = area_frame.area_coords
+                layout["auto_read_areas"]["areas"].append(auto_read_info)
+        
+        # Collect regular Read Areas (non-Auto Read)
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                continue
+                
+            if hasattr(area_frame, 'area_coords'):
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                area_info = {
+                    "coords": area_frame.area_coords,
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                layout["areas"].append(area_info)
+        
+        try:
+            # Save automations and images (this will add automations to layout dict)
+            # For auto-save, don't prompt user about folder creation (silently create if needed)
+            self._save_automations_to_layout(layout, current_file, prompt_user=False)
+            
+            # Reset unsaved changes flag in automations window if it exists
+            if hasattr(self, '_automations_window') and self._automations_window:
+                self._automations_window._has_unsaved_changes = False
+            
+            # Save the layout directly to the current file
+            with open(current_file, 'w') as f:
+                json.dump(layout, f, indent=4)
+            
+            # Reset unsaved changes flag AFTER successful save
+            self._has_unsaved_changes = False
+            # Reset change tracking
+            self._unsaved_changes = {
+                'added_areas': set(),
+                'removed_areas': set(),
+                'hotkey_changes': set(),
+                'additional_options': False,
+                'area_settings': set(),
+            }
+            
+            # Show feedback in status label
+            if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                self.root.after_cancel(self._feedback_timer)
+            
+            # Show auto-save success message
+            self.status_label.config(text=f"Layout auto-saved: {os.path.basename(current_file)}", fg="green")
+            self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+            
+            print(f"Layout auto-saved to {current_file}\n--------------------------")
+        except Exception as e:
+            print(f"Error auto-saving layout: {e}")
+
+    def load_game_units(self):
+        """Load game units from JSON file in the app data directory."""
+        import tempfile, os, json, re
+        temp_path = APP_DOCUMENTS_DIR
+        os.makedirs(temp_path, exist_ok=True)
+        
+        file_path = os.path.join(temp_path, 'gamer_units.json')
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    # Remove comments from JSON file before parsing
+                    content = f.read()
+                    # Remove single-line comments (// ...)
+                    content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
+                    # Remove multi-line comments (/* ... */)
+                    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+                    # Parse the cleaned JSON
+                    return json.loads(content)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                print(f"Warning: Error reading game units file: {e}, using default units")
+        
+        # Create default game units if file doesn't exist or is invalid
+        default_units = {
+            'xp': 'Experience Points',
+            'hp': 'Health Points',
+            'mp': 'Mana Points',
+            'gp': 'Gold Pieces',
+            'pp': 'Platinum Pieces',
+            'sp': 'Skill Points',
+            'ep': 'Energy Points',
+            'ap': 'Action Points',
+            'bp': 'Battle Points',
+            'lp': 'Loyalty Points',
+            'cp': 'Challenge Points',
+            'vp': 'Victory Points',
+            'rp': 'Reputation Points',
+            'tp': 'Talent Points',
+            'ar': 'Armor Rating',
+            'dmg': 'Damage',
+            'dps': 'Damage Per Second',
+            'def': 'Defense',
+            'mat': 'Materials',
+            'exp': 'Exploration Points',
+            '§': 'Simoliance',
+            'v-bucks': 'Virtual Bucks',
+            'r$': 'Robux',
+            'nmt': 'Nook Miles Tickets',
+            'be': 'Blue Essence',
+            'radianite': 'Radianite Points',
+            'ow coins': 'Overwatch Coins',
+            '₽': 'PokeDollars',
+            '€$': 'Eurodollars',
+            'z': 'Zenny',
+            'l': 'Lunas',
+            'e': 'Eve',
+            'i': 'Isk',
+            'j': 'Jewel',
+            'sc': 'Star Coins',
+            'o2': 'Oxygen',
+            'pu': 'Power Units',
+            'mc': 'Mana Crystals',
+            'es': 'Essence',
+            'sh': 'Shards',
+            'st': 'Stars',
+            'mu': 'Munny',
+            'b': 'Bolts',
+            'r': 'Rings',
+            'ca': 'Caps',
+            'rns': 'Runes',
+            'sl': 'Souls',
+            'fav': 'Favor',
+            'am': 'Amber',
+            'cc': 'Crystal Cores',
+            'fg': 'Fragments'
+        }
+        
+        # Save default units to file
+        with open(file_path, 'w', encoding='utf-8') as f:
+            header = '''//  Game Units Configuration
+//  Format: "short_name": "Full Name"
+//  Example: "xp" will be read as "Experience Points"
+//  Enable "Read gamer units" in the main window to use this feature
+
+'''
+            f.write(header)
+            json.dump(default_units, f, indent=4, ensure_ascii=False)
+        
+        return default_units
+
+    def save_game_units(self):
+        """Save game units to JSON file in the app data directory."""
+        import tempfile, os, json
+        
+        temp_path = APP_DOCUMENTS_DIR
+        os.makedirs(temp_path, exist_ok=True)
+        
+        file_path = os.path.join(temp_path, 'game_units.json')
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                header = '''//  Game Units Configuration
+//  Format: "short_name": "Full Name"
+//  Example: "xp" will be read as "Experience Points"
+//  Enable "Read gamer units" in the main window to use this feature
+
+'''
+                f.write(header)
+                json.dump(self.game_units, f, indent=4, ensure_ascii=False)
+            print(f"Game units saved to: {file_path}")
+            
+            # Show feedback in status label
+            if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                self.root.after_cancel(self._feedback_timer)
+            
+            # Show load success message
+            self.status_label.config(text="Game units saved successfully!", fg="black")
+            self._feedback_timer = self.root.after(3000, lambda: self.status_label.config(text=""))
+            
+            return True
+        except Exception as e:
+            print(f"Error saving game units: {e}")
+            return False
+
+    def open_game_units_editor(self):
+        """Open the game units editor window."""
+        # Check if window already exists
+        if hasattr(self, '_game_units_editor') and self._game_units_editor and self._game_units_editor.window.winfo_exists():
+            # Bring existing window to front
+            self._game_units_editor.window.lift()
+            self._game_units_editor.window.focus_force()
+            return
+        
+        # Create new editor window
+        self._game_units_editor = GameUnitsEditWindow(self.root, self)
+    
+    def open_automations_window(self):
+        """Open the automations window."""
+        # Check if window already exists (even if hidden)
+        if hasattr(self, '_automations_window') and self._automations_window:
+            try:
+                if self._automations_window.window.winfo_exists():
+                    # Window exists - show it if it's hidden
+                    try:
+                        self._automations_window.window.deiconify()
+                    except:
+                        pass  # Window might already be visible
+                    # Bring existing window to front
+                    self._automations_window.window.lift()
+                    self._automations_window.window.focus_force()
+                    return
+            except:
+                # Window was destroyed, preserve polling state before creating new one
+                old_instance = self._automations_window
+                if old_instance:
+                    # Store polling state and thread info before old instance is replaced
+                    if hasattr(old_instance, 'polling_active'):
+                        self._automations_polling_active = old_instance.polling_active
+                    # Store reference to old instance temporarily so new instance can access it
+                    self._old_automations_window = old_instance
+                # Create a new one
+                pass
+        
+        # Create new automations window
+        self._automations_window = AutomationsWindow(self.root, self)
+        
+        # Clean up old instance reference after new instance is created
+        if hasattr(self, '_old_automations_window'):
+            delattr(self, '_old_automations_window')
+        
+        # If a layout is loaded, load automations from it
+        current_layout_file = self.layout_file.get()
+        if current_layout_file and os.path.exists(current_layout_file):
+            try:
+                with open(current_layout_file, 'r', encoding='utf-8') as f:
+                    layout = json.load(f)
+                # Load automations from the layout
+                self._load_automations_from_layout(layout, current_layout_file)
+            except Exception as e:
+                print(f"Error loading automations when opening window: {e}")
+    
+    def set_area_for_automation(self, frame, callback, freeze_screen=False):
+        """Set area for automation - uses area selection but doesn't trigger reading"""
+        print("=" * 60)
+        print("GAME_TEXT_READER: set_area_for_automation() called")
+        print(f"GAME_TEXT_READER: Frame: {frame}")
+        print(f"GAME_TEXT_READER: Callback: {callback}")
+        print(f"GAME_TEXT_READER: Freeze screen: {freeze_screen}")
+        
+        # Store callback and freeze screen setting in frame
+        frame._automation_callback = callback
+        frame._freeze_screen = freeze_screen
+        frame._is_automation = True  # Flag to skip reading
+        print(f"GAME_TEXT_READER: Stored attributes in frame:")
+        print(f"GAME_TEXT_READER: - _automation_callback: {hasattr(frame, '_automation_callback')}")
+        print(f"GAME_TEXT_READER: - _freeze_screen: {hasattr(frame, '_freeze_screen')}")
+        print(f"GAME_TEXT_READER: - _is_automation: {hasattr(frame, '_is_automation')}")
+        
+        # Create a temporary area_name_var for compatibility
+        temp_area_name_var = tk.StringVar(value="Automation Area")
+        print(f"GAME_TEXT_READER: Created temp_area_name_var: {temp_area_name_var.get()}")
+        
+        # Use set_auto_read_area but it will check the _is_automation flag
+        # We'll modify set_auto_read_area to skip reading for automation frames
+        print("GAME_TEXT_READER: Calling set_auto_read_area()...")
+        try:
+            self.set_auto_read_area(frame, temp_area_name_var, None)
+            print("GAME_TEXT_READER: set_auto_read_area() returned")
+        except Exception as e:
+            print(f"GAME_TEXT_READER: ERROR in set_auto_read_area(): {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        print("=" * 60)
+
+    def _on_game_units_editor_close(self):
+        """Handle closing of game units editor window."""
+        if hasattr(self, '_game_units_editor') and self._game_units_editor:
+            self._game_units_editor.window.destroy()
+            self._game_units_editor = None
+
+    def open_game_reader_folder(self):
+        """Open the app data folder in Windows Explorer."""
+        import os
+        import subprocess
+        
+        # Get the current username
+        username = os.getlogin()
+        # Construct the path to the app folder
+        folder_path = APP_DOCUMENTS_DIR
+        
+        # Create folder if it doesn't exist
+        os.makedirs(folder_path, exist_ok=True)
+        
+        # Open the folder in Windows Explorer
+        try:
+            subprocess.Popen(f'explorer "{folder_path}"')
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open folder: {str(e)}")
+
+    def normalize_text(self, text):
+        """Normalize text by removing punctuation and making it lowercase."""
+        import string
+        # Remove punctuation and make lowercase
+        text = text.lower()
+        text = text.translate(str.maketrans('', '', string.punctuation))
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        return text
+
+    def on_drop(self, event):
+        """Handle file drop event"""
+        try:
+            # Get the file path from the drop event
+            # On Windows, the path is wrapped in {}
+            file_path = event.data.strip('{}')
+            
+            # Clean up the path (remove quotes if present)
+            file_path = file_path.strip('\"\'')
+            
+            # Normalize the path (convert forward slashes to backslashes on Windows)
+            file_path = os.path.normpath(file_path)
+            
+            # Check if the file exists and is a JSON file
+            if not os.path.isfile(file_path) or not file_path.lower().endswith('.json'):
+                messagebox.showerror("Error", "Please drop a valid JSON layout file")
+                return
+            
+            # Check if we have a file already loaded
+            if self.layout_file.get():
+                # If it's the same file, just return
+                if os.path.normpath(self.layout_file.get()) == file_path:
+                    return
+                    
+                # If there are unsaved changes, show warning
+                if self._has_unsaved_changes:
+                    response = messagebox.askyesnocancel(
+                        "Unsaved Changes",
+                        f"You have unsaved changes in the current layout.\n\n"
+                        f"Current: {os.path.basename(self.layout_file.get())}\n"
+                        f"New: {os.path.basename(file_path)}\n\n"
+                        "Save changes before closing?\n"
+                    )
+                    if response is None:  # Cancel
+                        return
+                    elif response:  # Yes - Save and load
+                        self.save_layout()
+                else:
+                    # No unsaved changes, just confirm loading new file
+                    if not messagebox.askyesno(
+                        "Load New Layout",
+                        f"Load new layout file?\n\n"
+                        f"Current: {os.path.basename(self.layout_file.get())}\n"
+                        f"New: {os.path.basename(file_path)}"
+                    ):
+                        return  # User chose not to load the new file
+            
+            # Load the new layout
+            self._load_layout_file(file_path)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error handling dropped file: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def load_layout(self, file_path=None):
+        """Show file dialog to load a layout file"""
+        if not file_path:
+            # Get the default directory (app Layouts folder)
+            import tempfile
+            default_dir = APP_LAYOUTS_DIR
+            os.makedirs(default_dir, exist_ok=True)
+            
+            file_path = filedialog.askopenfilename(
+                filetypes=[("JSON files", "*.json")],
+                initialdir=default_dir
+            )
+            if not file_path:  # User cancelled
+                return
+        
+        self._load_layout_file(file_path)
+
+    def _set_unsaved_changes(self, change_type=None, details=None):
+        """Mark that there are unsaved changes
+        
+        Args:
+            change_type: Type of change ('area_added', 'area_removed', 'hotkey_changed', 
+                         'additional_options', 'area_settings')
+            details: Additional details about the change (e.g., area name, hotkey name)
+        """
+        # Don't mark as unsaved if we're currently loading a layout
+        if not getattr(self, '_is_loading_layout', False):
+            self._has_unsaved_changes = True
+            
+            # Track specific changes
+            if change_type == 'area_added' and details:
+                self._unsaved_changes['added_areas'].add(details)
+            elif change_type == 'area_removed' and details:
+                self._unsaved_changes['removed_areas'].add(details)
+            elif change_type == 'hotkey_changed' and details:
+                self._unsaved_changes['hotkey_changes'].add(details)
+            elif change_type == 'additional_options':
+                self._unsaved_changes['additional_options'] = True
+            elif change_type == 'area_settings' and details:
+                self._unsaved_changes['area_settings'].add(details)
+        
+    def _validate_layout_data(self, layout):
+        """Validate layout data for security and integrity"""
+        if not isinstance(layout, dict):
+            raise ValueError("Layout must be a dictionary")
+        
+        # Define expected structure and types
+        expected_fields = {
+            'version': str,
+            'bad_word_list': str,
+            'ignore_usernames': bool,
+            'ignore_previous': bool,
+            'ignore_gibberish': bool,
+            'pause_at_punctuation': bool,
+            'better_unit_detection': bool,
+            'read_game_units': bool,
+            'fullscreen_mode': bool,
+            'stop_hotkey': (str, type(None)),
+            'pause_hotkey': (str, type(None)),
+            'edit_area_hotkey': (str, type(None)),
+            'repeat_latest_hotkey': (str, type(None)),
+            'edit_area_screenshot_bg': bool,
+            'edit_area_alpha': (int, float),
+            'volume': str,
+            'areas': list
+        }
+        
+        # Validate top-level fields
+        for field, expected_type in expected_fields.items():
+            if field in layout:
+                value = layout[field]
+                if not isinstance(value, expected_type):
+                    raise ValueError(f"Invalid type for {field}: expected {expected_type}, got {type(value)}")
+                
+                # Additional validation for specific fields
+                if field == 'version':
+                    if not value or len(value) > 10:  # Reasonable version string length
+                        raise ValueError("Invalid version string")
+                elif field == 'bad_word_list':
+                    if len(value) > 10000:  # Reasonable limit for bad word list
+                        raise ValueError("Bad word list too long")
+                elif field == 'volume':
+                    try:
+                        vol_int = int(value)
+                        if vol_int < 0 or vol_int > 100:
+                            raise ValueError("Volume must be between 0 and 100")
+                    except ValueError:
+                        raise ValueError("Invalid volume value")
+                elif field == 'stop_hotkey':
+                    if value is not None and (not isinstance(value, str) or len(value) > 50):
+                        raise ValueError("Invalid stop hotkey")
+                elif field == 'pause_hotkey':
+                    if value is not None and (not isinstance(value, str) or len(value) > 50):
+                        raise ValueError("Invalid pause hotkey")
+                elif field == 'edit_area_hotkey':
+                    if value is not None and (not isinstance(value, str) or len(value) > 50):
+                        raise ValueError("Invalid edit area hotkey")
+                elif field == 'repeat_latest_hotkey':
+                    if value is not None and (not isinstance(value, str) or len(value) > 50):
+                        raise ValueError("Invalid repeat latest hotkey")
+                elif field == 'edit_area_alpha':
+                    if not isinstance(value, (int, float)) or value < 0.0 or value > 1.0:
+                        raise ValueError("Invalid edit area alpha (must be between 0.0 and 1.0)")
+        
+        # Validate areas array
+        if 'areas' in layout:
+            areas = layout['areas']
+            if len(areas) > 50:  # Reasonable limit for number of areas
+                raise ValueError("Too many areas defined")
+            
+            for i, area in enumerate(areas):
+                if not isinstance(area, dict):
+                    raise ValueError(f"Area {i} must be a dictionary")
+                
+                # Validate area fields
+                area_fields = {
+                    'coords': (list, tuple),
+                    'name': str,
+                    'hotkey': (str, type(None)),
+                    'preprocess': bool,
+                    'voice': str,
+                    'speed': str,
+                    'settings': dict
+                }
+                
+                for field, expected_type in area_fields.items():
+                    if field in area:
+                        value = area[field]
+                        if not isinstance(value, expected_type):
+                            raise ValueError(f"Invalid type for area {i} {field}")
+                        
+                        # Additional validation
+                        if field == 'name':
+                            if not value or len(value) > 100:  # Reasonable name length
+                                raise ValueError(f"Invalid area name in area {i}")
+                            # Sanitize name - remove potentially dangerous characters
+                            if any(char in value for char in ['<', '>', '"', "'", '&']):
+                                raise ValueError(f"Area name contains invalid characters in area {i}")
+                        elif field == 'coords':
+                            if len(value) != 4:
+                                raise ValueError(f"Coordinates must have exactly 4 values in area {i}")
+                            for coord in value:
+                                # Allow negative coordinates for multi-monitor setups (monitors left/above primary)
+                                if not isinstance(coord, (int, float)) or coord < -10000 or coord > 10000:
+                                    raise ValueError(f"Invalid coordinate value in area {i}")
+                        elif field == 'hotkey':
+                            if value is not None and (not isinstance(value, str) or len(value) > 50):
+                                raise ValueError(f"Invalid hotkey in area {i}")
+                        elif field == 'voice' or field == 'speed':
+                            if len(value) > 100:  # Reasonable limit
+                                raise ValueError(f"Invalid {field} value in area {i}")
+                        elif field == 'settings':
+                            # Validate settings dictionary
+                            if len(value) > 20:  # Reasonable number of settings
+                                raise ValueError(f"Too many settings in area {i}")
+                            for key, val in value.items():
+                                if not isinstance(key, str) or len(key) > 50:
+                                    raise ValueError(f"Invalid setting key in area {i}")
+                                if not isinstance(val, (str, int, float, bool, type(None))) or (isinstance(val, str) and len(val) > 100):
+                                    raise ValueError(f"Invalid setting value in area {i}")
+        
+        return True
+
+    def _close_editor_if_open(self):
+        """Close the editor if it's open (especially when freeze screen is enabled), so popups can be visible"""
+        if hasattr(self, 'area_selection_in_progress') and self.area_selection_in_progress:
+            # Close editor if open (especially important when freeze screen is enabled, but close it anyway to ensure popups are visible)
+            if hasattr(self, '_edit_area_done_callback') and self._edit_area_done_callback:
+                try:
+                    self._edit_area_done_callback()
+                except Exception as e:
+                    print(f"Error closing editor before showing popup: {e}")
+
+    def _check_areas_within_screen_bounds(self):
+        """Check if any loaded areas are outside the current screen bounds and warn user"""
+        # DEBUG: Set to True to force show the warning dialog for testing
+        FORCE_SHOW_WARNING = False
+        
+        try:
+            # Get current virtual screen bounds (all monitors combined)
+            min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+            min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+            total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+            total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+            max_x = min_x + total_width
+            max_y = min_y + total_height
+            
+            # Track areas that are outside bounds
+            areas_outside_bounds = []
+            
+            for area in self.areas:
+                area_frame = area[0]
+                area_name_var = area[3]
+                area_name = area_name_var.get()
+                
+                # Skip Auto Read areas - they should not trigger this warning
+                if area_name.startswith("Auto Read"):
+                    continue
+                
+                # Check if the area has coordinates set
+                if hasattr(area_frame, 'area_coords') and area_frame.area_coords:
+                    coords = area_frame.area_coords
+                    x1, y1, x2, y2 = coords
+                    
+                    # Check if the area is completely outside the current screen bounds
+                    completely_outside = (x2 <= min_x or x1 >= max_x or y2 <= min_y or y1 >= max_y)
+                    
+                    # Check if the area is partially outside (but not completely)
+                    partially_outside = (x1 < min_x or x2 > max_x or y1 < min_y or y2 > max_y) and not completely_outside
+                    
+                    if completely_outside:
+                        areas_outside_bounds.append((area_name, "completely outside", coords))
+                    elif partially_outside:
+                        areas_outside_bounds.append((area_name, "partially outside", coords))
+            
+            # Show warning if any areas are outside bounds (or if forced for testing)
+            if areas_outside_bounds or FORCE_SHOW_WARNING:
+                # Build warning message
+                warning_lines = []
+                
+                if areas_outside_bounds:
+                    for area_name, status, coords in areas_outside_bounds:
+                        if status == "completely outside":
+                            warning_lines.append(f"  • {area_name} (outside)")
+                        else:
+                            warning_lines.append(f"  • {area_name} (partly outside)")
+                else:
+                    # Force show mode - add dummy entries for preview
+                    warning_lines.append(f"  • Example Area 1 (outside)")
+                    warning_lines.append(f"  • Example Area 2 (partly outside)")
+                
+                warning_msg = "Some areas are outside of your screen bounds.\n\n"
+                warning_msg += "\n".join(warning_lines)
+                warning_msg += "\n\nYou can reposition areas via the area editor."
+                
+                # Close editor if open (with freeze screen) so popup is visible
+                self._close_editor_if_open()
+                
+                messagebox.showwarning("Areas Outside Screen", warning_msg)
+                print(f"Warning: {len(areas_outside_bounds)} area(s) outside current screen bounds")
+                
+        except Exception as e:
+            print(f"Error checking screen bounds: {e}")
+
+    def _load_layout_file(self, file_path):
+        """Internal method to load a layout file"""
+        if file_path:
+            # Set loading flag to prevent trace callbacks from marking changes
+            self._is_loading_layout = True
+            # Set flag to indicate layout was just loaded (for edit view undo stack)
+            self._layout_just_loaded = True
+            try:
+                # Basic file validation
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError("Layout file does not exist")
+                
+                # Check file size (prevent loading extremely large files)
+                file_size = os.path.getsize(file_path)
+                if file_size > 10 * 1024 * 1024:  # 10MB limit
+                    raise ValueError("Layout file is too large (max 10MB)")
+                
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    try:
+                        layout = json.load(f)
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON format: {str(e)}")
+                
+                # Validate the loaded data
+                self._validate_layout_data(layout)
+                
+                # Only set the file path AFTER successful validation
+                # Note: We'll reset _has_unsaved_changes at the END of loading, after all values are set
+                # This prevents trace callbacks from marking the file as changed during loading
+                self.layout_file.set(file_path)
+                    
+                # Clear all areas and processing settings when loading a savefile
+                if self.areas:
+                    # Remove all areas (including the first one)
+                    for area in self.areas:
+                        # Clean up hotkeys before destroying the area
+                        hotkey_button = area[1]
+                        if hasattr(hotkey_button, 'keyboard_hook'):
+                            try:
+                                if hotkey_button.keyboard_hook:
+                                    # Check if it's a callable (function) or a hook ID
+                                    if callable(hotkey_button.keyboard_hook):
+                                        # It's a function, try to unhook it
+                                        try:
+                                            keyboard.unhook(hotkey_button.keyboard_hook)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # Check if this is a custom ctrl hook, on_press_key hook, or a regular add_hotkey hook
+                                        try:
+                                            if hasattr(hotkey_button.keyboard_hook, 'remove'):
+                                                # This is an add_hotkey hook
+                                                keyboard.remove_hotkey(hotkey_button.keyboard_hook)
+                                            elif hasattr(hotkey_button.keyboard_hook, 'unhook'):
+                                                # This is an on_press_key hook
+                                                hotkey_button.keyboard_hook.unhook()
+                                            else:
+                                                # This is a custom on_press hook
+                                                keyboard.unhook(hotkey_button.keyboard_hook)
+                                        except Exception:
+                                            # Fallback to unhook if all methods fail
+                                            keyboard.unhook(hotkey_button.keyboard_hook)
+                            except Exception as e:
+                                print(f"Warning: Error cleaning up keyboard hook: {e}")
+                        if hasattr(hotkey_button, 'mouse_hook'):
+                            try:
+                                if hotkey_button.mouse_hook:
+                                    # Check if it's a callable (function) or a hook ID
+                                    if callable(hotkey_button.mouse_hook):
+                                        # It's a function, try to unhook it
+                                        try:
+                                            mouse.unhook(hotkey_button.mouse_hook)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # It's a hook ID, try to remove the hotkey first
+                                        try:
+                                            if hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
+                                                mouse.unhook(hotkey_button.mouse_hook_id)
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                print(f"Warning: Error cleaning up mouse hook: {e}")
+                        area[0].destroy()
+                    self.areas = []
+                self.processing_settings.clear()
+
+                save_version = layout.get("version", "0.0")
+                current_version = "0.5"
+
+                if tuple(map(int, save_version.split('.'))) < tuple(map(int, current_version.split('.'))):
+                    messagebox.showerror("Error", "Cannot load older version save files.")
+                    return
+
+                # Extract just the filename from the full path for display
+                file_name = os.path.basename(file_path)
+                
+                # Show feedback in status label
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                
+                # Show load success message
+                self.status_label.config(text=f"Layout loaded: {file_name}", fg="black")
+                self._feedback_timer = self.root.after(2000, lambda: self.status_label.config(text=""))
+
+                # Actually load the layout data in the specified order:
+                # 1. Program Volume
+                # 2. Ignore Word list
+                # 3. The different checkboxes
+                # 4. Stop Hotkey
+                # 5. Auto Read areas including Stop Read on new select
+                # 6. Read Areas
+                
+                # Keep the full path in layout_file so we know where to save later
+                # (This was already set at line 7941, but we ensure it's the full path here)
+                self.layout_file.set(file_path)
+                
+                # 1. Load Program Volume
+                saved_volume = layout.get("volume", "100")
+                self.volume.set(saved_volume)
+                try:
+                    self.speaker.Volume = int(saved_volume)
+                    print(f"Loaded volume setting: {saved_volume}%")
+                except ValueError:
+                    print("Invalid volume in save file, defaulting to 100%")
+                    self.volume.set("100")
+                    self.speaker.Volume = 100
+                
+                # 2. Load Ignore Word list
+                self.bad_word_list.set(layout.get("bad_word_list", ""))
+                
+                # 3. Load the different checkboxes
+                self.ignore_usernames_var.set(layout.get("ignore_usernames", False))
+                self.ignore_previous_var.set(layout.get("ignore_previous", False))
+                self.ignore_gibberish_var.set(layout.get("ignore_gibberish", False))
+                self.pause_at_punctuation_var.set(layout.get("pause_at_punctuation", False))
+                self.better_unit_detection_var.set(layout.get("better_unit_detection", False))
+                self.read_game_units_var.set(layout.get("read_game_units", False))
+                self.fullscreen_mode_var.set(layout.get("fullscreen_mode", False))
+                if hasattr(self, 'process_freeze_screen_var'):
+                    self.process_freeze_screen_var.set(layout.get("process_freeze_screen", False))
+                if hasattr(self, 'allow_mouse_buttons_var'):
+                    self.allow_mouse_buttons_var.set(layout.get("allow_mouse_buttons", False))
+                
+                # Clean up existing areas and unhook all hotkeys
+                # Clean up images
+                for image in self.latest_images.values():
+                    try:
+                        image.close()
+                    except (AttributeError, Exception):
+                        # Image may not have close() method
+                        pass
+                self.latest_images.clear()
+                
+                # Unhook all existing hotkeys
+                keyboard.unhook_all()
+                mouse.unhook_all()
+                
+                # Set up stop hotkey first
+                saved_stop_hotkey = layout.get("stop_hotkey")
+                if saved_stop_hotkey:
+                    self.stop_hotkey = saved_stop_hotkey
+                    self.stop_hotkey_button.mock_button = type('MockButton', (), {
+                        'hotkey': saved_stop_hotkey,
+                        'is_stop_button': True
+                    })
+                    self.setup_hotkey(self.stop_hotkey_button.mock_button, None)  # Pass None as area_frame for stop hotkey
+                    
+                    # Update the button text
+                    display_name = saved_stop_hotkey.replace('numpad ', 'NUMPAD ').replace('num_', 'num:') \
+                                               .replace('ctrl','CTRL') \
+                                               .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                               .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                                               .replace('windows','WIN') \
+                                               .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name.upper()} ]")
+                    print(f"Loaded Stop hotkey: {saved_stop_hotkey}")
+                
+                # Set up pause hotkey
+                saved_pause_hotkey = layout.get("pause_hotkey")
+                if saved_pause_hotkey:
+                    self.pause_hotkey = saved_pause_hotkey
+                    self.pause_hotkey_button.mock_button = type('MockButton', (), {
+                        'hotkey': saved_pause_hotkey,
+                        'is_pause_button': True
+                    })
+                    self.setup_hotkey(self.pause_hotkey_button.mock_button, None)  # Pass None as area_frame for pause hotkey
+                    
+                    # Update the button text
+                    display_name = saved_pause_hotkey.replace('numpad ', 'NUMPAD ').replace('num_', 'num:') \
+                                               .replace('ctrl','CTRL') \
+                                               .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                               .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                                               .replace('windows','WIN') \
+                                               .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    self.pause_hotkey_button.config(text=f"Pause/Play Hotkey: [ {display_name.upper()} ]")
+                    print(f"Loaded Pause/Play hotkey: {saved_pause_hotkey}")
+                
+                # Set up edit area hotkey
+                saved_edit_area_hotkey = layout.get("edit_area_hotkey")
+                if saved_edit_area_hotkey:
+                    # Clean up existing edit area hotkey if it exists
+                    if hasattr(self, 'edit_area_hotkey_mock_button') and self.edit_area_hotkey_mock_button:
+                        try:
+                            self._cleanup_hooks(self.edit_area_hotkey_mock_button)
+                        except Exception as e:
+                            print(f"Warning: Error cleaning up edit area hotkey: {e}")
+                    
+                    self.edit_area_hotkey = saved_edit_area_hotkey
+                    self.edit_area_hotkey_mock_button = type('MockButton', (), {
+                        'hotkey': saved_edit_area_hotkey,
+                        'is_edit_area_button': True
+                    })
+                    self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                    print(f"Loaded Edit Area hotkey: {saved_edit_area_hotkey}")
+                
+                # Set up repeat latest hotkey
+                saved_repeat_latest_hotkey = layout.get("repeat_latest_hotkey")
+                if saved_repeat_latest_hotkey:
+                    # Clean up existing repeat latest hotkey if it exists
+                    if hasattr(self, 'repeat_latest_hotkey_button') and self.repeat_latest_hotkey_button:
+                        try:
+                            self._cleanup_hooks(self.repeat_latest_hotkey_button)
+                        except Exception as e:
+                            print(f"Warning: Error cleaning up repeat latest hotkey: {e}")
+                    
+                    self.repeat_latest_hotkey = saved_repeat_latest_hotkey
+                    if hasattr(self, 'repeat_latest_hotkey_button'):
+                        self.repeat_latest_hotkey_button.hotkey = saved_repeat_latest_hotkey
+                        self.setup_hotkey(self.repeat_latest_hotkey_button, None)
+                        
+                        # Update button text if display button exists
+                        if hasattr(self.repeat_latest_hotkey_button, '_display_button') and self.repeat_latest_hotkey_button._display_button:
+                            display_name = self._hotkey_to_display_name(saved_repeat_latest_hotkey)
+                            self.repeat_latest_hotkey_button._display_button.config(text=f"Hotkey: [ {display_name.upper()} ]")
+                    print(f"Loaded Repeat Latest hotkey: {saved_repeat_latest_hotkey}")
+                
+                # Load edit area screenshot background setting
+                saved_screenshot_bg = layout.get("edit_area_screenshot_bg")
+                if saved_screenshot_bg is not None:
+                    self.edit_area_screenshot_bg = bool(saved_screenshot_bg)
+                    if hasattr(self, 'screenshot_bg_var'):
+                        self.screenshot_bg_var.set(self.edit_area_screenshot_bg)
+                    print(f"Loaded Edit Area screenshot background: {self.edit_area_screenshot_bg}")
+                
+                # Load edit area alpha setting
+                saved_alpha = layout.get("edit_area_alpha")
+                if saved_alpha is not None:
+                    try:
+                        self.edit_area_alpha = float(saved_alpha)
+                        # Ensure alpha is within valid range (0.0 to 1.0)
+                        if self.edit_area_alpha < 0.0:
+                            self.edit_area_alpha = 0.0
+                        elif self.edit_area_alpha > 1.0:
+                            self.edit_area_alpha = 1.0
+                        print(f"Loaded Edit Area alpha: {self.edit_area_alpha}")
+                    except (ValueError, TypeError):
+                        print(f"Warning: Invalid alpha value in layout, using default: {saved_alpha}")
+                        self.edit_area_alpha = 0.95  # Default value
+
+                # 5. Load Auto Read areas including Stop Read on new select
+                auto_read_areas_data = layout.get("auto_read_areas")
+                if auto_read_areas_data:
+                    # Load Stop Read on new select setting
+                    stop_read_on_select = auto_read_areas_data.get("stop_read_on_select", True)
+                    if hasattr(self, 'interrupt_on_new_scan_var'):
+                        self.interrupt_on_new_scan_var.set(stop_read_on_select)
+                    
+                    # Remove all existing Auto Read areas
+                    areas_to_remove = []
+                    for i, area in enumerate(self.areas):
+                        if len(area) >= 9:
+                            area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                        else:
+                            area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                        area_name = area_name_var.get()
+                        if area_name.startswith("Auto Read"):
+                            areas_to_remove.append(i)
+                    
+                    # Remove from end to beginning to avoid index issues
+                    for i in reversed(areas_to_remove):
+                        area = self.areas[i]
+                        hotkey_button = area[1]
+                        # Clean up hotkeys
+                        if hasattr(hotkey_button, 'keyboard_hook'):
+                            try:
+                                if hotkey_button.keyboard_hook:
+                                    if callable(hotkey_button.keyboard_hook):
+                                        try:
+                                            keyboard.unhook(hotkey_button.keyboard_hook)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        try:
+                                            if hasattr(hotkey_button.keyboard_hook, 'remove'):
+                                                keyboard.remove_hotkey(hotkey_button.keyboard_hook)
+                                            elif hasattr(hotkey_button.keyboard_hook, 'unhook'):
+                                                hotkey_button.keyboard_hook.unhook()
+                                            else:
+                                                keyboard.unhook(hotkey_button.keyboard_hook)
+                                        except Exception:
+                                            keyboard.unhook(hotkey_button.keyboard_hook)
+                            except Exception:
+                                pass
+                        if hasattr(hotkey_button, 'mouse_hook'):
+                            try:
+                                if hotkey_button.mouse_hook:
+                                    if callable(hotkey_button.mouse_hook):
+                                        try:
+                                            mouse.unhook(hotkey_button.mouse_hook)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        try:
+                                            if hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
+                                                mouse.unhook(hotkey_button.mouse_hook_id)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        area[0].destroy()
+                        del self.areas[i]
+                    
+                    # Load each Auto Read area from the layout
+                    auto_read_areas_list = auto_read_areas_data.get("areas", [])
+                    for auto_read_info in auto_read_areas_list:
+                        area_name = auto_read_info.get("name", "Auto Read")
+                        # Create the Auto Read area
+                        self.add_read_area(removable=True, editable_name=False, area_name=area_name)
+                        
+                        # Get the newly created area (last one in the list)
+                        if len(self.areas[-1]) >= 9:
+                            area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var = self.areas[-1][:9]
+                        else:
+                            area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var = self.areas[-1][:8]
+                            freeze_screen_var = None
+                        
+                        # Set coordinates if they exist
+                        if "coords" in auto_read_info:
+                            area_frame.area_coords = auto_read_info["coords"]
+                        
+                        # Set the hotkey if it exists
+                        if auto_read_info.get("hotkey"):
+                            hotkey_button.hotkey = auto_read_info["hotkey"]
+                            display_name = auto_read_info["hotkey"].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if auto_read_info["hotkey"].startswith('num_') else auto_read_info["hotkey"].replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                            hotkey_button.config(text=f"Hotkey: [ {display_name.upper()} ]")
+                            self.setup_hotkey(hotkey_button, area_frame)
+                        
+                        # Set preprocessing and voice settings
+                        preprocess_var.set(auto_read_info.get("preprocess", False))
+                        # Load voice (same logic as regular areas)
+                        if hasattr(self, 'voices') and self.voices:
+                            try:
+                                saved_voice = auto_read_info.get("voice")
+                                if saved_voice and saved_voice != "Select Voice":
+                                    voice_full_names = {}
+                                    for i, voice in enumerate(self.voices, 1):
+                                        if hasattr(voice, 'GetDescription'):
+                                            full_name = voice.GetDescription()
+                                            if "Microsoft" in full_name and " - " in full_name:
+                                                parts = full_name.split(" - ")
+                                                if len(parts) == 2:
+                                                    voice_part = parts[0].replace("Microsoft ", "")
+                                                    lang_part = parts[1]
+                                                    voice_full_names[f"{i}. {voice_part} ({lang_part})"] = full_name
+                                            elif " - " in full_name:
+                                                parts = full_name.split(" - ")
+                                                if len(parts) == 2:
+                                                    voice_full_names[f"{i}. {parts[0]} ({parts[1]})"] = full_name
+                                            else:
+                                                voice_full_names[f"{i}. {full_name}"] = full_name
+                                    
+                                    display_name = 'Select Voice'
+                                    full_voice_name = None
+                                    
+                                    for i, voice in enumerate(self.voices, 1):
+                                        if hasattr(voice, 'GetDescription') and voice.GetDescription() == saved_voice:
+                                            full_voice_name = saved_voice
+                                            full_name = voice.GetDescription()
+                                            if "Microsoft" in full_name and " - " in full_name:
+                                                parts = full_name.split(" - ")
+                                                if len(parts) == 2:
+                                                    voice_part = parts[0].replace("Microsoft ", "")
+                                                    lang_part = parts[1]
+                                                    display_name = f"{i}. {voice_part} ({lang_part})"
+                                                else:
+                                                    display_name = f"{i}. {full_name}"
+                                            elif " - " in full_name:
+                                                parts = full_name.split(" - ")
+                                                if len(parts) == 2:
+                                                    display_name = f"{i}. {parts[0]} ({parts[1]})"
+                                                else:
+                                                    display_name = f"{i}. {full_name}"
+                                            else:
+                                                display_name = f"{i}. {full_name}"
+                                            break
+                                    
+                                    if full_voice_name is None and saved_voice in voice_full_names:
+                                        full_voice_name = voice_full_names[saved_voice]
+                                        display_name = saved_voice
+                                    
+                                    if full_voice_name:
+                                        voice_var.set(display_name)
+                                        voice_var._full_name = full_voice_name
+                                    # else: keep the default first voice set by add_read_area
+                                # else: keep the default first voice set by add_read_area
+                            except Exception as e:
+                                print(f"Warning: Could not validate voice for Auto Read area: {e}")
+                                # Keep the default first voice set by add_read_area
+                        # else: keep the default first voice set by add_read_area
+                        
+                        speed_var.set(auto_read_info.get("speed", "100"))
+                        psm_var.set(auto_read_info.get("psm", "3 (Default - Fully auto, no OSD)"))
+                        
+                        # Load freeze_screen setting
+                        if freeze_screen_var and hasattr(freeze_screen_var, 'set'):
+                            freeze_screen_var.set(auto_read_info.get("freeze_screen", False))
+                        
+                        # Load image processing settings
+                        if "settings" in auto_read_info:
+                            self.processing_settings[area_name] = auto_read_info["settings"].copy()
+                            print(f"Loaded image processing settings for Auto Read area: {area_name}")
+
+                # --- Handle Auto Read hotkey ---
+                auto_read_hotkey = None
+                if self.areas and hasattr(self.areas[0][1], 'hotkey'):
+                    auto_read_hotkey = self.areas[0][1].hotkey
+                    # Clear the existing auto-read hotkey before loading new ones
+                    if auto_read_hotkey:
+                        try:
+                            if hasattr(self.areas[0][1], 'hotkey_id') and hasattr(self.areas[0][1].hotkey_id, 'remove'):
+                                # This is an add_hotkey hook
+                                keyboard.remove_hotkey(self.areas[0][1].hotkey_id)
+                            else:
+                                # This is a custom on_press hook or doesn't exist
+                                pass
+                        except (KeyError, AttributeError):
+                            pass
+                        self.areas[0][1].hotkey = None
+                        self.areas[0][1].config(text="Set Hotkey")
+                
+                # Check for conflicts with the auto-read hotkey
+                conflict_area_name = None
+                for area_info in layout.get("areas", []):
+                    if auto_read_hotkey and area_info.get("hotkey") == auto_read_hotkey:
+                        conflict_area_name = area_info["name"]
+                        break
+                
+                # 6. Load Read Areas (regular areas, non-Auto Read)
+                areas_loaded = False
+                for area_info in layout.get("areas", []):
+                    # Create a new area using add_read_area (removable, editable, normal name)
+                    self.add_read_area(removable=True, editable_name=True, area_name=area_info["name"])
+                    
+                    # Get the newly created area (last one in the list)
+                    if len(self.areas[-1]) >= 9:
+                        area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var = self.areas[-1][:9]
+                    else:
+                        area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var, speed_var, psm_var = self.areas[-1][:8]
+                        freeze_screen_var = None
+                    areas_loaded = True
+                    
+                    # Set the area coordinates
+                    area_frame.area_coords = area_info["coords"]
+                    
+                    # Set the hotkey if it exists
+                    if area_info["hotkey"]:
+                        hotkey_button.hotkey = area_info["hotkey"]
+                        display_name = area_info["hotkey"].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if area_info["hotkey"].startswith('num_') else area_info["hotkey"].replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        hotkey_button.config(text=f"Hotkey: [ {display_name.upper()} ]")
+                        self.setup_hotkey(hotkey_button, area_frame)
+                        
+                        # Warn about special characters that may cause cross-language issues
+                        if is_special_character(area_info["hotkey"]):
+                            alternative = suggest_alternative_key(area_info["hotkey"])
+                            if alternative:
+                                print(f"WARNING: Area '{area_info['name']}' uses special character '{area_info['hotkey']}' which may not work on different keyboard layouts.")
+                                print(f"Consider changing it to '{alternative}' for better compatibility.")
+                    
+                    # Set preprocessing and voice settings
+                    preprocess_var.set(area_info.get("preprocess", False))
+                    # Check if the saved voice exists in current SAPI voices and convert to display name
+                    if hasattr(self, 'voices') and self.voices:
+                        try:
+                            saved_voice = area_info.get("voice")
+                            if saved_voice and saved_voice != "Select Voice":
+                                # First, create a mapping of display names to full names (for backward compatibility)
+                                voice_full_names = {}
+                                for i, voice in enumerate(self.voices, 1):
+                                    if hasattr(voice, 'GetDescription'):
+                                        full_name = voice.GetDescription()
+                                        # Create the same abbreviated display name logic WITH numbering
+                                        if "Microsoft" in full_name and " - " in full_name:
+                                            parts = full_name.split(" - ")
+                                            if len(parts) == 2:
+                                                voice_part = parts[0].replace("Microsoft ", "")
+                                                lang_part = parts[1]
+                                                display_name = f"{i}. {voice_part} ({lang_part})"
+                                            else:
+                                                display_name = f"{i}. {full_name}"
+                                        elif " - " in full_name:
+                                            parts = full_name.split(" - ")
+                                            if len(parts) == 2:
+                                                display_name = f"{i}. {parts[0]} ({parts[1]})"
+                                            else:
+                                                display_name = f"{i}. {full_name}"
+                                        else:
+                                            display_name = f"{i}. {full_name}"
+                                        voice_full_names[display_name] = full_name
+                                
+                                # Try to find the voice: first by full name, then by display name
+                                display_name = 'Select Voice'
+                                full_voice_name = None
+                                
+                                # Check if saved_voice is a full name (matches GetDescription)
+                                for i, voice in enumerate(self.voices, 1):
+                                    if hasattr(voice, 'GetDescription') and voice.GetDescription() == saved_voice:
+                                        full_voice_name = saved_voice
+                                        # Create the display name
+                                        full_name = voice.GetDescription()
+                                        if "Microsoft" in full_name and " - " in full_name:
+                                            parts = full_name.split(" - ")
+                                            if len(parts) == 2:
+                                                voice_part = parts[0].replace("Microsoft ", "")
+                                                lang_part = parts[1]
+                                                display_name = f"{i}. {voice_part} ({lang_part})"
+                                            else:
+                                                display_name = f"{i}. {full_name}"
+                                        elif " - " in full_name:
+                                            parts = full_name.split(" - ")
+                                            if len(parts) == 2:
+                                                display_name = f"{i}. {parts[0]} ({parts[1]})"
+                                            else:
+                                                display_name = f"{i}. {full_name}"
+                                        else:
+                                            display_name = f"{i}. {full_name}"
+                                        break
+                                
+                                # If not found by full name, check if it's a display name (for old saves)
+                                if full_voice_name is None and saved_voice in voice_full_names:
+                                    full_voice_name = voice_full_names[saved_voice]
+                                    display_name = saved_voice
+                                
+                                if full_voice_name:
+                                    voice_var.set(display_name)
+                                    # Set the full name for the voice variable
+                                    voice_var._full_name = full_voice_name
+                                # else: keep the default first voice set by add_read_area
+                            # else: keep the default first voice set by add_read_area
+                        except Exception as e:
+                            print(f"Warning: Could not validate voice: {e}")
+                            # Keep the default first voice set by add_read_area
+                    # else: keep the default first voice set by add_read_area
+                    speed_var.set(area_info.get("speed", "1.0"))
+                    psm_var.set(area_info.get("psm", "3 (Default - Fully auto, no OSD)"))
+                    
+                    # Load and store image processing settings
+                    if "settings" in area_info:
+                        self.processing_settings[area_info["name"]] = area_info["settings"].copy()
+                        print(f"Loaded image processing settings for area: {area_info['name']}")
+                        
+                # Update preferred sizes during load
+                self.resize_window()
+
+                # Only process the last loaded area if any areas were loaded
+                if areas_loaded and len(self.areas) > 1:
+                    # Get coordinates from the last loaded area
+                    x1, y1, x2, y2 = area_frame.area_coords
+                    screenshot = capture_screen_area(x1, y1, x2, y2)
+
+                    # Store original or processed image based on settings
+                    if preprocess_var.get() and area_info["name"] in self.processing_settings:
+                        settings = self.processing_settings[area_info["name"]]
+                        processed_image = preprocess_image(
+                            screenshot,
+                            brightness=settings.get('brightness', 1.0),
+                            contrast=settings.get('contrast', 1.0),
+                            saturation=settings.get('saturation', 1.0),
+                            sharpness=settings.get('sharpness', 1.0),
+                            blur=settings.get('blur', 0.0),
+                            threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                            hue=settings.get('hue', 0.0),
+                            exposure=settings.get('exposure', 1.0)
+                        )
+                        self._store_image_with_bounds(area_name_var.get(), processed_image)
+                    else:
+                        self._store_image_with_bounds(area_name_var.get(), screenshot)
+                # --- Handle Auto Read hotkey state after loading ---
+                # If no conflict and auto-read hotkey exists, re-register it
+                if not conflict_area_name and auto_read_hotkey and self.areas and hasattr(self.areas[0][1], 'hotkey'):
+                    try:
+                        # Re-register the auto-read hotkey
+                        self.areas[0][1].hotkey = auto_read_hotkey
+                        display_name = auto_read_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/') if auto_read_hotkey.startswith('num_') else auto_read_hotkey.replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        self.areas[0][1].config(text=f"Hotkey: [ {display_name.upper()} ]")
+                        # Re-setup the hotkey
+                        self.setup_hotkey(self.areas[0][1], self.areas[0][0])
+                        print(f"Re-registered Auto Read hotkey: {auto_read_hotkey}")
+                    except Exception as e:
+                        print(f"Error re-registering Auto Read hotkey: {e}")
+                # Show popup if conflict detected
+                elif conflict_area_name:
+                    hotkey_val = auto_read_hotkey if auto_read_hotkey else "?"
+                    messagebox.showinfo(
+                        "Hotkey Conflict",
+                        f"Detected same Hotkey!\n\nAuto Read Hotkey = {hotkey_val}\n{conflict_area_name} Hotkey = {hotkey_val}\n\nPlease set a new hotkey for AutoRead if you still want this function.")
+                    # Clear the Auto Read hotkey registration
+                    if self.areas and hasattr(self.areas[0][1], 'hotkey'):
+                        try:
+                            if hasattr(self.areas[0][1], 'hotkey_id') and hasattr(self.areas[0][1].hotkey_id, 'remove'):
+                                # This is an add_hotkey hook
+                                keyboard.remove_hotkey(self.areas[0][1].hotkey_id)
+                            else:
+                                # This is a custom on_press hook or doesn't exist
+                                pass
+                        except (KeyError, AttributeError):
+                            pass
+                        self.areas[0][1].hotkey = None
+                        self.areas[0][1].config(text="Set Hotkey")
+
+                # Reset unsaved changes flag AFTER all values have been loaded
+                # This prevents trace callbacks from marking the file as changed during loading
+                self._has_unsaved_changes = False
+                # Reset change tracking
+                self._unsaved_changes = {
+                    'added_areas': set(),
+                    'removed_areas': set(),
+                    'hotkey_changes': set(),
+                    'additional_options': False,
+                    'area_settings': set(),
+                }
+                
+                # Restore edit area hotkey if it exists (it's stored in settings, not layout)
+                # This is needed because keyboard.unhook_all() was called earlier, which unhooked the edit area hotkey
+                if hasattr(self, 'edit_area_hotkey') and self.edit_area_hotkey:
+                    try:
+                        # Use the primary mock button if it exists
+                        if hasattr(self, 'edit_area_hotkey_mock_button') and self.edit_area_hotkey_mock_button:
+                            self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                            print(f"Restored edit area hotkey after layout load: {self.edit_area_hotkey}")
+                        # Otherwise, recreate it
+                        elif hasattr(self, 'edit_area_hotkey_button') and hasattr(self.edit_area_hotkey_button, 'mock_button'):
+                            self.setup_hotkey(self.edit_area_hotkey_button.mock_button, None)
+                            self.edit_area_hotkey_mock_button = self.edit_area_hotkey_button.mock_button
+                            print(f"Restored edit area hotkey after layout load: {self.edit_area_hotkey}")
+                        else:
+                            # Recreate the mock button
+                            self.edit_area_hotkey_mock_button = type('MockButton', (), {'hotkey': self.edit_area_hotkey, 'is_edit_area_button': True})
+                            self.setup_hotkey(self.edit_area_hotkey_mock_button, None)
+                            if hasattr(self, 'edit_area_hotkey_button'):
+                                self.edit_area_hotkey_button.mock_button = self.edit_area_hotkey_mock_button
+                            print(f"Recreated and restored edit area hotkey after layout load: {self.edit_area_hotkey}")
+                    except Exception as e:
+                        print(f"Error restoring edit area hotkey after layout load: {e}")
+                
+                # Restore repeat latest hotkey if it exists (it's stored in settings, not layout)
+                # This is needed because keyboard.unhook_all() was called earlier, which unhooked the repeat latest hotkey
+                if hasattr(self, 'repeat_latest_hotkey') and self.repeat_latest_hotkey:
+                    try:
+                        if hasattr(self, 'repeat_latest_hotkey_button'):
+                            # Ensure the button's hotkey attribute is set
+                            if not hasattr(self.repeat_latest_hotkey_button, 'hotkey') or not self.repeat_latest_hotkey_button.hotkey:
+                                self.repeat_latest_hotkey_button.hotkey = self.repeat_latest_hotkey
+                            self.setup_hotkey(self.repeat_latest_hotkey_button, None)
+                            print(f"Restored repeat latest hotkey after layout load: {self.repeat_latest_hotkey}")
+                    except Exception as e:
+                        print(f"Error restoring repeat latest hotkey after layout load: {e}")
+                
+                print(f"Layout loaded from {file_path}\n--------------------------")
+                
+                # Check if any loaded areas are outside current screen bounds
+                self._check_areas_within_screen_bounds()
+                
+                # Save the layout path to settings for auto-loading on next startup
+                self.save_last_layout_path(file_path)
+                
+                # Force-resize the window to fit the newly loaded layout
+                self.resize_window(force=True)
+                # Expand window width if loaded hotkeys need more space
+                self._ensure_window_width()
+                # Ensure window position keeps buttons visible after loading layout
+                self._ensure_window_position()
+                
+                # Load automations and images (7. Automations)
+                self._load_automations_from_layout(layout, file_path)
+                
+            except (ValueError, FileNotFoundError) as e:
+                # Handle validation and file errors with specific messages
+                messagebox.showerror("Invalid Save File", f"The save file appears to be corrupted or malicious:\n\n{str(e)}\n\nPlease use a valid save file.")
+                print(f"Security validation failed for layout file: {e}")
+            except json.JSONDecodeError as e:
+                messagebox.showerror("Invalid Save File", f"The save file contains invalid JSON format:\n\n{str(e)}\n\nThe file may be corrupted.")
+                print(f"JSON decode error in layout file: {e}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load layout: {str(e)}")
+                print(f"Error loading layout: {e}")
+            finally:
+                # Always clear the loading flag, even if an error occurred
+                self._is_loading_layout = False
+
+    def validate_speed_key(self, event, speed_var):
+        """Additional validation for speed entry key presses"""
+        if event.char.isdigit() or event.keysym in ('BackSpace', 'Delete', 'Left', 'Right'):
+            return
+        return 'break'
+
+    def setup_hotkey(self, button, area_frame):
+        """Enhanced hotkey setup supporting multi-key combinations like Ctrl+Shift+F1"""
+        try:
+            # Check for duplicate hotkey registrations (optimized to avoid nested loops)
+            if hasattr(button, 'hotkey') and button.hotkey:
+                # Find current area name first (if area_frame is provided) to avoid nested loop
+                current_area_name = "Unknown Area"
+                if area_frame:
+                    for area_tuple in getattr(self, 'areas', []):
+                        if area_tuple[0] is area_frame:
+                            if len(area_tuple) >= 4 and hasattr(area_tuple[3], 'get'):
+                                current_area_name = area_tuple[3].get()
+                            break
+                
+                # Check if this hotkey is already registered by another button
+                for area_tuple in getattr(self, 'areas', []):
+                    if len(area_tuple) >= 9:
+                        other_area_frame, other_hotkey_button, _, other_area_name_var, _, _, _, _, _ = area_tuple[:9]
+                    else:
+                        other_area_frame, other_hotkey_button, _, other_area_name_var, _, _, _, _ = area_tuple[:8]
+                    if (other_hotkey_button is not button and 
+                        hasattr(other_hotkey_button, 'hotkey') and 
+                        other_hotkey_button.hotkey == button.hotkey and
+                        hasattr(other_hotkey_button, 'keyboard_hook')):
+                        other_area_name = other_area_name_var.get() if hasattr(other_area_name_var, 'get') else "Unknown Area"
+                        print(f"Warning: Hotkey '{button.hotkey}' is already registered for area '{other_area_name}'. Skipping registration for area '{current_area_name}'.")
+                        return False
+            
+            # CRITICAL: Preserve automation callback before cleanup
+            # This is important because setup_hotkey might be called when restoring hotkeys
+            preserved_automation_callback = None
+            preserved_automation_temp_frame = None
+            if hasattr(button, '_automation_callback'):
+                preserved_automation_callback = button._automation_callback
+                print(f"DEBUG: Preserving automation callback before setup_hotkey cleanup")
+            if hasattr(button, '_automation_temp_frame'):
+                preserved_automation_temp_frame = button._automation_temp_frame
+                # Try to get callback from automation window backup
+                if preserved_automation_temp_frame and hasattr(preserved_automation_temp_frame, '_automation_window'):
+                    automation_window = preserved_automation_temp_frame._automation_window
+                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
+                        if not preserved_automation_callback:
+                            preserved_automation_callback = automation_window._area_selection_hotkey_callback
+                            print(f"DEBUG: Restored callback from automation window backup")
+            
+            # Clean up any existing hooks for this button first
+            if hasattr(button, 'keyboard_hook'):
+                try:
+                    # Check if this is a custom ctrl hook or a regular add_hotkey hook
+                    if hasattr(button.keyboard_hook, 'remove'):
+                        # This is an add_hotkey hook
+                        keyboard.remove_hotkey(button.keyboard_hook)
+                    else:
+                        # This is a custom on_press hook
+                        keyboard.unhook(button.keyboard_hook)
+                    delattr(button, 'keyboard_hook')
+                except Exception as e:
+                    print(f"Error cleaning up keyboard hook: {e}")
+            
+            if hasattr(button, 'mouse_hook_id'):
+                try:
+                    mouse.unhook(button.mouse_hook_id)
+                    delattr(button, 'mouse_hook_id')
+                except Exception as e:
+                    print(f"Error cleaning up mouse hook ID: {e}")
+            if hasattr(button, 'mouse_hook'):
+                try:
+                    delattr(button, 'mouse_hook')
+                except Exception as e:
+                    print(f"Error cleaning up mouse hook function: {e}")
+            
+            # Restore automation callback after cleanup
+            if preserved_automation_callback:
+                button._automation_callback = preserved_automation_callback
+                print(f"DEBUG: Restored automation callback after cleanup")
+            if preserved_automation_temp_frame:
+                button._automation_temp_frame = preserved_automation_temp_frame
+            
+            # Store area_frame if this is not a stop button
+            if not hasattr(button, 'is_stop_button') and area_frame is not None:
+                button.area_frame = area_frame
+                
+            # Only proceed if we have a valid hotkey
+            if not hasattr(button, 'hotkey') or not button.hotkey:
+                print(f"No hotkey set for button: {button}")
+                return False
+                
+            print(f"Setting up hotkey for: {button.hotkey}")
+            
+            # Define the hotkey handler
+            def hotkey_handler():
+                try:
+                    hotkey_name = getattr(button, 'hotkey', 'N/A')
+                    print(f"=" * 80)
+                    print(f"DEBUG HOTKEY HANDLER: hotkey_handler CALLED for hotkey: '{hotkey_name}'")
+                    print(f"DEBUG HOTKEY HANDLER: Button: {button}, Type: {type(button).__name__}")
+                    print(f"=" * 80)
+                    
+                    # Check if input is allowed (centralized check for all input types)
+                    if not InputManager.is_allowed():
+                        print(f"DEBUG HOTKEY HANDLER: Ignoring hotkey - InputManager is blocked")
+                        return
+                    if self.setting_hotkey:
+                        print(f"DEBUG: Ignoring hotkey - setting_hotkey mode is active")
+                        return
+                    
+                    # Check if the button itself is still valid
+                    if not hasattr(button, 'hotkey') or not button.hotkey:
+                        print(f"Warning: Hotkey triggered for invalid button, ignoring")
+                        return
+                    
+                    # Get hotkey name early so we can use it in callback lookup and debug output
+                    hotkey_name = button.hotkey
+                    
+                    print(f"DEBUG: Button is valid, checking for callbacks...")
+                    print(f"DEBUG: Button type: {type(button).__name__}, Button ID: {id(button)}")
+                    print(f"DEBUG: Hotkey name: '{hotkey_name}'")
+                    print(f"DEBUG: Has _automation_callback attr: {hasattr(button, '_automation_callback')}")
+                    if hasattr(button, '_automation_callback'):
+                        print(f"DEBUG: _automation_callback value: {button._automation_callback}")
+                    print(f"DEBUG: Has _combo_callback attr: {hasattr(button, '_combo_callback')}")
+                    if hasattr(button, '_combo_callback'):
+                        print(f"DEBUG: _combo_callback value: {button._combo_callback}")
+                    print(f"DEBUG: Has _combo_temp_frame attr: {hasattr(button, '_combo_temp_frame')}")
+                    print(f"DEBUG: Has _automations_window: {hasattr(self, '_automations_window')}")
+                    if hasattr(self, '_automations_window') and self._automations_window:
+                        print(f"DEBUG: Automations window exists, has combo_callbacks_by_hotkey: {hasattr(self._automations_window, 'combo_callbacks_by_hotkey')}")
+                        if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
+                            print(f"DEBUG: Registry keys: {list(self._automations_window.combo_callbacks_by_hotkey.keys())}")
+                            if hotkey_name in self._automations_window.combo_callbacks_by_hotkey:
+                                print(f"DEBUG: Found '{hotkey_name}' in registry!")
+                    
+                    # Debouncing: Check if this hotkey was triggered recently
+                    import time
+                    current_time = time.time()
+                    
+                    if hotkey_name in self.last_hotkey_trigger:
+                        time_since_last = current_time - self.last_hotkey_trigger[hotkey_name]
+                        # Only apply debouncing if time_since_last is non-negative (last trigger was in the past)
+                        # If negative, it means clock was adjusted or there's a timing issue - allow the trigger
+                        if time_since_last >= 0 and time_since_last < self.hotkey_debounce_time:
+                            print(f"DEBUG: Ignoring duplicate hotkey trigger for '{hotkey_name}' (last triggered {time_since_last:.3f}s ago)")
+                            return
+                        # If time_since_last is negative, reset the timer and allow the trigger
+                        elif time_since_last < 0:
+                            print(f"DEBUG: Negative time detected for '{hotkey_name}' ({time_since_last:.3f}s), resetting timer")
+                    
+                    # Update the last trigger time
+                    self.last_hotkey_trigger[hotkey_name] = current_time
+                    
+                    # Debug: Log which hotkey was triggered with more detail
+                    if hasattr(button, 'hotkey'):
+                        import threading
+                        thread_id = threading.current_thread().ident
+                        print(f"Hotkey triggered: '{button.hotkey}' (type: {type(button.hotkey).__name__}, bytes: {button.hotkey.encode('utf-8')}, thread: {thread_id})")
+                        print(f"DEBUG: Handler function ID: {id(hotkey_handler)}")
+                    
+                    # Check for hotkey conflicts
+                    conflict_locations = []
+                    is_stop_button = hasattr(button, 'is_stop_button')
+                    is_area_button = hasattr(button, 'area_frame') and button.area_frame is not None
+                    
+                    # Check if this hotkey is used as stop hotkey
+                    if hasattr(self, 'stop_hotkey') and self.stop_hotkey == hotkey_name:
+                        if not is_stop_button:  # Only add if this button is not the stop button itself
+                            conflict_locations.append("Stop Hotkey")
+                    
+                    # Check if this hotkey is used by any area
+                    if hasattr(self, 'areas'):
+                        for area in self.areas:
+                            if len(area) >= 2:
+                                area_hotkey_button = area[1]
+                                if hasattr(area_hotkey_button, 'hotkey') and area_hotkey_button.hotkey == hotkey_name:
+                                    # Check if this is not the same button
+                                    if area_hotkey_button is not button:
+                                        area_name = "Unknown Area"
+                                        if len(area) >= 4 and hasattr(area[3], 'get'):
+                                            area_name = area[3].get()
+                                        conflict_locations.append(f"Area: {area_name}")
+                    
+                    # If conflicts detected, show popup (only once per conflict)
+                    if conflict_locations:
+                        conflict_key = f"{hotkey_name}_{','.join(sorted(conflict_locations))}"
+                        if conflict_key not in self.shown_conflicts:
+                            self.shown_conflicts.add(conflict_key)
+                            # Add current button's location to the list
+                            if is_stop_button:
+                                conflict_locations.insert(0, "Stop Hotkey")
+                            elif is_area_button:
+                                area_info = self._get_area_info(button)
+                                if area_info:
+                                    area_name = area_info.get('name', 'Unknown Area')
+                                    conflict_locations.insert(0, f"Area: {area_name}")
+                            
+                            # Show the conflict popup
+                            try:
+                                show_hotkey_conflict_warning(self, hotkey_name, conflict_locations)
+                            except Exception as e:
+                                print(f"Error showing hotkey conflict warning: {e}")
+                        
+                        # Ignore the hotkey trigger when conflict is detected
+                        print(f"DEBUG: Ignoring duplicate hotkey trigger for '{hotkey_name}' (last triggered {time_since_last:.3f}s ago)")
+                        return
+                        
+                    # Handle stop button
+                    if hasattr(button, 'is_stop_button'):
+                        self.stop_speaking()
+                        return
+                    
+                    # Handle pause button
+                    if hasattr(button, 'is_pause_button'):
+                        self.toggle_pause_resume()
+                        return
+                    
+                    # Handle edit area button
+                    if hasattr(button, 'is_edit_area_button'):
+                        print(f"DEBUG: Edit area button hotkey triggered, is_edit_area_button={hasattr(button, 'is_edit_area_button')}")
+                        # Toggle edit area: if already open, close it (like pressing Done)
+                        if hasattr(self, 'area_selection_in_progress') and self.area_selection_in_progress:
+                            print("DEBUG: Edit area is open, closing it")
+                            # Edit area is open, close it by calling the done callback
+                            if hasattr(self, '_edit_area_done_callback') and self._edit_area_done_callback:
+                                self._edit_area_done_callback()
+                            else:
+                                print("DEBUG: No done callback found")
+                        else:
+                            print("DEBUG: Edit area is not open, opening it")
+                            # Edit area is not open, open it
+                            self.edit_areas()
+                        return
+                    
+                    # Handle repeat latest area text button
+                    if hasattr(button, 'is_repeat_latest_button'):
+                        # Always use the direct method so it works even when window is closed
+                        if hasattr(self, 'text_log_history') and self.text_log_history:
+                            latest_entry = self.text_log_history[-1]
+                            # Play the text directly using the helper method
+                            self._play_text_log_entry(latest_entry)
+                        else:
+                            print("No Scan History available to repeat.")
+                        return
+                        
+                    # Handle hotkey combo callback (check BEFORE automation callback)
+                    print(f"DEBUG COMBO HOTKEY: Checking for combo callback for hotkey '{hotkey_name}'")
+                    # Try multiple methods to find the callback for maximum reliability
+                    combo_callback = None
+                    
+                    # Method 1: Look up by hotkey name in registry (MOST RELIABLE - doesn't depend on button reference)
+                    if not combo_callback and hotkey_name:
+                        print(f"DEBUG COMBO HOTKEY: Method 1 - Checking registry...")
+                        print(f"DEBUG COMBO HOTKEY: Has _automations_window: {hasattr(self, '_automations_window')}")
+                        # Try to find automations window directly from game_text_reader
+                        if hasattr(self, '_automations_window') and self._automations_window:
+                            automation_window = self._automations_window
+                            print(f"DEBUG COMBO HOTKEY: Automation window exists: {automation_window}")
+                            print(f"DEBUG COMBO HOTKEY: Has combo_callbacks_by_hotkey: {hasattr(automation_window, 'combo_callbacks_by_hotkey')}")
+                            if hasattr(automation_window, 'combo_callbacks_by_hotkey'):
+                                print(f"DEBUG COMBO HOTKEY: Registry keys: {list(automation_window.combo_callbacks_by_hotkey.keys())}")
+                                print(f"DEBUG COMBO HOTKEY: Looking for '{hotkey_name}' in registry...")
+                                if hotkey_name in automation_window.combo_callbacks_by_hotkey:
+                                    combo_callback = automation_window.combo_callbacks_by_hotkey[hotkey_name]
+                                    print(f"DEBUG COMBO HOTKEY: ✓ Found combo callback in registry for hotkey '{hotkey_name}' (via game_text_reader)")
+                                else:
+                                    print(f"DEBUG COMBO HOTKEY: ✗ Hotkey '{hotkey_name}' NOT found in registry")
+                            else:
+                                print(f"DEBUG COMBO HOTKEY: ✗ Automation window does not have combo_callbacks_by_hotkey attribute")
+                        else:
+                            print(f"DEBUG COMBO HOTKEY: ✗ No automation window found or window is None")
+                    
+                    # Method 2: Look up by hotkey name via button's temp_frame
+                    if not combo_callback and hotkey_name:
+                        # Try to find automations window and lookup callback by hotkey
+                        if hasattr(button, '_combo_temp_frame'):
+                            temp_frame = button._combo_temp_frame
+                            if hasattr(temp_frame, '_combo_window'):
+                                automation_window = temp_frame._combo_window
+                                if hasattr(automation_window, 'combo_callbacks_by_hotkey'):
+                                    if hotkey_name in automation_window.combo_callbacks_by_hotkey:
+                                        combo_callback = automation_window.combo_callbacks_by_hotkey[hotkey_name]
+                                        print(f"DEBUG: Found combo callback in registry for hotkey '{hotkey_name}' (via temp_frame)")
+                    
+                    # Method 3: Check button directly
+                    if not combo_callback and hasattr(button, '_combo_callback') and button._combo_callback:
+                        combo_callback = button._combo_callback
+                        print(f"DEBUG: Found combo callback on button directly")
+                    
+                    # Method 4: Get from combo backup
+                    if not combo_callback and hasattr(button, '_combo_temp_frame'):
+                        temp_frame = button._combo_temp_frame
+                        if hasattr(temp_frame, '_combo_ref'):
+                            combo = temp_frame._combo_ref
+                            if isinstance(combo, dict) and combo.get('_hotkey_callback_backup'):
+                                combo_callback = combo['_hotkey_callback_backup']
+                                print(f"DEBUG: Found combo callback from combo backup")
+                    
+                    # If we found a callback, use it
+                    if combo_callback:
+                        print(f"DEBUG COMBO HOTKEY: ✓ Hotkey combo callback found, calling it...")
+                        print(f"DEBUG COMBO HOTKEY: Callback function: {combo_callback}")
+                        try:
+                            print(f"DEBUG COMBO HOTKEY: Executing callback now...")
+                            combo_callback()
+                            print(f"DEBUG COMBO HOTKEY: ✓ Hotkey combo callback executed successfully")
+                        except Exception as e:
+                            print(f"Error in hotkey combo callback: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        finally:
+                            # ALWAYS restore callback after execution to ensure it persists
+                            # Restore to all possible locations for maximum reliability
+                            button._combo_callback = combo_callback
+                            if hasattr(button, '_combo_temp_frame'):
+                                temp_frame = button._combo_temp_frame
+                                if hasattr(temp_frame, '_combo_ref'):
+                                    combo = temp_frame._combo_ref
+                                    if isinstance(combo, dict):
+                                        combo['_hotkey_callback_backup'] = combo_callback
+                                if hasattr(temp_frame, '_combo_window'):
+                                    automation_window = temp_frame._combo_window
+                                    if hasattr(automation_window, 'combo_callbacks_by_hotkey') and hotkey_name:
+                                        automation_window.combo_callbacks_by_hotkey[hotkey_name] = combo_callback
+                            # Also restore to game_text_reader's automations window registry
+                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
+                                if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
+                                    self._automations_window.combo_callbacks_by_hotkey[hotkey_name] = combo_callback
+                            print(f"DEBUG: Restored combo callback to all locations after execution")
+                        return
+                    
+                    # If no callback found, log detailed debug info
+                    print(f"DEBUG: WARNING - No combo callback found for hotkey '{hotkey_name}'")
+                    print(f"DEBUG: Button: {button}, Type: {type(button).__name__}")
+                    print(f"DEBUG: Button has hotkey: {hasattr(button, 'hotkey')}, value: {getattr(button, 'hotkey', None)}")
+                    if hasattr(self, '_automations_window') and self._automations_window:
+                        if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
+                            print(f"DEBUG: Registry contains: {list(self._automations_window.combo_callbacks_by_hotkey.keys())}")
+                    
+                    # Handle automation hotkey callback (check after combo callback)
+                    print(f"DEBUG AUTOMATION HOTKEY: Checking for automation callback for hotkey '{hotkey_name}'")
+                    automation_callback = None
+                    
+                    # Method 1: Look up by hotkey name in registry (MOST RELIABLE - doesn't depend on button reference)
+                    if not automation_callback and hotkey_name:
+                        print(f"DEBUG AUTOMATION HOTKEY: Method 1 - Checking registry...")
+                        print(f"DEBUG AUTOMATION HOTKEY: Has _automations_window: {hasattr(self, '_automations_window')}")
+                        # Try to find automations window directly from game_text_reader
+                        if hasattr(self, '_automations_window') and self._automations_window:
+                            automation_window = self._automations_window
+                            print(f"DEBUG AUTOMATION HOTKEY: Automation window exists: {automation_window}")
+                            print(f"DEBUG AUTOMATION HOTKEY: Has automation_callbacks_by_hotkey: {hasattr(automation_window, 'automation_callbacks_by_hotkey')}")
+                            if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
+                                print(f"DEBUG AUTOMATION HOTKEY: Registry keys: {list(automation_window.automation_callbacks_by_hotkey.keys())}")
+                                print(f"DEBUG AUTOMATION HOTKEY: Looking for '{hotkey_name}' in registry...")
+                                if hotkey_name in automation_window.automation_callbacks_by_hotkey:
+                                    automation_callback = automation_window.automation_callbacks_by_hotkey[hotkey_name]
+                                    print(f"DEBUG AUTOMATION HOTKEY: ✓ Found automation callback in registry for hotkey '{hotkey_name}' (via game_text_reader)")
+                                else:
+                                    print(f"DEBUG AUTOMATION HOTKEY: ✗ Hotkey '{hotkey_name}' NOT found in registry")
+                            else:
+                                print(f"DEBUG AUTOMATION HOTKEY: ✗ Automation window does not have automation_callbacks_by_hotkey attribute")
+                        else:
+                            print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation window found or window is None")
+                    
+                    # Method 2: Check button directly (fallback)
+                    if not automation_callback:
+                        print(f"DEBUG AUTOMATION HOTKEY: Method 2 - Checking button directly...")
+                        print(f"DEBUG AUTOMATION HOTKEY: Button has _automation_callback: {hasattr(button, '_automation_callback')}")
+                        if hasattr(button, '_automation_callback') and button._automation_callback:
+                            automation_callback = button._automation_callback
+                            print(f"DEBUG AUTOMATION HOTKEY: ✓ Found automation callback on button directly")
+                        else:
+                            print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation callback on button")
+                    
+                    # If we found a callback, use it
+                    if automation_callback:
+                        print(f"DEBUG AUTOMATION HOTKEY: ✓ Automation callback found, calling it...")
+                        print(f"DEBUG AUTOMATION HOTKEY: Callback function: {automation_callback}")
+                        # Store callback before calling in case it gets cleared
+                        callback = automation_callback
+                        try:
+                            print(f"DEBUG AUTOMATION HOTKEY: Executing callback now...")
+                            callback()
+                            print(f"DEBUG AUTOMATION HOTKEY: ✓ Automation callback executed successfully")
+                            # Re-set callback after calling to ensure it persists
+                            # This is important because the callback might get cleared
+                            if hasattr(button, '_automation_callback'):
+                                button._automation_callback = callback
+                            # Also restore to registry
+                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
+                                if hasattr(self._automations_window, 'automation_callbacks_by_hotkey'):
+                                    self._automations_window.automation_callbacks_by_hotkey[hotkey_name] = callback
+                            # Also check if there's a backup on the automations window
+                            if hasattr(button, '_automation_temp_frame'):
+                                temp_frame = button._automation_temp_frame
+                                if hasattr(temp_frame, '_automation_window'):
+                                    automation_window = temp_frame._automation_window
+                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
+                                        # Restore from backup if needed
+                                        if not hasattr(button, '_automation_callback') or not button._automation_callback:
+                                            button._automation_callback = automation_window._area_selection_hotkey_callback
+                                            print(f"DEBUG: Restored callback from backup")
+                        except Exception as e:
+                            print(f"DEBUG AUTOMATION HOTKEY: ✗ Error in automation hotkey callback: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Try to restore callback even after error
+                            if hasattr(button, '_automation_callback'):
+                                button._automation_callback = callback
+                            # Also restore to registry
+                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
+                                if hasattr(self._automations_window, 'automation_callbacks_by_hotkey'):
+                                    self._automations_window.automation_callbacks_by_hotkey[hotkey_name] = callback
+                                    print(f"DEBUG AUTOMATION HOTKEY: Restored callback to registry after error")
+                        return
+                    else:
+                        print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation callback found for hotkey '{hotkey_name}'")
+                    
+                    # Try to restore combo callback from backup if it wasn't found
+                    if hasattr(button, '_combo_temp_frame'):
+                        temp_frame = button._combo_temp_frame
+                        if hasattr(temp_frame, '_combo_ref'):
+                            combo = temp_frame._combo_ref
+                            # Combo is a dictionary, access it directly
+                            if isinstance(combo, dict) and combo.get('_hotkey_callback_backup'):
+                                if not hasattr(button, '_combo_callback') or not button._combo_callback:
+                                    button._combo_callback = combo['_hotkey_callback_backup']
+                                    print(f"DEBUG: Restored combo callback from backup")
+                                    # Try calling it now
+                                    try:
+                                        button._combo_callback()
+                                        return
+                                    except Exception as e:
+                                        print(f"Error calling restored combo callback: {e}")
+                    
+                    # Try to restore automation callback from backup if it wasn't found
+                    if hasattr(button, '_automation_temp_frame'):
+                        # Debug: Log why callback wasn't found
+                        if not hasattr(button, '_automation_callback'):
+                            print(f"DEBUG: Button {button} does not have _automation_callback attribute")
+                            # Try to restore from backup
+                            if hasattr(button, '_automation_temp_frame'):
+                                temp_frame = button._automation_temp_frame
+                                if hasattr(temp_frame, '_automation_window'):
+                                    automation_window = temp_frame._automation_window
+                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
+                                        button._automation_callback = automation_window._area_selection_hotkey_callback
+                                        print(f"DEBUG: Restored callback from backup (callback was missing)")
+                                        # Try calling it now
+                                        try:
+                                            button._automation_callback()
+                                            return
+                                        except Exception as e:
+                                            print(f"Error calling restored callback: {e}")
+                        elif not button._automation_callback:
+                            print(f"DEBUG: Button {button} has _automation_callback but it is None/empty")
+                            # Try to restore from backup
+                            if hasattr(button, '_automation_temp_frame'):
+                                temp_frame = button._automation_temp_frame
+                                if hasattr(temp_frame, '_automation_window'):
+                                    automation_window = temp_frame._automation_window
+                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
+                                        button._automation_callback = automation_window._area_selection_hotkey_callback
+                                        print(f"DEBUG: Restored callback from backup (callback was None)")
+                                        # Try calling it now
+                                        try:
+                                            button._automation_callback()
+                                            return
+                                        except Exception as e:
+                                            print(f"Error calling restored callback: {e}")
+                    
+                    # Handle Auto Read area
+                    if hasattr(button, 'area_frame') and button.area_frame:
+                        # Check if the area still exists in the areas list
+                        area_exists = False
+                        for area in self.areas:
+                            if area[0] is button.area_frame:
+                                area_exists = True
+                                break
+                        
+                        if not area_exists:
+                            print(f"Warning: Hotkey triggered for removed area, ignoring")
+                            return
+                        
+                        area_info = self._get_area_info(button)
+                        if area_info and area_info.get('name', '').startswith("Auto Read"):
+                            self.set_auto_read_area(
+                                area_info['frame'], 
+                                area_info['name_var'], 
+                                area_info['set_area_btn'])
+                            return
+                        
+                        # Handle regular areas
+                        if hasattr(button, 'area_frame'):
+                            self.stop_speaking()
+                            threading.Thread(
+                                target=self.read_area, 
+                                args=(button.area_frame,), 
+                                daemon=True
+                            ).start()
+                            
+                except Exception as e:
+                    print(f"Error in hotkey handler: {e}")
+            
+            # Set up the appropriate hook based on hotkey type
+            if button.hotkey.startswith('button'):
+                try:
+                    # For mouse buttons, we need to use mouse.hook() and track button states
+                    # Extract button identifier from hotkey (e.g., "button1" -> 1, "buttonx" -> "x")
+                    button_identifier = button.hotkey.replace('button', '')
+                    
+                    # Check if we have the original button identifier stored
+                    if hasattr(button, 'original_button_id'):
+                        print(f"Setting up mouse hook for button '{button.original_button_id}' (hotkey: {button.hotkey})")
+                    else:
+                        print(f"Setting up mouse hook for button '{button_identifier}' (hotkey: {button.hotkey})")
+                    
+                    # Create a mouse event handler for this specific button
+                    def mouse_button_handler(event):
+                        # Check if input is allowed (centralized check for all input types)
+                        if not InputManager.is_allowed():
+                            return
+                        
+                        # Only process ButtonEvent objects, ignore MoveEvent, WheelEvent, etc.
+                        if not isinstance(event, mouse.ButtonEvent):
+                            return
+                        
+                        # Check if this is the right button by comparing with original_button_id
+                        button_matches = False
+                        
+                        if hasattr(button, 'original_button_id'):
+                            # Use the original button identifier for comparison
+                            button_matches = (event.button == button.original_button_id)
+                        else:
+                            # Fall back to comparing with the extracted identifier
+                            button_matches = (event.button == button_identifier)
+                        
+                        if (button_matches and 
+                            hasattr(event, 'event_type') and event.event_type == mouse.DOWN):
+                            print(f"Mouse button '{event.button}' matched for hotkey '{button.hotkey}'")
+                            hotkey_handler()
+                    
+                    # Store the handler function so we can unhook it later
+                    button.mouse_hook = mouse_button_handler
+                    button.mouse_hook_id = mouse.hook(mouse_button_handler)
+                    print(f"Mouse hook set up for {button.hotkey}")
+                except Exception as e:
+                    print(f"Error setting up mouse hook: {e}")
+                    return False
+            elif button.hotkey.startswith('controller_'):
+                try:
+                    # For controller buttons, we need to monitor controller input
+                    # Extract button identifier from hotkey (e.g., "controller_A" -> "A")
+                    button_identifier = button.hotkey.replace('controller_', '')
+                    
+                    print(f"Setting up controller hook for button '{button_identifier}' (hotkey: {button.hotkey})")
+                    
+                    # Create a controller event handler for this specific button
+                    def controller_button_handler():
+                        # Check if input is allowed (centralized check for all input types)
+                        if not InputManager.is_allowed():
+                            return
+                        
+                        print(f"Controller button '{button_identifier}' pressed for hotkey '{button.hotkey}'")
+                        hotkey_handler()
+                    
+                    # Store the handler function so we can access it later
+                    button.controller_hook = controller_button_handler
+                    
+                    # Start controller monitoring if not already running
+                    if not self.controller_handler.running:
+                        self.controller_handler.start_monitoring()
+                    
+                    print(f"Controller hook set up for {button.hotkey}")
+                    return True
+                except Exception as e:
+                    print(f"Error setting up controller hook: {e}")
+                    return False
+            else:
+                try:
+                    # Validate the hotkey before setting it up
+                    if not button.hotkey or button.hotkey.strip() == '':
+                        print(f"Error: Empty hotkey for button")
+                        return False
+                    
+                    # Enhanced validation for multi-key combinations
+                    hotkey_parts = button.hotkey.split('+')
+                    if len(hotkey_parts) > 1:
+                        print(f"Multi-key hotkey detected: {button.hotkey} ({len(hotkey_parts)} parts)")
+                        
+                        # Validate each part of the combination
+                        valid_parts = []
+                        for part in hotkey_parts:
+                            part = part.strip().lower()
+                            if part in ['ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows']:
+                                valid_parts.append(part)
+                            elif part.startswith('f') and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
+                                valid_parts.append(part)  # Function keys F1-F24
+                            elif part.startswith('num_'):
+                                valid_parts.append(part)  # Numpad keys
+                            elif len(part) == 1 and part.isalnum():
+                                valid_parts.append(part)  # Single character keys
+                            elif part in ['space', 'enter', 'tab', 'backspace', 'delete', 'insert', 'home', 'end', 'page up', 'page down']:
+                                valid_parts.append(part)  # Special keys
+                            else:
+                                print(f"Warning: Unknown hotkey part '{part}' in '{button.hotkey}'")
+                                valid_parts.append(part)  # Still allow it, but warn
+                        
+                        if len(valid_parts) != len(hotkey_parts):
+                            print(f"Some hotkey parts could not be validated")
+                    
+                    # Check for special characters and warn about potential issues
+                    is_special = is_special_character(button.hotkey)
+                    if is_special:
+                        print(f"WARNING: Hotkey '{button.hotkey}' contains special characters that may cause issues")
+                        alternative = suggest_alternative_key(button.hotkey)
+                        if alternative:
+                            print(f"Consider using '{alternative}' instead for better compatibility")
+                        
+                        # Check if this hotkey would conflict with existing ones
+                        if not self._check_hotkey_uniqueness(button.hotkey, button):
+                            print(f"WARNING: Hotkey '{button.hotkey}' conflicts with an existing hotkey")
+                            print(f"This may cause both hotkeys to trigger the same action")
+                            print(f"Please choose a different hotkey to avoid conflicts")
+                            return False
+                    
+                    # Check for problematic characters in numpad keys
+                    if button.hotkey.startswith('num_'):
+                        if len(button.hotkey) < 5:  # num_ + at least 1 character
+                            print(f"Error: Invalid numpad hotkey format: '{button.hotkey}'")
+                            return False
+                        
+                        # Additional validation for numpad keys
+                        numpad_part = button.hotkey[4:]  # Get the part after 'num_'
+                        if not numpad_part or numpad_part.strip() == '':
+                            print(f"Error: Empty numpad key part in hotkey: '{button.hotkey}'")
+                            return False
+                        
+                        # Check if the numpad key is valid
+                        valid_numpad_keys = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'multiply', 'add', 'subtract', '.', 'divide', 'enter']
+                        if numpad_part not in valid_numpad_keys:
+                            print(f"Error: Invalid numpad key '{numpad_part}' in hotkey: '{button.hotkey}'")
+                            print(f"Valid numpad keys: {valid_numpad_keys}")
+                            return False
+                        
+                        # Note: Special characters (*, +, -, /) are now handled by using descriptive names
+                        # in the numpad_scan_codes dictionary (multiply, add, subtract, divide)
+                    
+                    # Set up the keyboard hook (preserving original hotkey)
+                    try:
+                        # Debug: Log the exact hotkey being registered
+                        print(f"Registering hotkey: '{button.hotkey}' (length: {len(button.hotkey)}, bytes: {button.hotkey.encode('utf-8')})")
+                        
+                        # Special handling for ctrl key to prevent cross-activation
+                        if button.hotkey == 'ctrl':
+                            # Use both scan codes to catch either left or right Ctrl
+                            button.keyboard_hook = keyboard.add_hotkey('ctrl', hotkey_handler)
+                            print(f"Ctrl hotkey hook set up for both left and right Ctrl")
+                        else:
+                            # Enhanced key type detection with scan code-based handlers
+                            hotkey_parts = button.hotkey.split('+')
+                            base_key = hotkey_parts[-1].strip().lower()
+                            
+                            # Check if this is a numpad hotkey that needs special handling
+                            if button.hotkey.startswith('num_'):
+                                # Use custom scan code-based handler for numpad keys
+                                button.keyboard_hook = self._setup_numpad_hotkey_handler(button.hotkey, hotkey_handler)
+                                if button.keyboard_hook is not None:
+                                    print(f"Custom numpad hotkey handler set up for '{button.hotkey}'")
+                                    # Skip all other handlers since we have a custom numpad handler
+                                    return True
+                                else:
+                                    print(f"ERROR: Numpad handler returned None for '{button.hotkey}', will try other handlers")
+                            # Check if this is an arrow key that needs special handling
+                            elif base_key in ['up', 'down', 'left', 'right']:
+                                # Use custom scan code-based handler for arrow keys
+                                button.keyboard_hook = self._setup_arrow_key_hotkey_handler(button.hotkey, hotkey_handler)
+                                print(f"Custom arrow key hotkey handler set up for '{button.hotkey}'")
+                            # Check if this is a special key that needs special handling
+                            elif base_key in ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+                                              'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f20', 'f21', 'f22', 'f23', 'f24',
+                                              'num lock', 'scroll lock', 'insert', 'home', 'end', 'page up', 'page down',
+                                              'delete', 'tab', 'enter', 'backspace', 'space', 'escape']:
+                                # Use custom scan code-based handler for special keys
+                                print(f"DEBUG: Setting up special key handler for '{button.hotkey}' (base_key: '{base_key}')")
+                                button.keyboard_hook = self._setup_special_key_hotkey_handler(button.hotkey, hotkey_handler)
+                                if button.keyboard_hook is None:
+                                    print(f"ERROR: Special key handler returned None for '{button.hotkey}', falling back to regular handler")
+                                    # Fall back to regular handler
+                                    hotkey_to_register = self._convert_numpad_hotkey_for_keyboard(button.hotkey)
+                                    print(f"DEBUG: Setting up regular keyboard handler for '{button.hotkey}' (base_key: '{base_key}')")
+                                    button.keyboard_hook = keyboard.add_hotkey(hotkey_to_register, hotkey_handler)
+                                else:
+                                    print(f"Custom special key hotkey handler set up for '{button.hotkey}'")
+                            # Check if this is a regular keyboard number that needs special handling
+                            elif base_key in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
+                                # Use custom scan code-based handler for regular keyboard numbers
+                                button.keyboard_hook = self._setup_keyboard_number_hotkey_handler(button.hotkey, hotkey_handler)
+                                print(f"Custom keyboard number hotkey handler set up for '{button.hotkey}'")
+                            else:
+                                # Convert numpad hotkeys to keyboard library compatible format
+                                hotkey_to_register = self._convert_numpad_hotkey_for_keyboard(button.hotkey)
+                                
+                                # Debug: Log the conversion
+                                if hotkey_to_register != button.hotkey:
+                                    print(f"Converted hotkey '{button.hotkey}' to '{hotkey_to_register}' for keyboard library")
+                                
+                                # Use add_hotkey for ALL hotkeys - EXACT same as regular automation hotkeys
+                                # The hotkey_handler will find and call _combo_callback or _automation_callback automatically
+                                print(f"DEBUG: Setting up keyboard handler for '{button.hotkey}' (base_key: '{base_key}')")
+                                button.keyboard_hook = keyboard.add_hotkey(hotkey_to_register, hotkey_handler)
+                            
+                            if len(hotkey_parts) > 1:
+                                print(f"Multi-key hotkey registered successfully: '{button.hotkey}'")
+                            elif is_special:
+                                print(f"Keyboard hook set up for special character hotkey: '{button.hotkey}'")
+                            else:
+                                print(f"Keyboard hook set up for '{button.hotkey}'")
+                    except Exception as e:
+                        print(f"Error setting up keyboard hook: {e}")
+                        print(f"Hotkey value: '{button.hotkey}' (length: {len(button.hotkey) if button.hotkey else 0})")
+                        
+                        # Try to provide helpful error messages for common issues
+                        if "invalid" in str(e).lower() or "unknown" in str(e).lower():
+                            print(f"This might be due to an unsupported key combination")
+                            print(f"Try using simpler combinations or check key names")
+                        elif "already" in str(e).lower() or "exists" in str(e).lower():
+                            print(f"This hotkey might already be registered elsewhere")
+                        
+                        return False
+                except Exception as e:
+                    print(f"Error setting up keyboard hook: {e}")
+                    print(f"Hotkey value: '{button.hotkey}' (length: {len(button.hotkey) if button.hotkey else 0})")
+                    return False
+                    
+            # Final check: Ensure automation callback is still set after handler creation
+            # This is critical because the handler checks for it at runtime
+            if preserved_automation_callback:
+                if not hasattr(button, '_automation_callback') or not button._automation_callback:
+                    button._automation_callback = preserved_automation_callback
+                    print(f"DEBUG: Restored automation callback at end of setup_hotkey")
+                if preserved_automation_temp_frame:
+                    button._automation_temp_frame = preserved_automation_temp_frame
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error in setup_hotkey: {e}")
+            # Try to restore callback even if there was an error
+            if 'preserved_automation_callback' in locals() and preserved_automation_callback:
+                if hasattr(button, '_automation_callback'):
+                    button._automation_callback = preserved_automation_callback
+            return False
+            
+    def _setup_keyboard_number_hotkey_handler(self, hotkey, handler_func):
+        """Set up a custom scan code-based handler for regular keyboard number hotkeys"""
+        # Extract the number from the hotkey (e.g., "2" from "2" or "ctrl+2")
+        hotkey_parts = hotkey.split('+')
+        number_key = hotkey_parts[-1].strip()  # Get the last part (the actual key)
+        
+        # Check if this is a regular keyboard number
+        if number_key not in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
+            return None
+            
+        # Get the scan code for this keyboard number
+        target_scan_code = None
+        for scan_code, key_name in self.keyboard_number_scan_codes.items():
+            if key_name == number_key:
+                target_scan_code = scan_code
+                break
+                
+        if target_scan_code is None:
+            print(f"Warning: Could not find scan code for keyboard number '{number_key}'")
+            return None
+        
+        # Get numpad scan codes to exclude them
+        numpad_scan_codes_for_this_number = []
+        for scan_code, key_name in self.numpad_scan_codes.items():
+            if key_name == number_key:
+                numpad_scan_codes_for_this_number.append(scan_code)
+        
+        # Track last processed event to prevent duplicate triggers
+        if not hasattr(self, '_keyboard_number_handler_last_event'):
+            self._keyboard_number_handler_last_event = {}
+        
+        # Use hook method with scan code detection to distinguish from numpad keys
+        print(f"DEBUG: Using scan code-based hook method for keyboard number '{hotkey}' to distinguish from numpad keys")
+        def custom_handler(event):
+            try:
+                # Only process key down events to prevent duplicate triggers
+                if hasattr(event, 'event_type'):
+                    if event.event_type != 'down':
+                        return None  # Don't process key up events
+                
+                # Check if this is the correct scan code for the regular keyboard number
+                if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                    # Also verify this is NOT a numpad scan code
+                    if event.scan_code in numpad_scan_codes_for_this_number:
+                        # This is a numpad key, not a regular keyboard number - reject it
+                        return None
+                    
+                    # Check event name to ensure it's not a numpad key
+                    event_name = (event.name or '').lower()
+                    if event_name.startswith('numpad ') or event_name == f'numpad {number_key}':
+                        # This is a numpad key event - reject it
+                        return None
+                    
+                    # Check modifiers if they're part of the hotkey
+                    if len(hotkey_parts) > 1:
+                        # Extract modifiers from hotkey
+                        modifiers = [part.strip().lower() for part in hotkey_parts[:-1]]
+                        
+                        # Check if required modifiers are pressed
+                        modifiers_ok = True
+                        if 'ctrl' in modifiers:
+                            if not (keyboard.is_pressed('ctrl') or keyboard.is_pressed('left ctrl') or keyboard.is_pressed('right ctrl')):
+                                modifiers_ok = False
+                        if 'shift' in modifiers:
+                            if not keyboard.is_pressed('shift'):
+                                modifiers_ok = False
+                        if 'alt' in modifiers or 'left alt' in modifiers:
+                            if not keyboard.is_pressed('left alt'):
+                                modifiers_ok = False
+                        if 'right alt' in modifiers:
+                            if not keyboard.is_pressed('right alt'):
+                                modifiers_ok = False
+                        if 'windows' in modifiers:
+                            if not (keyboard.is_pressed('windows') or keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows')):
+                                modifiers_ok = False
+                        
+                        if not modifiers_ok:
+                            return None  # Required modifiers not pressed
+                    
+                    import threading
+                    import time
+                    thread_id = threading.current_thread().ident
+                    
+                    # Prevent duplicate processing within a very short time window
+                    current_time = time.time()
+                    if hotkey in self._keyboard_number_handler_last_event:
+                        last_time = self._keyboard_number_handler_last_event[hotkey]
+                        time_since_last = current_time - last_time
+                        if time_since_last < 0.05:  # 50ms window
+                            print(f"DEBUG: Skipping duplicate event for keyboard number hotkey '{hotkey}' (last triggered {time_since_last*1000:.1f}ms ago)")
+                            return False
+                    
+                    # Store the current time as the last processed time for this hotkey
+                    self._keyboard_number_handler_last_event[hotkey] = current_time
+                    
+                    print(f"Keyboard number hotkey triggered: {hotkey} (scan code: {target_scan_code}, event: {event_name}, thread: {thread_id})")
+                    
+                    try:
+                        handler_func()
+                    except Exception as e:
+                        print(f"ERROR: Exception in handler_func for keyboard number hotkey '{hotkey}': {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # Suppress the event to prevent other handlers from also triggering
+                    return False
+                    
+            except Exception as e:
+                print(f"Error in custom keyboard number handler: {e}")
+        
+        # Set up the keyboard hook
+        hook_id = keyboard.hook(custom_handler)
+        print(f"Keyboard number hotkey '{hotkey}' registered with hook (scan code: {target_scan_code})")
+        return hook_id
+
+    def _setup_numpad_hotkey_handler(self, hotkey, handler_func):
+        """Set up a custom scan code-based handler for numpad hotkeys"""
+        if not hotkey.startswith('num_'):
+            return None
+            
+        numpad_key = hotkey[4:]  # Remove 'num_' prefix
+        
+        # Get the scan code for this numpad key
+        target_scan_code = None
+        for scan_code, key_name in self.numpad_scan_codes.items():
+            if key_name == numpad_key:
+                target_scan_code = scan_code
+                break
+                
+        if target_scan_code is None:
+            print(f"Warning: Could not find scan code for numpad key '{numpad_key}'")
+            return None
+        
+        # Get regular keyboard number scan codes to exclude them
+        keyboard_number_scan_codes_for_this_number = []
+        if numpad_key in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
+            for scan_code, key_name in self.keyboard_number_scan_codes.items():
+                if key_name == numpad_key:
+                    keyboard_number_scan_codes_for_this_number.append(scan_code)
+        
+        # Track last processed event to prevent duplicate triggers
+        # Use a dictionary keyed by hotkey to track per-hotkey state
+        if not hasattr(self, '_numpad_handler_last_event'):
+            self._numpad_handler_last_event = {}
+            
+        # For numpad keys, we need to use scan code-based detection to distinguish
+        # between regular keyboard keys and numpad keys (e.g., regular / vs numpad /)
+        # So we'll use the hook method directly instead of trying add_hotkey
+        print(f"DEBUG: Using scan code-based hook method for numpad '{hotkey}' to distinguish from regular keyboard keys")
+        # Use hook method directly
+        def custom_handler(event):
+            try:
+                # Only process key down events to prevent duplicate triggers
+                # Check if this is a keyboard event and if it's a key down event
+                if hasattr(event, 'event_type'):
+                    # For keyboard events, event_type might be 'down' or 'up'
+                    # We only want to process 'down' events to avoid duplicate triggers
+                    if event.event_type != 'down':
+                        return None  # Don't process key up events
+                elif hasattr(event, 'name') and hasattr(event, 'scan_code'):
+                    # If event_type is not available, assume it's a key down event
+                    # This is a fallback for compatibility
+                    pass
+                else:
+                    # Not a keyboard event, skip it
+                    return None
+                
+                # Check if this is the correct scan code AND event name
+                if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                    # Also verify this is NOT a regular keyboard number scan code
+                    if event.scan_code in keyboard_number_scan_codes_for_this_number:
+                        # This is a regular keyboard number, not a numpad key - reject it
+                        return None
+                    
+                    # Also check the event name to distinguish from arrow keys
+                    event_name = (event.name or '').lower()
+                    
+                    # For conflicting scan codes, we need to be more careful with event name checks
+                    # For non-conflicting codes, scan code is definitive so we can be lenient
+                    conflicting_scan_codes = [75, 72, 77, 80]  # numpad 4/left, 8/up, 6/right, 2/down
+                    is_conflicting_scan_code = target_scan_code in conflicting_scan_codes
+                    
+                    # Only check event name for regular keyboard numbers if this is NOT a conflicting scan code
+                    # For conflicting codes, we'll check NumLock state later
+                    # For non-conflicting codes, scan code is unique to numpad so we trust it
+                    if not is_conflicting_scan_code and numpad_key in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']:
+                        # For non-conflicting codes, if scan code matches, it's definitely numpad
+                        # Event name might be just the number, which is fine - scan code is definitive
+                        pass  # Don't reject based on event name for non-conflicting codes
+                    
+                    # First, check if this is an arrow key event name - if so, reject immediately
+                    # Arrow keys should NEVER trigger numpad handlers, regardless of NumLock state
+                    arrow_key_names = ['up', 'down', 'left', 'right', 'pil opp', 'pil ned', 'pil venstre', 'pil høyre']
+                    if event_name in arrow_key_names:
+                        # This is definitely an arrow key, not a numpad key - reject it
+                        print(f"Numpad handler: Rejecting arrow key event '{event_name}' (scan code: {target_scan_code})")
+                        return None  # Don't suppress, let arrow handler process it
+                    
+                    # Check if this is actually a numpad key (not an arrow key)
+                    # Accept multiple formats: "numpad X", "X", and raw symbols for special keys
+                    expected_numpad_name = f"numpad {numpad_key}"
+                    raw_symbol = None
+                    
+                    # Map special numpad keys to their raw symbols
+                    if numpad_key == 'multiply':
+                        raw_symbol = '*'
+                    elif numpad_key == 'add':
+                        raw_symbol = '+'
+                    elif numpad_key == 'subtract':
+                        raw_symbol = '-'
+                    elif numpad_key == 'divide':
+                        raw_symbol = '/'
+                    elif numpad_key == '.':
+                        raw_symbol = '.'
+                    
+                    # Check if the event name matches any of the expected formats
+                    event_name_matches = (event_name == expected_numpad_name or 
+                                         event_name == numpad_key or 
+                                         (raw_symbol and event_name == raw_symbol))
+                    
+                    # For scan codes that conflict with arrow keys (75, 72, 77, 80), 
+                    # we MUST check NumLock state to distinguish numpad keys from arrow keys
+                    # (is_conflicting_scan_code already determined above)
+                    numlock_is_on = False
+                    
+                    if is_conflicting_scan_code:
+                        try:
+                            # Check NumLock state using Windows API
+                            import ctypes
+                            VK_NUMLOCK = 0x90
+                            numlock_is_on = bool(ctypes.windll.user32.GetKeyState(VK_NUMLOCK) & 1)
+                        except Exception:
+                            # Fallback: try keyboard library
+                            try:
+                                numlock_is_on = keyboard.is_pressed('num lock')
+                            except Exception:
+                                pass
+                    
+                    # Accept the event if:
+                    # 1. For conflicting scan codes: accept if:
+                    #    - NumLock is ON AND event name matches numpad formats, OR
+                    #    - Event name clearly indicates numpad key (like "4" or "numpad 4") even if NumLock is OFF
+                    #    This allows numpad hotkeys to work even when NumLock is OFF, while preventing arrow keys from triggering numpad handlers
+                    # 2. For non-conflicting scan codes: accept if scan code matches (event name check is optional)
+                    #    Since scan code is unique to numpad for non-conflicting codes, we can be more lenient
+                    if is_conflicting_scan_code:
+                        # FIRST: Check if an arrow hotkey is registered for this scan code
+                        # If it is, we must reject this numpad event to keep them mutually exclusive
+                        arrow_key_map = {75: 'left', 72: 'up', 77: 'right', 80: 'down'}
+                        expected_arrow_key = arrow_key_map.get(target_scan_code)
+                        has_arrow_hotkey = False
+                        
+                        if expected_arrow_key:
+                            # Check all areas for an arrow hotkey matching this scan code
+                            for area_tuple in getattr(self, 'areas', []):
+                                if len(area_tuple) >= 9:
+                                    area_frame, hotkey_button, _, _, _, _, _, _, _ = area_tuple[:9]
+                                else:
+                                    area_frame, hotkey_button, _, _, _, _, _, _ = area_tuple[:8]
+                                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == expected_arrow_key:
+                                    has_arrow_hotkey = True
+                                    break
+                            
+                            # Also check stop hotkey
+                            if hasattr(self, 'stop_hotkey') and self.stop_hotkey == expected_arrow_key:
+                                has_arrow_hotkey = True
+                        
+                        if has_arrow_hotkey:
+                            # Arrow hotkey is registered for this scan code - reject numpad event
+                            # This keeps them mutually exclusive
+                            print(f"Numpad handler: Rejecting - arrow hotkey '{expected_arrow_key}' is registered for scan code {target_scan_code}")
+                            should_accept = False
+                        else:
+                            # No arrow hotkey registered - proceed with numpad logic
+                            # For conflicting scan codes, check if event name clearly indicates numpad
+                            # If event name is the numpad number or "numpad X", accept it even if NumLock is OFF
+                            # This allows numpad hotkeys to work regardless of NumLock state
+                            event_name_clearly_numpad = (event_name == numpad_key or 
+                                                         event_name == expected_numpad_name or
+                                                         (numpad_key in ['2', '4', '6', '8'] and event_name == numpad_key))
+                            
+                            if event_name_clearly_numpad:
+                                # Event name clearly indicates numpad - accept it regardless of NumLock state
+                                should_accept = True
+                            elif numlock_is_on and event_name_matches:
+                                # NumLock is ON and event name matches - accept it
+                                should_accept = True
+                            else:
+                                # Event name doesn't clearly indicate numpad and NumLock is OFF
+                                # Check if this numpad hotkey is actually registered - if it is, accept it
+                                # This handles the case where NumLock is OFF and event name is "left"/"right"/etc.
+                                # but we want the numpad hotkey to work
+                                numpad_hotkey_registered = False
+                                
+                                # Check all areas for this numpad hotkey
+                                for area_tuple in getattr(self, 'areas', []):
+                                    if len(area_tuple) >= 9:
+                                        area_frame, hotkey_button, _, _, _, _, _, _, _ = area_tuple[:9]
+                                    else:
+                                        area_frame, hotkey_button, _, _, _, _, _, _ = area_tuple[:8]
+                                    if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == hotkey:
+                                        numpad_hotkey_registered = True
+                                        break
+                                
+                                # Also check stop hotkey
+                                if hasattr(self, 'stop_hotkey') and self.stop_hotkey == hotkey:
+                                    numpad_hotkey_registered = True
+                                
+                                if numpad_hotkey_registered:
+                                    # This numpad hotkey is registered - accept it even if event name is ambiguous
+                                    # This allows numpad hotkeys to work when NumLock is OFF
+                                    should_accept = True
+                                else:
+                                    # No numpad hotkey registered - reject it to prevent arrow keys from triggering
+                                    should_accept = False
+                    else:
+                        # For non-conflicting scan codes, the scan code is unique to numpad
+                        # So if scan code matches (already verified above), accept it
+                        # Scan code is definitive - event name check is just for logging/debugging
+                        should_accept = True
+                    
+                    if should_accept:
+                        import threading
+                        import time
+                        thread_id = threading.current_thread().ident
+                        
+                        # Prevent duplicate processing within a very short time window
+                        # This catches cases where the same key press triggers multiple events
+                        current_time = time.time()
+                        
+                        # Check if we've already processed this hotkey very recently (within 50ms)
+                        if hotkey in self._numpad_handler_last_event:
+                            last_time = self._numpad_handler_last_event[hotkey]
+                            time_since_last = current_time - last_time
+                            if time_since_last < 0.05:  # 50ms window
+                                print(f"DEBUG: Skipping duplicate event for numpad hotkey '{hotkey}' (last triggered {time_since_last*1000:.1f}ms ago)")
+                                return False
+                        
+                        # Store the current time as the last processed time for this hotkey
+                        self._numpad_handler_last_event[hotkey] = current_time
+                        
+                        print(f"Numpad hotkey triggered: {hotkey} (scan code: {target_scan_code}, event: {event_name}, thread: {thread_id}, numlock: {numlock_is_on})")
+                        print(f"DEBUG: Numpad handler function ID: {id(custom_handler)}")
+                        
+                        # Don't do debouncing here - let the hotkey_handler function handle it
+                        # This prevents double debouncing where the handler sees it was just updated
+                        
+                        print(f"DEBUG: Calling handler_func for numpad hotkey '{hotkey}'")
+                        try:
+                            handler_func()
+                            print(f"DEBUG: handler_func completed for numpad hotkey '{hotkey}'")
+                        except Exception as e:
+                            print(f"ERROR: Exception in handler_func for numpad hotkey '{hotkey}': {e}")
+                            import traceback
+                            traceback.print_exc()
+                        # Suppress the event to prevent other handlers from also triggering
+                        return False
+                    else:
+                        expected_formats = [expected_numpad_name, numpad_key]
+                        if raw_symbol:
+                            expected_formats.append(raw_symbol)
+                        if is_conflicting_scan_code:
+                            expected_formats.append(f"(numlock on)")
+                        print(f"Numpad handler: Ignoring key with scan code {target_scan_code} but event name '{event_name}' (expected {', '.join(expected_formats)}, numlock: {numlock_is_on})")
+                    
+            except Exception as e:
+                print(f"Error in custom numpad handler: {e}")
+        
+        # Set up the keyboard hook
+        hook_id = keyboard.hook(custom_handler)
+        print(f"Numpad hotkey '{hotkey}' registered with hook (scan code: {target_scan_code})")
+        
+        # Also try to block the key to prevent other handlers
+        try:
+            # Get the raw symbol for blocking
+            raw_symbol = None
+            if numpad_key == 'multiply':
+                raw_symbol = '*'
+            elif numpad_key == 'add':
+                raw_symbol = '+'
+            elif numpad_key == 'subtract':
+                raw_symbol = '-'
+            elif numpad_key == 'divide':
+                raw_symbol = '/'
+            elif numpad_key == '.':
+                raw_symbol = '.'
+            
+            if raw_symbol:
+                print(f"DEBUG: Attempting to block key '{raw_symbol}' to prevent double triggering")
+                # Note: keyboard.block_key() might not work for all keys, but it's worth trying
+        except Exception as e:
+            print(f"DEBUG: Could not block key: {e}")
+        
+        return hook_id
+
+    def _setup_arrow_key_hotkey_handler(self, hotkey, handler_func):
+        """Set up a custom scan code-based handler for arrow key hotkeys"""
+        # Extract the arrow key from the hotkey (e.g., "right" from "right" or "ctrl+right")
+        hotkey_parts = hotkey.split('+')
+        arrow_key = hotkey_parts[-1].strip().lower()  # Get the last part (the actual key)
+        
+        # Check if this is an arrow key
+        if arrow_key not in ['up', 'down', 'left', 'right']:
+            return None
+            
+        # Get the scan code for this arrow key
+        target_scan_code = None
+        for scan_code, key_name in self.arrow_key_scan_codes.items():
+            if key_name == arrow_key:
+                target_scan_code = scan_code
+                break
+                
+        if target_scan_code is None:
+            print(f"Warning: Could not find scan code for arrow key '{arrow_key}'")
+            return None
+            
+        # Create a custom handler that checks both scan codes and event names
+        def custom_handler(event):
+            try:
+                # Check if this is the correct scan code AND event name
+                if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                    # Get event name early for checking
+                    event_name = (event.name or '').lower()
+                    
+                    # Check NumLock state for conflicting scan codes (75, 72, 77, 80)
+                    # If NumLock is on, these scan codes should be treated as numpad keys, not arrow keys
+                    conflicting_scan_codes = {75: 'left', 72: 'up', 77: 'right', 80: 'down'}  # numpad 4/left, 8/up, 6/right, 2/down
+                    is_conflicting_scan_code = target_scan_code in conflicting_scan_codes
+                    numlock_is_on = False
+                    
+                    if is_conflicting_scan_code:
+                        try:
+                            # Check NumLock state using Windows API
+                            import ctypes
+                            VK_NUMLOCK = 0x90
+                            numlock_is_on = bool(ctypes.windll.user32.GetKeyState(VK_NUMLOCK) & 1)
+                        except Exception:
+                            # Fallback: try keyboard library
+                            try:
+                                numlock_is_on = keyboard.is_pressed('num lock')
+                            except Exception:
+                                pass
+                        
+                        # If NumLock is on, this is definitely a numpad key, not an arrow key - reject immediately
+                        if numlock_is_on:
+                            print(f"Arrow key handler: Rejecting key with scan code {target_scan_code} (NumLock is on, this is numpad key, event: {event_name})")
+                            return None  # Don't suppress, let numpad handler process it
+                    
+                    # Also check the event name to distinguish from numpad keys
+                    
+                    # First, check if this is a numpad key event name - if so, reject immediately
+                    # Numpad keys should NEVER trigger arrow handlers, regardless of NumLock state
+                    # Check for numpad number formats: "4", "numpad 4", etc.
+                    numpad_number_names = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+                    if event_name in numpad_number_names:
+                        # This is definitely a numpad number, not an arrow key - reject it
+                        print(f"Arrow key handler: Rejecting numpad number event '{event_name}' (scan code: {target_scan_code})")
+                        return None  # Don't suppress, let numpad handler process it
+                    
+                    # Also check for "numpad X" format
+                    if event_name.startswith('numpad '):
+                        print(f"Arrow key handler: Rejecting numpad event '{event_name}' (scan code: {target_scan_code})")
+                        return None  # Don't suppress, let numpad handler process it
+                    
+                    # For conflicting scan codes, check if numpad hotkey is registered FIRST
+                    # This must happen before checking event name, because when NumLock is OFF,
+                    # numpad keys send arrow key event names (e.g., numpad 4 sends "left")
+                    if is_conflicting_scan_code and not numlock_is_on:
+                        # NumLock is OFF - check if there's a numpad hotkey registered for this scan code
+                        # Map conflicting scan codes to their numpad numbers
+                        numpad_number_map = {75: '4', 72: '8', 77: '6', 80: '2'}
+                        expected_numpad_number = numpad_number_map.get(target_scan_code)
+                        
+                        if expected_numpad_number:
+                            numpad_hotkey = f"num_{expected_numpad_number}"
+                            has_numpad_hotkey = False
+                            
+                            # Check all areas for a numpad hotkey matching this scan code
+                            for area_tuple in getattr(self, 'areas', []):
+                                if len(area_tuple) >= 9:
+                                    area_frame, hotkey_button, _, _, _, _, _, _, _ = area_tuple[:9]
+                                else:
+                                    area_frame, hotkey_button, _, _, _, _, _, _ = area_tuple[:8]
+                                if hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey == numpad_hotkey:
+                                    has_numpad_hotkey = True
+                                    break
+                            
+                            # Also check stop hotkey
+                            if hasattr(self, 'stop_hotkey') and self.stop_hotkey == numpad_hotkey:
+                                has_numpad_hotkey = True
+                            
+                            if has_numpad_hotkey:
+                                # There's a numpad hotkey registered for this scan code
+                                # Reject this arrow key event to let the numpad handler process it
+                                print(f"Arrow key handler: Rejecting - numpad hotkey '{numpad_hotkey}' is registered for scan code {target_scan_code} (event: {event_name})")
+                                return None  # Don't suppress, let numpad handler process it
+                        
+                        # Also check if event name is just the numpad number
+                        if expected_numpad_number and event_name == expected_numpad_number:
+                            # Event name is just the numpad number - this is a numpad key, not arrow key
+                            print(f"Arrow key handler: Rejecting numpad key (event name is numpad number '{event_name}', scan code: {target_scan_code})")
+                            return None  # Don't suppress, let numpad handler process it
+                    
+                    # Check if this is actually an arrow key (not a numpad key)
+                    # For conflicting scan codes, we also require NumLock to be OFF (already checked above)
+                    # AND the event name must be an arrow key name (not a number)
+                    arrow_key_names_map = {
+                        'right': ['right', 'pil høyre'],
+                        'left': ['left', 'pil venstre'],
+                        'up': ['up', 'pil opp'],
+                        'down': ['down', 'pil ned']
+                    }
+                    
+                    expected_arrow_names = arrow_key_names_map.get(arrow_key, [])
+                    if event_name in expected_arrow_names:
+                        # Event name matches arrow key - accept it
+                        # (Numpad hotkey check already done above for conflicting codes)
+                        
+                        print(f"Arrow key hotkey triggered: {hotkey} (scan code: {target_scan_code}, event: {event_name})")
+                        handler_func()
+                        # Suppress the event to prevent other handlers from also triggering
+                        return False
+                    else:
+                        print(f"Arrow key handler: Ignoring key with scan code {target_scan_code} but event name '{event_name}' (expected {expected_arrow_names})")
+                    
+            except Exception as e:
+                print(f"Error in custom arrow key handler: {e}")
+        
+        # Instead of using keyboard.hook(), use keyboard.add_hotkey() without suppression
+        # This allows the key to work in other programs while still triggering the hotkey
+        try:
+            print(f"DEBUG: Using add_hotkey without suppression for arrow key '{hotkey}'")
+            hook_id = keyboard.add_hotkey(hotkey, handler_func, suppress=False)
+            print(f"Arrow key hotkey '{hotkey}' registered with add_hotkey (scan code: {target_scan_code})")
+            return hook_id
+        except Exception as e:
+            print(f"Error using add_hotkey for arrow key '{hotkey}': {e}")
+            # Fall back to hook method
+            # Set up the keyboard hook
+            hook_id = keyboard.hook(custom_handler)
+            print(f"Arrow key hotkey '{hotkey}' registered with hook (scan code: {target_scan_code})")
+            return hook_id
+
+    def _setup_special_key_hotkey_handler(self, hotkey, handler_func):
+        """Set up a custom scan code-based handler for special key hotkeys"""
+        # Extract the special key from the hotkey (e.g., "f1" from "f1" or "ctrl+f1")
+        hotkey_parts = hotkey.split('+')
+        special_key = hotkey_parts[-1].strip().lower()  # Get the last part (the actual key)
+        
+        print(f"DEBUG: _setup_special_key_hotkey_handler called for hotkey '{hotkey}', special_key '{special_key}'")
+        
+        # Check if this is a special key
+        if special_key not in ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+                              'f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f20', 'f21', 'f22', 'f23', 'f24',
+                              'num lock', 'scroll lock', 'insert', 'home', 'end', 'page up', 'page down',
+                              'delete', 'tab', 'enter', 'backspace', 'space', 'escape']:
+            print(f"DEBUG: Special key '{special_key}' not in allowed list, returning None")
+            return None
+            
+        # Get the scan code for this special key
+        target_scan_code = None
+        for scan_code, key_name in self.special_key_scan_codes.items():
+            if key_name == special_key:
+                target_scan_code = scan_code
+                break
+                
+        if target_scan_code is None:
+            print(f"Warning: Could not find scan code for special key '{special_key}'")
+            return None
+            
+        print(f"DEBUG: Found scan code {target_scan_code} for special key '{special_key}'")
+        
+        # For F13-F24, use hook method directly as keyboard library may not support them
+        # For other keys, try add_hotkey first, then fall back to hook
+        if special_key in ['f13', 'f14', 'f15', 'f16', 'f17', 'f18', 'f19', 'f20', 'f21', 'f22', 'f23', 'f24']:
+            # Use hook method directly for F13-F24
+            def custom_handler(event):
+                try:
+                    # Check if this is the correct scan code and it's a key down event
+                    if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                        if hasattr(event, 'event_type') and event.event_type == 'down':
+                            print(f"Special key hotkey triggered: {hotkey} (scan code: {target_scan_code})")
+                            handler_func()
+                            # Don't suppress - allow key to work normally
+                            return True
+                except Exception as e:
+                    print(f"Error in custom special key handler: {e}")
+                return True
+            
+            # Set up the keyboard hook
+            hook_id = keyboard.hook(custom_handler)
+            print(f"Special key hotkey '{hotkey}' registered with hook (scan code: {target_scan_code})")
+            return hook_id
+        else:
+            # For F1-F12 and other special keys, try add_hotkey first
+            # Instead of using keyboard.hook(), use keyboard.add_hotkey() without suppression
+            # This allows the key to work in other programs while still triggering the hotkey
+            try:
+                print(f"DEBUG: Using add_hotkey without suppression for '{hotkey}'")
+                hook_id = keyboard.add_hotkey(hotkey, handler_func, suppress=False)
+                print(f"Special key hotkey '{hotkey}' registered with add_hotkey (scan code: {target_scan_code})")
+                return hook_id
+            except Exception as e:
+                print(f"Error using add_hotkey for '{hotkey}': {e}")
+                # Fall back to hook method
+                def custom_handler(event):
+                    try:
+                        # Check if this is the correct scan code
+                        if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                            print(f"Special key hotkey triggered: {hotkey} (scan code: {target_scan_code})")
+                            handler_func()
+                            # Suppress the event to prevent other handlers from also triggering
+                            return False
+                            
+                    except Exception as e:
+                        print(f"Error in custom special key handler: {e}")
+                
+                # Set up the keyboard hook
+                hook_id = keyboard.hook(custom_handler)
+                print(f"Special key hotkey '{hotkey}' registered with hook (scan code: {target_scan_code})")
+                return hook_id
+
+    def _setup_regular_keyboard_hotkey_handler(self, hotkey, handler_func):
+        """Set up a custom hook handler for regular keyboard letters (a-z, A-Z)"""
+        # Extract the base key (should be a single letter)
+        hotkey_parts = hotkey.split('+')
+        base_key = hotkey_parts[-1].strip().lower()
+        
+        print(f"DEBUG: _setup_regular_keyboard_hotkey_handler called for hotkey '{hotkey}', base_key '{base_key}'")
+        
+        # Verify it's a single letter
+        if len(base_key) != 1 or not base_key.isalpha():
+            print(f"DEBUG: Not a single letter hotkey, falling back to add_hotkey")
+            return None
+        
+        # Use keyboard.hook() with a custom handler - same approach as special keys
+        # This ensures the handler is called in the right context
+        def custom_handler(event):
+            try:
+                # Get the event name (key name) - keyboard library uses event.name
+                event_name = None
+                if hasattr(event, 'name'):
+                    event_name = str(event.name).lower()
+                
+                # Debug: log when we see the target key to verify hook is working
+                # Only log for the target key to reduce noise
+                if event_name == base_key:
+                    event_type = getattr(event, 'event_type', 'N/A')
+                    print(f"DEBUG: Hook received key '{base_key}', event_type={event_type}, event={type(event).__name__}")
+                    
+                    # Check if it's a key down event
+                    is_key_down = True
+                    if hasattr(event, 'event_type'):
+                        is_key_down = event.event_type == 'down'
+                    # If no event_type, assume it's a key down (hook typically only fires on down)
+                    
+                    if is_key_down:
+                        print(f"Regular keyboard hotkey triggered: {hotkey} (key: '{base_key}')")
+                        # Call the handler function (which is hotkey_handler from setup_hotkey)
+                        handler_func()
+                        # Don't suppress - allow key to work normally in other programs
+                        return True
+            except Exception as e:
+                print(f"Error in custom regular keyboard handler for '{base_key}': {e}")
+                import traceback
+                traceback.print_exc()
+            return True
+        
+        # Set up the keyboard hook - this is more reliable than add_hotkey for single letters
+        hook_id = keyboard.hook(custom_handler)
+        print(f"Regular keyboard hotkey '{hotkey}' registered with hook (key: '{base_key}')")
+        return hook_id
+
+    def _test_numpad_scan_codes(self):
+        """Test method to verify numpad and keyboard number scan code detection"""
+        print("Numpad scan codes:")
+        for scan_code, key_name in self.numpad_scan_codes.items():
+            print(f"  Scan code {scan_code}: {key_name}")
+        
+        print("\nKeyboard number scan codes:")
+        for scan_code, key_name in self.keyboard_number_scan_codes.items():
+            print(f"  Scan code {scan_code}: {key_name}")
+        
+        def test_handler(event):
+            if hasattr(event, 'scan_code'):
+                print(f"Key pressed: scan_code={event.scan_code}, name={getattr(event, 'name', 'unknown')}")
+        
+        print("\nPress numpad and keyboard number keys to test scan code detection (press ESC to stop)...")
+        hook_id = keyboard.hook(test_handler)
+        
+        # Wait for ESC to be pressed
+        keyboard.wait('esc')
+        keyboard.unhook(hook_id)
+        print("Test completed.")
+
+    def _convert_numpad_hotkey_for_keyboard(self, hotkey):
+        """Convert numpad hotkey format to keyboard library compatible format"""
+        if not hotkey:
+            return hotkey
+            
+        # Handle multi-key combinations (e.g., "ctrl+num_1")
+        if '+' in hotkey:
+            parts = hotkey.split('+')
+            converted_parts = []
+            for part in parts:
+                converted_parts.append(self._convert_single_numpad_key(part.strip()))
+            return '+'.join(converted_parts)
+        else:
+            return self._convert_single_numpad_key(hotkey)
+    
+    def _convert_single_numpad_key(self, key):
+        """Convert a single numpad key to keyboard library format"""
+        if key.startswith('num_'):
+            numpad_key = key[4:]  # Remove 'num_' prefix
+            
+            # Map numpad keys to keyboard library format
+            numpad_mapping = {
+                '0': 'numpad 0',
+                '1': 'numpad 1', 
+                '2': 'numpad 2',
+                '3': 'numpad 3',
+                '4': 'numpad 4',
+                '5': 'numpad 5',
+                '6': 'numpad 6',
+                '7': 'numpad 7',
+                '8': 'numpad 8',
+                '9': 'numpad 9',
+                'multiply': 'numpad *',
+                'add': 'numpad +',
+                'subtract': 'numpad -',
+                'divide': 'numpad /',
+                '.': 'numpad .',
+                'enter': 'numpad enter'
+            }
+            
+            return numpad_mapping.get(numpad_key, key)
+        
+        return key
+
+    def _get_raw_symbol_for_numpad_key(self, numpad_key):
+        """Get the raw symbol for a numpad key"""
+        symbol_mapping = {
+            'multiply': '*',
+            'add': '+',
+            'subtract': '-',
+            'divide': '/',
+            '.': '.',
+            '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+            '5': '5', '6': '6', '7': '7', '8': '8', '9': '9'
+        }
+        return symbol_mapping.get(numpad_key, numpad_key)
+
+    def _convert_numpad_to_display(self, hotkey):
+        """Convert numpad hotkey names to display symbols"""
+        if not hotkey or not hotkey.startswith('num_'):
+            return hotkey
+        
+        numpad_part = hotkey[4:]  # Get the part after 'num_'
+        symbol_map = {
+            'multiply': '*',
+            'add': '+',
+            'subtract': '-',
+            'divide': '/',
+            '0': '0', '1': '1', '2': '2', '3': '3', '4': '4',
+            '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+            '.': '.', 'enter': 'Enter'
+        }
+        
+        if numpad_part in symbol_map:
+            return f"num:{symbol_map[numpad_part]}"
+        return hotkey
+
+    def _get_display_hotkey(self, button):
+        """Get the display text for a hotkey"""
+        if not hasattr(button, 'hotkey') or not button.hotkey:
+            return "No Hotkey"
+        
+        return button.hotkey
+    
+    def _hotkey_to_display_name(self, key_name):
+        """Convert a hotkey name to display format"""
+        if not key_name:
+            return ""
+        # Convert numpad keys to display format
+        if key_name.startswith('num_'):
+            display_name = self._convert_numpad_to_display(key_name)
+        elif key_name.startswith('controller_'):
+            # Extract controller button name for display
+            button_name = key_name.replace('controller_', '')
+            # Handle D-Pad names specially
+            if button_name.startswith('dpad_'):
+                dpad_name = button_name.replace('dpad_', '')
+                display_name = f"D-Pad {dpad_name.title()}"
+            else:
+                display_name = button_name
+        else:
+            display_name = key_name.replace('numpad ', 'NUMPAD ') \
+                                   .replace('ctrl','CTRL') \
+                                   .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                   .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                                   .replace('windows','WIN') \
+                                   .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+        return display_name.upper()
+
+    def _check_hotkey_uniqueness(self, new_hotkey, exclude_button=None):
+        """Check if a hotkey is unique among all registered hotkeys"""
+        if not new_hotkey:
+            return True
+        
+        for area in self.areas:
+            if area[1] is exclude_button:
+                continue
+            if hasattr(area[1], 'hotkey') and area[1].hotkey:
+                if area[1].hotkey == new_hotkey:
+                    return False
+        return True
+
+    def _normalize_hotkey(self, hotkey):
+        """Normalize hotkey to prevent character encoding issues (for reference only)"""
+        if not hotkey:
+            return hotkey
+        
+        # Convert to lowercase for consistency
+        normalized = hotkey.lower()
+        
+        # Handle common character normalizations that cause conflicts
+        char_map = {
+            'å': 'a',
+            'ä': 'a',
+            'ö': 'o',
+            '¨': 'u',
+            '´': "'",
+            '`': "'",
+            '~': '~',
+            '^': '^'
+        }
+        
+        for special_char, normal_char in char_map.items():
+            if special_char in normalized:
+                print(f"Normalizing '{special_char}' to '{normal_char}' in hotkey '{hotkey}'")
+                normalized = normalized.replace(special_char, normal_char)
+        
+        return normalized
+
+    def _cleanup_hooks(self, button):
+        """Simple cleanup method for existing hooks"""
+        try:
+            # Clean up mouse hook if it exists
+            if hasattr(button, 'mouse_hook_id'):
+                try:
+                    if button.mouse_hook_id:
+                        mouse.unhook(button.mouse_hook_id)
+                except Exception as e:
+                    print(f"Warning: Error cleaning up mouse hook ID: {e}")
+                finally:
+                    # Always set to None to prevent future errors
+                    button.mouse_hook_id = None
+            
+            if hasattr(button, 'mouse_hook'):
+                try:
+                    # Clean up the handler function reference
+                    button.mouse_hook = None
+                except Exception as e:
+                    print(f"Warning: Error cleaning up mouse hook function: {e}")
+            
+            # Clean up keyboard hook if it exists
+            if hasattr(button, 'keyboard_hook'):
+                try:
+                    if button.keyboard_hook:
+                        # Check if it's a callable (function) or a hook ID
+                        if callable(button.keyboard_hook):
+                            # It's a function, try to unhook it
+                            try:
+                                keyboard.unhook(button.keyboard_hook)
+                            except Exception:
+                                pass
+                        else:
+                            # Check if this is a custom ctrl hook or a regular add_hotkey hook
+                            try:
+                                if hasattr(button.keyboard_hook, 'remove'):
+                                    # This is an add_hotkey hook
+                                    keyboard.remove_hotkey(button.keyboard_hook)
+                                else:
+                                    # This is a custom on_press hook
+                                    keyboard.unhook(button.keyboard_hook)
+                            except Exception:
+                                # Fallback to unhook if both methods fail
+                                keyboard.unhook(button.keyboard_hook)
+                except Exception as e:
+                    print(f"Warning: Error cleaning up keyboard hook: {e}")
+                finally:
+                    # Always set to None to prevent future errors
+                    button.keyboard_hook = None
+            
+            # Clean up controller hook if it exists
+            if hasattr(button, 'controller_hook'):
+                try:
+                    button.controller_hook = None
+                except Exception as e:
+                    print(f"Warning: Error cleaning up controller hook: {e}")
+                        
+        except Exception as e:
+            print(f"Unexpected error in _cleanup_hooks: {e}")
+            # Make sure we don't leave any attributes behind
+            for attr in ['mouse_hook', 'keyboard_hook', 'controller_hook']:
+                if hasattr(button, attr):
+                    try:
+                        delattr(button, attr)
+                    except (AttributeError, Exception):
+                        # Attribute may not exist
+                        pass
+
+
+            
+    def _validate_file_size(self, file_path, max_size_mb=5):
+        """Validate file size before loading to prevent memory issues"""
+        try:
+            if not os.path.exists(file_path):
+                return False
+            file_size = os.path.getsize(file_path)
+            max_size_bytes = max_size_mb * 1024 * 1024
+            if file_size > max_size_bytes:
+                print(f"Warning: File too large ({file_size} bytes > {max_size_bytes} bytes), skipping: {file_path}")
+                return False
+            if file_size == 0:
+                print(f"Warning: File is empty, skipping: {file_path}")
+                return False
+            return True
+        except Exception as e:
+            print(f"Error validating file size: {e}")
+            return False
+    
+    def _store_image_with_bounds(self, area_name, image):
+        """Store image with bounds checking to prevent memory leaks"""
+        try:
+            # Close old image if it exists to free memory
+            if area_name in self.latest_images:
+                old_image = self.latest_images[area_name]
+                if hasattr(old_image, 'close'):
+                    try:
+                        old_image.close()
+                    except Exception:
+                        pass
+                del old_image
+            
+            # Store new image
+            self.latest_images[area_name] = image
+            
+            # If we have too many areas with images, clean up oldest ones
+            # Keep only images for areas that still exist
+            if len(self.latest_images) > 50:  # Total limit across all areas
+                # Get list of current area names
+                current_area_names = set()
+                for area in self.areas:
+                    if len(area) >= 4:
+                        area_name_var = area[3]
+                        if hasattr(area_name_var, 'get'):
+                            current_area_names.add(area_name_var.get())
+                
+                # Remove images for areas that no longer exist
+                to_remove = [name for name in self.latest_images.keys() if name not in current_area_names]
+                for name in to_remove:
+                    try:
+                        img = self.latest_images[name]
+                        if hasattr(img, 'close'):
+                            img.close()
+                        del self.latest_images[name]
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Warning: Error managing image storage: {e}")
+            # Fallback: just store the image
+            self.latest_images[area_name] = image
+    
+    def _safe_after(self, delay_ms, callback):
+        """Wrapper for root.after that tracks timers for cleanup"""
+        timer_id = self.root.after(delay_ms, callback)
+        if hasattr(self, '_active_timers'):
+            self._active_timers.add(timer_id)
+        return timer_id
+    
+    def _cancel_timer(self, timer_id):
+        """Cancel a timer and remove it from tracking"""
+        if timer_id:
+            try:
+                self.root.after_cancel(timer_id)
+            except Exception:
+                pass
+            if hasattr(self, '_active_timers'):
+                self._active_timers.discard(timer_id)
+
+    def _get_area_info(self, button):
+        """Helper method to get area information for a button"""
+        for area in self.areas:
+            if area[1] is button:
+                return {
+                    'frame': area[0],
+                    'name': area[3].get() if hasattr(area[3], 'get') else None,
+                    'name_var': area[3],
+                    'set_area_btn': area[2]
+                }
+        return None
+
+    def read_area(self, area_frame):
+        # First check if this is a stop button - if so, return immediately
+        if area_frame is None:  # Stop button passes None as area_frame
+            return
+
+        # Check if the area frame still exists in the areas list
+        area_exists = False
+        for area in self.areas:
+            if area[0] is area_frame:
+                area_exists = True
+                break
+        
+        if not area_exists:
+            print(f"Warning: Attempted to read removed area, ignoring")
+            return
+
+        if not hasattr(area_frame, 'area_coords'):
+            # Suppress error for Auto Read area
+            area_info = None
+            for area in self.areas:
+                if area[0] is area_frame:
+                    area_info = area
+                    break
+            if area_info and area_info[3].get().startswith("Auto Read"):
+                return
+            messagebox.showerror("Error", "No area coordinates set. Click Set Area to set one.")
+            return
+
+        # Ensure speaker is initialized
+        if not self.speaker:
+            try:
+                self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                self.speaker.Volume = int(self.volume.get())
+            except Exception as e:
+                print(f"Error initializing speaker: {e}")
+                return
+
+        # Get area info first
+        area_info = None
+        for area in self.areas:
+            if area[0] is area_frame:
+                area_info = area
+                break
+        
+        if not area_info:
+            print(f"Error: Could not determine area name for frame {area_frame}")
+            return
+
+        area_name = area_info[3].get()
+        self.latest_area_name.set(area_name)
+        voice_var = area_info[5]
+        speed_var = area_info[6]
+        preprocess = area_info[4].get()
+        psm_var = area_info[7]
+
+        # Check all additional options checkboxes at the start (before any processing)
+        # This ensures settings are determined upfront and available throughout the process
+        fullscreen_mode_enabled = (hasattr(self, 'fullscreen_mode_var') and self.fullscreen_mode_var.get())
+        ignore_usernames_enabled = (hasattr(self, 'ignore_usernames_var') and self.ignore_usernames_var.get())
+        ignore_previous_enabled = (hasattr(self, 'ignore_previous_var') and self.ignore_previous_var.get())
+        ignore_gibberish_enabled = (hasattr(self, 'ignore_gibberish_var') and self.ignore_gibberish_var.get())
+        better_unit_detection_enabled = (hasattr(self, 'better_unit_detection_var') and self.better_unit_detection_var.get())
+        read_game_units_enabled = (hasattr(self, 'read_game_units_var') and self.read_game_units_var.get())
+
+        # Show processing feedback
+        self.show_processing_feedback(area_name)
+
+        # Capture screenshot
+        x1, y1, x2, y2 = area_frame.area_coords
+        
+        # Apply fullscreen mode refresh if enabled (for forcing screen refresh in fullscreen apps)
+        # Only apply if we're not using a frozen screenshot
+        # Save the game window handle for use in PrintWindow capture
+        game_window_handle = None
+        if fullscreen_mode_enabled and not (hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None):
+            try:
+                # For fullscreen apps, we need to force a screen buffer refresh
+                # The most effective method is to briefly switch focus away and back
+                foreground_hwnd = win32gui.GetForegroundWindow()
+                root_hwnd = self.root.winfo_id()
+                
+                if foreground_hwnd and foreground_hwnd != root_hwnd:
+                    # Save the game window handle BEFORE tabbing out - we'll use this for PrintWindow
+                    game_window_handle = foreground_hwnd
+                    
+                    # Method 1: Briefly bring GameReader to foreground, then restore original
+                    # This forces Windows to update the screen buffer
+                    try:
+                        # Save current foreground window
+                        original_foreground = foreground_hwnd
+                        
+                        # Step 1: Tab out - bring GameReader to foreground
+                        if root_hwnd and self.root.winfo_viewable():
+                            # Make sure window is not minimized
+                            if win32gui.IsIconic(root_hwnd):
+                                win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
+                            
+                            # Bring to foreground
+                            win32gui.SetForegroundWindow(root_hwnd)
+                            self.root.update()
+                            time.sleep(0.02)  # 20ms - minimal delay for tab out
+                            
+                            # Step 2: Tab back in - restore game to foreground
+                            if win32gui.IsWindow(original_foreground):
+                                # Restore if minimized
+                                if win32gui.IsIconic(original_foreground):
+                                    win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
+                                    time.sleep(0.05)  # Wait for restore
+                                
+                                # Bring to foreground
+                                win32gui.SetForegroundWindow(original_foreground)
+                                time.sleep(0.1)  # 100ms - initial delay after setting foreground
+                                
+                                # Step 3: Wait for game to be fully active before screenshot
+                                # Poll to ensure the game window is actually in foreground
+                                max_wait = 30  # Maximum 30 attempts (300ms)
+                                wait_count = 0
+                                while wait_count < max_wait:
+                                    current_foreground = win32gui.GetForegroundWindow()
+                                    if current_foreground == original_foreground:
+                                        # Game is in foreground, wait a bit more to ensure it's fully rendered
+                                        time.sleep(0.15)  # 150ms delay for game to fully render
+                                        # Verify one more time that game is still in foreground
+                                        final_check = win32gui.GetForegroundWindow()
+                                        if final_check == original_foreground:
+                                            print("Fullscreen mode: Game confirmed active and ready for capture")
+                                            break
+                                    time.sleep(0.01)  # 10ms between checks
+                                    wait_count += 1
+                                
+                                # Additional delay to ensure game is fully rendered and screen buffer is updated
+                                time.sleep(0.2)  # 200ms delay for game to fully restore and render
+                    except Exception as e:
+                        print(f"Error in focus switching: {e}")
+                
+                # Method 2: Invalidate desktop and foreground window
+                try:
+                    desktop_hwnd = win32gui.GetDesktopWindow()
+                    if desktop_hwnd:
+                        ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
+                    
+                    if foreground_hwnd and foreground_hwnd != root_hwnd:
+                        ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
+                        win32gui.UpdateWindow(foreground_hwnd)
+                except (OSError, AttributeError, Exception):
+                    # Window handle may be invalid or window may be closed
+                    pass
+                
+                # Final verification delay - ensure everything is ready
+                # Don't add extra delay here since we already waited above
+                print("Fullscreen mode: Screen refresh triggered, ready for capture")
+            except Exception as e:
+                print(f"Error in fullscreen mode screen refresh: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue with normal capture even if refresh fails
+        
+        # Track if we already processed the frozen screenshot
+        frozen_screenshot_already_processed = False
+        
+        # Check if we have a frozen screenshot to use instead of capturing from live screen
+        if hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None:
+            try:
+                print(f"Using frozen screenshot instead of live screen capture")
+                frozen_img = area_frame.frozen_screenshot
+                frozen_min_x, frozen_min_y, frozen_width, frozen_height = area_frame.frozen_screenshot_bounds
+                
+                # Check if frozen screenshot was already processed during capture
+                # If process_freeze_screen_var is enabled, the screenshot was already processed when captured
+                process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
+                                                self.process_freeze_screen_var.get())
+                
+                if process_freeze_screen_enabled:
+                    # Screenshot was already processed during capture, so it's already processed
+                    frozen_screenshot_already_processed = True
+                    print("Using already-processed frozen screenshot (processed during capture).")
+                elif preprocess and area_name in self.processing_settings:
+                    # Process now if preprocess is enabled but process_freeze_screen_var is not
+                    # (for backward compatibility with old behavior)
+                    settings = self.processing_settings[area_name]
+                    frozen_img = preprocess_image(
+                        frozen_img,
+                        brightness=settings.get('brightness', 1.0),
+                        contrast=settings.get('contrast', 1.0),
+                        saturation=settings.get('saturation', 1.0),
+                        sharpness=settings.get('sharpness', 1.0),
+                        blur=settings.get('blur', 0.0),
+                        threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                        hue=settings.get('hue', 0.0),
+                        exposure=settings.get('exposure', 1.0)
+                    )
+                    frozen_screenshot_already_processed = True
+                    print("Image processing applied to frozen screenshot (during read).")
+                
+                # Convert screen coordinates to coordinates relative to the frozen screenshot
+                # The frozen screenshot starts at (frozen_min_x, frozen_min_y)
+                rel_x1 = x1 - frozen_min_x
+                rel_y1 = y1 - frozen_min_y
+                rel_x2 = x2 - frozen_min_x
+                rel_y2 = y2 - frozen_min_y
+                
+                # Ensure coordinates are within bounds
+                rel_x1 = max(0, min(frozen_width, rel_x1))
+                rel_y1 = max(0, min(frozen_height, rel_y1))
+                rel_x2 = max(0, min(frozen_width, rel_x2))
+                rel_y2 = max(0, min(frozen_height, rel_y2))
+                
+                # Ensure valid area
+                crop_x1, crop_x2 = min(rel_x1, rel_x2), max(rel_x1, rel_x2)
+                crop_y1, crop_y2 = min(rel_y1, rel_y2), max(rel_y1, rel_y2)
+                
+                # Extract the region from the frozen screenshot (or processed frozen screenshot)
+                if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                    screenshot = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+                    print(f"Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
+                else:
+                    # Fallback to live capture if crop area is invalid
+                    print(f"Invalid crop area, falling back to live screen capture")
+                    # Use the saved game window handle (captured before tabbing out)
+                    target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                    screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+                
+                # Clear the frozen screenshot after use
+                delattr(area_frame, 'frozen_screenshot')
+                if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                    delattr(area_frame, 'frozen_screenshot_bounds')
+            except Exception as e:
+                print(f"Error using frozen screenshot: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback to live capture
+                # Use the saved game window handle (captured before tabbing out)
+                target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+                # Clear frozen screenshot on error
+                if hasattr(area_frame, 'frozen_screenshot'):
+                    delattr(area_frame, 'frozen_screenshot')
+                if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                    delattr(area_frame, 'frozen_screenshot_bounds')
+        else:
+            # Normal capture from live screen
+            # Use the saved game window handle (captured before tabbing out)
+            # If we didn't capture it (no fullscreen mode), get current foreground window
+            if not game_window_handle and fullscreen_mode_enabled:
+                game_window_handle = win32gui.GetForegroundWindow()
+            target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+            screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+        
+        # Store original or processed image based on settings
+        # Skip processing if we already processed the frozen screenshot
+        if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
+            settings = self.processing_settings[area_name]
+            processed_image = preprocess_image(
+                screenshot,
+                brightness=settings.get('brightness', 1.0),
+                contrast=settings.get('contrast', 1.0),
+                saturation=settings.get('saturation', 1.0),
+                sharpness=settings.get('sharpness', 1.0),
+                blur=settings.get('blur', 0.0),
+                threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                hue=settings.get('hue', 0.0),
+                exposure=settings.get('exposure', 1.0)
+            )
+            # Store with bounds checking to prevent memory leak
+            self._store_image_with_bounds(area_name, processed_image)
+            # Use processed image for OCR
+            # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
+            psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
+            text = pytesseract.image_to_string(processed_image, config=f'--psm {psm_value}')
+            print("Image preprocessing applied.")
+        else:
+            # Store with bounds checking to prevent memory leak
+            self._store_image_with_bounds(area_name, screenshot)
+            # Use original image for OCR (or already processed image if freeze screen was processed)
+            # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
+            psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
+            text = pytesseract.image_to_string(screenshot, config=f'--psm {psm_value}')
+
+        import re
+        
+        # --- Read game units logic (run FIRST to give priority to game units) ---
+        if read_game_units_enabled:
+            # Ensure game_units exists and is a dictionary
+            if not hasattr(self, 'game_units') or self.game_units is None or not isinstance(self.game_units, dict):
+                # Reload game units if not initialized or invalid
+                self.game_units = self.load_game_units()
+            # Ensure we have a valid dictionary
+            if not isinstance(self.game_units, dict):
+                print("Warning: game_units is not a valid dictionary, skipping game unit replacement")
+            else:
+                game_unit_map = self.game_units
+                
+                # Add default mappings for common game units
+                default_mappings = {
+                    'xp': 'Experience Points',
+                    'hp': 'Health Points',
+                    'mp': 'Mana Points',
+                    'gp': 'Gold Pieces',
+                    'pp': 'Platinum Pieces',
+                    'sp': 'Skill Points',
+                    'ep': 'Energy Points',
+                    'ap': 'Action Points',
+                    'bp': 'Battle Points',
+                    'lp': 'Loyalty Points',
+                    'cp': 'Challenge Points',
+                    'vp': 'Victory Points',
+                    'rp': 'Reputation Points',
+                    'tp': 'Talent Points',
+                    'ar': 'Armor Rating',
+                    'dmg': 'Damage',
+                    'dps': 'Damage Per Second',
+                    'def': 'Defense',
+                    'mat': 'Materials',
+                    'exp': 'Exploration Points',
+                    '§': 'Simoliance',
+                    'v-bucks': 'Virtual Bucks',
+                    'r$': 'Robux',
+                    'nmt': 'Nook Miles Tickets',
+                    'be': 'Blue Essence',
+                    'radianite': 'Radianite Points',
+                    'ow coins': 'Overwatch Coins',
+                    '₽': 'PokeDollars',
+                    '€$': 'Eurodollars',
+                    'z': 'Zenny',
+                    'l': 'Lunas',
+                    'e': 'Eve',
+                    'i': 'Isk',
+                    'j': 'Jewel',
+                    'sc': 'Star Coins',
+                    'o2': 'Oxygen',
+                    'pu': 'Power Units',
+                    'mc': 'Mana Crystals',
+                    'es': 'Essence',
+                    'sh': 'Shards',
+                    'st': 'Stars',
+                    'mu': 'Munny',
+                    'b': 'Bolts',
+                    'r': 'Rings',
+                    'ca': 'Caps',
+                    'rns': 'Runes',
+                    'sl': 'Souls',
+                    'fav': 'Favor',
+                    'am': 'Amber',
+                    'cc': 'Crystal Cores',
+                    'fg': 'Fragments'
+                }
+                
+                # Update game units with default mappings if they don't exist
+                for key, value in default_mappings.items():
+                    if key not in game_unit_map:
+                        game_unit_map[key] = value
+                # Sort by length descending to match longer units first (e.g., 'gp' before 'g')
+                sorted_units = sorted(game_unit_map.keys(), key=len, reverse=True)
+                
+                # Build regex pattern for all units (word boundaries, case-insensitive)
+                # Pattern matches units with optional numbers: "100 xp" or just "xp"
+                pattern = re.compile(r'(?<!\w)(\d+(?:\.\d+)?)?(\s*)(' + '|'.join(map(re.escape, sorted_units)) + r')(?!\w)', re.IGNORECASE)
+                
+                def game_repl(match):
+                    value = match.group(1) or ''  # Number (optional)
+                    space = match.group(2) or ''   # Space (optional)
+                    unit = match.group(3).lower()
+                    full_name = game_unit_map.get(unit, unit)
+                    
+                    if value:
+                        return f"{value}{space}{full_name}"
+                    else:
+                        return full_name
+                
+                text = pattern.sub(game_repl, text)
+
+        # --- Better measurement unit detection logic (run AFTER game units) ---
+        if better_unit_detection_enabled:
+            unit_map = {
+                'l': 'Liters',
+                'm': 'Meters',
+                'in': 'Inches',
+                'ml': 'Milliliters',
+                'gal': 'Gallons',
+                'g': 'Grams',
+                'lb': 'Pounds',
+                'ib': 'Pounds',  # Treat 'ib' as 'Pounds' due to OCR confusion
+                'c': 'Celsius',
+                'f': 'Fahrenheit',
+                # Money units
+                'kr': 'Crowns',
+                'eur': 'Euros',
+                'usd': 'US Dollars',
+                'sek': 'Swedish Crowns',
+                'nok': 'Norwegian Crowns',
+                'dkk': 'Danish Crowns',
+                '£': 'Pounds Sterling',
+            }
+            pattern = re.compile(r'(?<!\w)(\d+(?:\.\d+)?)(\s*)(l|m|in|ml|gal|g|lb|ib|c|f|kr|eur|usd|sek|nok|dkk|£)(?!\w)', re.IGNORECASE)
+            def repl(match):
+                value = match.group(1)
+                space = match.group(2)
+                unit = match.group(3).lower()
+                if unit in ['lb', 'ib']:
+                    return f"{value}{space}Pounds"
+                if unit == '£':
+                    return f"{value}{space}Pounds Sterling"
+                return f"{value}{space}{unit_map.get(unit, unit)}"
+            text = pattern.sub(repl, text)
+
+        print(f"[BOLD]Processing Area with name '{area_name}' Output Text:[/BOLD] \n {text}\n--------------------------")
+
+        # Handle text history if ignore previous is enabled
+        if ignore_previous_enabled:
+            # Limit history size to prevent memory growth
+            max_history_size = 1000  # Adjust as needed
+            if area_name in self.text_histories and len(self.text_histories[area_name]) > max_history_size:
+                # Keep only the most recent entries
+                self.text_histories[area_name] = set(list(self.text_histories[area_name])[-max_history_size:])
+
+        # Split text into lines to handle usernames
+        lines = text.split('\n')
+        filtered_lines = []
+        
+        import re  # Move import to here, outside the loop
+        for line in lines:
+            if not line.strip():  # Skip empty lines
+                continue
+            words = line.split()
+            if words:
+                # Filter out usernames if enabled
+                if ignore_usernames_enabled:
+                    # Check for username pattern (word followed by : or ;)
+                    filtered_words = []
+                    i = 0
+                    while i < len(words):
+                        # Check if current word is part of a username pattern
+                        if i < len(words) - 1 and words[i + 1] in [':', ';']:
+                            i += 2 if words[i + 1] in [':', ';'] else 1
+                        else:
+                            filtered_words.append(words[i])
+                        i += 1
+                    line = ' '.join(filtered_words)
+
+                ignore_items = [item.strip().lower() for item in self.bad_word_list.get().split(',') if item.strip()]
+
+                def normalize_text(text):
+                    # Remove punctuation, normalize spaces, and make lowercase
+                    text = re.sub(r'[\W_]+', ' ', text)  # Replace all non-word chars with space
+                    text = re.sub(r'\s+', ' ', text)     # Collapse multiple spaces
+                    return text.strip().lower()
+
+                def is_ignored(text, ignore_items, normalized_line=None):
+                    """
+                    Returns True if the text matches any ignored word or phrase (case-insensitive, ignores punctuation and extra spaces).
+                    - For single words: matches if the word matches (case-insensitive)
+                    - For phrases: matches if the phrase appears exactly (case-insensitive, ignores punctuation)
+                    """
+                    text_norm = normalize_text(text)
+                    for item in ignore_items:
+                        if ' ' in item:
+                            # Phrase: match as exact phrase anywhere in the normalized line
+                            if normalized_line and normalize_text(item) in normalized_line:
+                                return True
+                        else:
+                            # Single word: match as a word (not substring)
+                            if text_norm == normalize_text(item):
+                                return True
+                    return False
+
+                # Normalize the line for phrase matching
+                normalized_line = normalize_text(line)
+
+                # Remove ignored phrases (with spaces)
+                for item in ignore_items:
+                    if ' ' in item:
+                        norm_phrase = normalize_text(item)
+                        # Remove all occurrences of the phrase from the normalized line
+                        while norm_phrase in normalized_line:
+                            # Find the phrase in the original line (approximate position)
+                            # Replace in the original line (case-insensitive, ignoring punctuation)
+                            # We'll use regex for robust matching
+                            pattern = re.compile(r'\b' + re.escape(item) + r'\b', re.IGNORECASE)
+                            line = pattern.sub(' ', line)
+                            # Re-normalize after replacement
+                            normalized_line = normalize_text(line)
+
+                # Now split and filter out single ignored words
+                filtered_words = [word for word in line.split() if not any(normalize_text(word) == normalize_text(item) for item in ignore_items if ' ' not in item)]
+
+                # Only skip if the line is empty after filtering
+                if not filtered_words:
+                    continue
+                
+                # Apply gibberish filtering if enabled
+                if ignore_gibberish_enabled:
+                    vowels = set('aeiouAEIOU')
+                    consonants = set('bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ')
+                    
+                    # Common short words that should be allowed
+                    common_short_words = {'a', 'i', 'am', 'an', 'as', 'at', 'be', 'by', 'do', 'go', 'he', 'if', 'in', 'is', 'it', 'me', 'my', 'no', 'of', 'on', 'or', 'so', 'to', 'up', 'us', 'we'}
+                    
+                    def is_not_gibberish(word):
+                        # Remove punctuation for analysis but keep the word if it's valid
+                        clean_word = re.sub(r'[^\w]', '', word)
+                        if not clean_word:
+                            return True  # Keep words that are only punctuation
+                        
+                        # Always allow very short words (1-2 chars) and common short words
+                        if len(clean_word) <= 2 or clean_word.lower() in common_short_words:
+                            return True
+                        
+                        # Allow if it's purely numeric (numbers are not gibberish)
+                        if clean_word.isdigit():
+                            return True
+                        
+                        # Allow if it contains digits and is short enough (like "2x", "3D", "v2")
+                        if any(c.isdigit() for c in clean_word) and len(clean_word) <= 4:
+                            return True
+                        
+                        # Check if word has any letters
+                        if not any(c.isalpha() for c in clean_word):
+                            return False
+                        
+                        # For words with letters, analyze character patterns
+                        letters_only = ''.join(c for c in clean_word if c.isalpha())
+                        if not letters_only:
+                            return True  # If no letters after filtering, it's probably a number
+                        
+                        letters_lower = letters_only.lower()
+                        
+                        # Check for repeated characters (like "aaaa", "xxxx", "llll")
+                        if len(letters_lower) >= 3:
+                            # Check if more than 60% of characters are the same
+                            char_counts = {}
+                            for char in letters_lower:
+                                char_counts[char] = char_counts.get(char, 0) + 1
+                            max_count = max(char_counts.values())
+                            if max_count / len(letters_lower) > 0.6:
+                                return False
+                        
+                        # Check for alternating patterns (like "ababab", "xyxyxy")
+                        if len(letters_lower) >= 4:
+                            # Check 2-character patterns
+                            pattern = letters_lower[:2]
+                            if len(letters_lower) % 2 == 0:
+                                if letters_lower == pattern * (len(letters_lower) // 2):
+                                    return False
+                            # Check 3-character patterns
+                            if len(letters_lower) >= 6 and len(letters_lower) % 3 == 0:
+                                pattern3 = letters_lower[:3]
+                                if letters_lower == pattern3 * (len(letters_lower) // 3):
+                                    return False
+                        
+                        # Check vowel/consonant ratio for longer words
+                        if len(letters_lower) >= 4:
+                            vowel_count = sum(1 for c in letters_lower if c in vowels)
+                            consonant_count = sum(1 for c in letters_lower if c in consonants)
+                            
+                            # If no vowels at all and word is 4+ chars, likely gibberish
+                            if vowel_count == 0 and len(letters_lower) >= 4:
+                                return False
+                            
+                            # If too many consecutive consonants (5+), likely gibberish
+                            max_consecutive_consonants = 0
+                            current_consecutive = 0
+                            for c in letters_lower:
+                                if c in consonants:
+                                    current_consecutive += 1
+                                    max_consecutive_consonants = max(max_consecutive_consonants, current_consecutive)
+                                else:
+                                    current_consecutive = 0
+                            if max_consecutive_consonants >= 5:
+                                return False
+                            
+                            # Check vowel ratio - too low might indicate gibberish
+                            total_letters = vowel_count + consonant_count
+                            if total_letters > 0:
+                                vowel_ratio = vowel_count / total_letters
+                                # Very low vowel ratio (< 10%) for long words is suspicious
+                                if vowel_ratio < 0.1 and len(letters_lower) >= 6:
+                                    return False
+                        
+                        # Check for random-looking character sequences
+                        # If word has many different consonants with few vowels, it might be gibberish
+                        if len(letters_lower) >= 5:
+                            unique_chars = len(set(letters_lower))
+                            vowel_count = sum(1 for c in letters_lower if c in vowels)
+                            # If many unique consonants but very few vowels, suspicious
+                            if unique_chars >= 4 and vowel_count == 0:
+                                return False
+                        
+                        # If we passed all checks, it's likely not gibberish
+                        return True
+                    
+                    filtered_words = [word for word in filtered_words if is_not_gibberish(word)]
+                
+                if filtered_words:  # Only add non-empty lines
+                    filtered_lines.append(' '.join(filtered_words))
+        # Join lines with proper spacing
+        filtered_text = ' '.join(filtered_lines)
+
+        if self.pause_at_punctuation_var.get():
+            # Replace punctuation with itself plus a pause marker
+            for punct in ['.', '!', '?']:
+                filtered_text = filtered_text.replace(punct, punct + ' ... ')
+            # Add smaller pauses for commas and semicolons
+            for punct in [',', ';']:
+                filtered_text = filtered_text.replace(punct, punct + ' .. ')
+
+        # Store in text log history (before speaking)
+        # Always store in history, even if no text detected
+        # Get voice name and speed
+        voice_name = None
+        speed_value = None
+        if voice_var:
+            voice_name = getattr(voice_var, '_full_name', voice_var.get())
+        if speed_var:
+            try:
+                speed_value = int(speed_var.get())
+            except ValueError:
+                speed_value = None
+        
+        # If no text detected, use placeholder text for display
+        display_text = filtered_text if filtered_text.strip() else "no text was detected"
+        
+        # Add to history (keep last 20)
+        log_entry = {
+            'text': display_text,
+            'area_name': area_name,
+            'voice': voice_name,
+            'speed': speed_value
+        }
+        self.text_log_history.append(log_entry)
+        # Keep only last 20 entries
+        if len(self.text_log_history) > 20:
+            self.text_log_history.pop(0)
+
+        # If no text detected, skip speaking but still show in history
+        if not filtered_text.strip():
+            print("No text detected. Entry added to Scan History with 'no text detected' placeholder.")
+            
+            # Update status label with reminder if area monitoring is active
+            if hasattr(self, 'status_label'):
+                # Check if area monitoring is active
+                monitoring_active = False
+                if hasattr(self, '_automations_window') and self._automations_window:
+                    try:
+                        monitoring_active = getattr(self._automations_window, 'polling_active', False)
+                    except:
+                        pass
+                
+                # Build status message
+                status_message = f"No text detected in '{area_name}'"
+                if monitoring_active:
+                    status_message += " (Area monitoring is active)"
+                
+                # Cancel any existing feedback clear timer
+                if hasattr(self, '_feedback_timer') and self._feedback_timer:
+                    self.root.after_cancel(self._feedback_timer)
+                
+                # Update status text
+                self.status_label.config(text=status_message, fg="orange", font=("Helvetica", 10, "bold"))
+                
+                # Clear after 3 seconds
+                def clear_feedback():
+                    self.status_label.config(text="", font=("Helvetica", 10))
+                    # After clearing, show monitoring status if active
+                    self._show_monitoring_status_if_active()
+                self._feedback_timer = self.root.after(3000, clear_feedback)
+            
+            # If this was called from a combo, still trigger the callback so the combo can proceed
+            # (The callback will detect no text and skip speech monitoring)
+            if hasattr(area_frame, '_combo_callback') and area_frame._combo_callback:
+                print("GAME_TEXT_READER: Combo callback detected for no-text read area, scheduling callback...")
+                combo_callback = area_frame._combo_callback
+                # Call after a short delay to ensure read_area() processing is complete
+                self.root.after(100, lambda: combo_callback())
+                # Clear the callback to avoid calling it again
+                delattr(area_frame, '_combo_callback')
+            return
+
+        # Set the voice and speed for SAPI
+        if voice_var:
+            # Check both SAPI voices and our combined voice list (includes mock voices)
+            selected_voice = None
+            
+            # Get the actual voice name (full name, not display name)
+            actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
+            
+            # First try to find in SAPI voices
+            try:
+                voices = self.speaker.GetVoices()
+                for voice in voices:
+                    if voice.GetDescription() == actual_voice_name:
+                        selected_voice = voice
+                        break
+            except Exception as e:
+                print(f"Error getting SAPI voices: {e}")
+            
+            # If not found in SAPI, try our combined voice list (includes mock voices)
+            if not selected_voice and hasattr(self, 'voices'):
+                for voice in self.voices:
+                    if hasattr(voice, 'GetDescription') and voice.GetDescription() == actual_voice_name:
+                        # Check if this is a real SAPI voice object
+                        if hasattr(voice, 'GetId') and hasattr(voice, 'GetToken'):  # Working OneCore voice object
+                            print(f"Found working OneCore voice: {actual_voice_name}")
+                            selected_voice = voice
+                            break
+                        elif hasattr(voice, 'GetId'):  # Real SAPI voice object
+                            print(f"Found real voice in combined list: {actual_voice_name}")
+                            selected_voice = voice
+                            break
+                        else:
+                            # For mock voices, we can't set them directly, so just continue
+                            print(f"Found mock voice: {actual_voice_name}")
+                            selected_voice = "mock_voice"  # Mark as found but don't set
+                            break
+            
+            if selected_voice and selected_voice != "mock_voice":
+                try:
+                    # If this is a OneCore voice, route through UWP immediately for reliability
+                    if hasattr(selected_voice, 'GetToken'):
+                        print(f"Using OneCore voice via Narrator: {actual_voice_name}")
+                        if _ensure_uwp_available():
+                            loop = None
+                            old_loop = None
+                            try:
+                                loop = asyncio.new_event_loop()
+                                try:
+                                    old_loop = asyncio.get_event_loop()
+                                except RuntimeError:
+                                    old_loop = None
+                                asyncio.set_event_loop(loop)
+                                loop.run_until_complete(self._speak_with_uwp(filtered_text, preferred_desc=actual_voice_name))
+                                return
+                            except Exception as _e:
+                                print(f"UWP fallback failed: {_e}")
+                                import traceback; traceback.print_exc()
+                            finally:
+                                # Restore previous event loop
+                                if old_loop is not None:
+                                    try:
+                                        asyncio.set_event_loop(old_loop)
+                                    except Exception:
+                                        pass
+                                # Only close loop if it was created and run successfully
+                                if loop is not None:
+                                    try:
+                                        # Only close if loop was actually started (run_until_complete was called)
+                                        if not loop.is_closed():
+                                            try:
+                                                loop.close()
+                                            except RuntimeError as e:
+                                                if "run loop not started" not in str(e).lower():
+                                                    raise
+                                    except Exception:
+                                        pass
+                        else:
+                            print("UWP TTS not available. Install with: pip install winsdk")
+                        # If UWP not available or failed, we fall through and try SAPI default
+                    else:
+                        # Regular SAPI voice
+                        self.speaker.Voice = selected_voice
+                        print(f"Successfully set voice to: {selected_voice.GetDescription()}")
+                except Exception as set_voice_e:
+                    print(f"Error setting voice: {set_voice_e}")
+                    messagebox.showerror("Error", f"Could not set voice: {set_voice_e}")
+                    return
+            elif selected_voice == "mock_voice":
+                # For mock voices (OneCore), use UWP path if available
+                print(f"Using OneCore (mock) voice via Narrator: {actual_voice_name}")
+                if _ensure_uwp_available():
+                    loop = None
+                    old_loop = None
+                    try:
+                        loop = asyncio.new_event_loop()
+                        try:
+                            old_loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            old_loop = None
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self._speak_with_uwp(filtered_text, preferred_desc=actual_voice_name))
+                        return
+                    except Exception as _e:
+                        print(f"UWP fallback failed: {_e}")
+                        import traceback; traceback.print_exc()
+                    finally:
+                        # Restore previous event loop
+                        if old_loop is not None:
+                            try:
+                                asyncio.set_event_loop(old_loop)
+                            except Exception:
+                                pass
+                        # Only close loop if it was created and run successfully
+                        if loop is not None:
+                            try:
+                                # Only close if loop was actually started (run_until_complete was called)
+                                if not loop.is_closed():
+                                    try:
+                                        loop.close()
+                                    except RuntimeError as e:
+                                        if "run loop not started" not in str(e).lower():
+                                            raise
+                            except Exception:
+                                pass
+                else:
+                    print("UWP TTS not available. Install with: pip install winsdk")
+                # If UWP not available, inform and abort
+                messagebox.showerror("Error", "Selected voice requires Windows Narrator TTS. Please install 'winsdk' (pip install winsdk) or choose a SAPI voice.")
+                return
+            else:
+                messagebox.showerror("Error", "No voice selected. Please select a voice.")
+                print("Error: Did not speak, Reason: No selected voice.")
+                return
+
+        # Update speed for win32com - Convert from percentage to rate (-10 to 10)
+        if speed_var:
+            try:
+                speed = int(speed_var.get())
+                if speed > 0:
+                    # Convert speed percentage to SAPI rate (-10 to 10)
+                    self.speaker.Rate = (speed - 100) // 10
+            except ValueError:
+                pass  # Invalid speed value, ignore
+
+        # Set volume and speak text
+        try:
+            # Set volume
+            try:
+                vol = int(self.volume.get())
+                if 0 <= vol <= 100:
+                    self.speaker.Volume = vol
+                else:
+                    self.volume.set("100")
+                    self.speaker.Volume = 100
+            except ValueError:
+                self.volume.set("100")
+                self.speaker.Volume = 100
+
+            # Ensure speech engine is ready before speaking
+            self._ensure_speech_ready()
+            
+            # Track text and start time for pause/resume functionality
+            self.current_speech_text = filtered_text
+            import time
+            self.speech_start_time = time.time()
+            self.paused_text = None
+            self.paused_position = 0
+            
+            # Speak the text
+            self.is_speaking = True
+            self.speaker.Speak(filtered_text, 1)  # 1 is SVSFlagsAsync
+            print("Speech started.\n--------------------------")
+            
+            # Start monitoring speech completion
+            self._start_speech_monitor()
+            
+            # If this was called from a combo, trigger the combo callback after speech starts
+            # This allows the combo to start monitoring speech after read_area() has started speaking
+            if hasattr(area_frame, '_combo_callback') and area_frame._combo_callback:
+                print("GAME_TEXT_READER: Combo callback detected for regular read area, scheduling callback after speech starts...")
+                combo_callback = area_frame._combo_callback
+                # Call after a short delay to ensure speech has actually started
+                self.root.after(100, lambda: combo_callback())
+                # Clear the callback to avoid calling it again
+                delattr(area_frame, '_combo_callback')
+        except Exception as e:
+            print(f"Error during speech: {e}")
+            self.is_speaking = False
+            try:
+                # Try to reinitialize the speaker
+                self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                self.speaker.Volume = int(self.volume.get())
+            except Exception as e2:
+                print(f"Error reinitializing speaker: {e2}")
+                self.is_speaking = False
+
+    def on_window_close(self):
+        """Handle window close event - check for unsaved changes before closing"""
+        # Check if there are unsaved changes
+        if self._has_unsaved_changes:
+            # Build list of specific changes
+            change_list = []
+            if self._unsaved_changes['added_areas']:
+                count = len(self._unsaved_changes['added_areas'])
+                change_list.append(f"- Added {count} area{'s' if count > 1 else ''}")
+            if self._unsaved_changes['removed_areas']:
+                count = len(self._unsaved_changes['removed_areas'])
+                change_list.append(f"- Removed {count} area{'s' if count > 1 else ''}")
+            if self._unsaved_changes['hotkey_changes']:
+                for hotkey_name in sorted(self._unsaved_changes['hotkey_changes']):
+                    change_list.append(f"- {hotkey_name} was changed")
+            if self._unsaved_changes['additional_options']:
+                change_list.append("- Additional options was changed")
+            if self._unsaved_changes['area_settings']:
+                count = len(self._unsaved_changes['area_settings'])
+                change_list.append(f"- {count} area setting{'s' if count > 1 else ''} was changed")
+            
+            # Build the message
+            if change_list:
+                changes_text = "\n".join(change_list)
+                message = f"You have unsaved changes in the current layout.\n\n" \
+                         f"Changes:\n{changes_text}\n\n" \
+                         f"Save changes before closing?"
+            else:
+                # Fallback if no specific changes tracked
+                message = f"You have unsaved changes in the current layout.\n\n" \
+                         f"Save changes before closing?"
+            
+            # Prompt user about unsaved changes
+            response = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                message
+            )
+            
+            if response is None:  # Cancel - don't close
+                return
+            elif response:  # Yes - Save and close
+                # Try to save the layout
+                try:
+                    # Check if we have a file path, if not, save_layout will show a dialog
+                    if self.layout_file.get():
+                        # We have a file, try to save directly to it
+                        try:
+                            self._save_layout_to_file(self.layout_file.get())
+                        except (ValueError, Exception) as e:
+                            # If direct save fails (validation error or other), show save dialog instead
+                            # This gives user option to save to different location or fix issues
+                            self.save_layout()
+                            # If user cancelled save dialog, don't close
+                            if self._has_unsaved_changes:
+                                return
+                    else:
+                        # No file path, use save_layout which will show save dialog
+                        self.save_layout()
+                        # If user cancelled save dialog, don't close
+                        if self._has_unsaved_changes:
+                            return
+                except Exception as e:
+                    # If save failed unexpectedly, ask if user still wants to close
+                    if not messagebox.askyesno(
+                        "Save Failed",
+                        f"Failed to save layout: {str(e)}\n\n"
+                        "Do you still want to close without saving?"
+                    ):
+                        return  # User chose not to close
+            # If response is False (No), just continue to close without saving
+        
+        # No unsaved changes or user chose to discard - proceed with cleanup and close
+        # Show shutting down message with blinking effect
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Shutting down...", fg="Black")
+            self.root.update_idletasks()  # Force UI update to show the message
+            
+            # Create blinking effect with high contrast
+            _blink_state = [True]  # Use list to allow modification in nested function
+            def blink_message():
+                if hasattr(self, 'status_label') and self.status_label.winfo_exists():
+                    if _blink_state[0]:
+                        self.status_label.config(fg="red", font=("Helvetica", 10, "bold"))
+                    else:
+                        self.status_label.config(fg="Black", font=("Helvetica", 10, "bold"))
+                    _blink_state[0] = not _blink_state[0]
+                    self.root.after(300, blink_message)  # Blink every 300ms for more obvious effect
+            
+            # Start blinking immediately and faster
+            self.root.after(100, blink_message)
+            self.root.update_idletasks()  # Force UI update
+        
+        self.cleanup()
+        self.root.destroy()
+    
+    def _save_layout_to_file(self, file_path):
+        """Save layout directly to a file without showing dialog"""
+        if not self.areas:
+            raise ValueError("There is nothing to save.")
+        
+        # Check if all areas have coordinates set, but ignore Auto Read
+        for area_frame, _, _, area_name_var, _, _, _, _, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                continue
+            if not hasattr(area_frame, 'area_coords'):
+                raise ValueError(f"Area '{area_name}' does not have a defined area, remove it or configure before saving.")
+        
+        # Build layout (same as save_layout method)
+        layout = {
+            "version": APP_VERSION,
+            "volume": self.volume.get(),
+            "bad_word_list": self.bad_word_list.get(),
+            "ignore_usernames": self.ignore_usernames_var.get(),
+            "ignore_previous": self.ignore_previous_var.get(),
+            "ignore_gibberish": self.ignore_gibberish_var.get(),
+            "pause_at_punctuation": self.pause_at_punctuation_var.get(),
+            "better_unit_detection": self.better_unit_detection_var.get(),
+            "read_game_units": self.read_game_units_var.get(),
+            "fullscreen_mode": self.fullscreen_mode_var.get(),
+            "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
+            "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "stop_hotkey": self.stop_hotkey,
+            "pause_hotkey": self.pause_hotkey,
+            "auto_read_areas": {
+                "stop_read_on_select": getattr(self, 'interrupt_on_new_scan_var', tk.BooleanVar(value=True)).get(),
+                "areas": []
+            },
+            "areas": []
+        }
+        
+        # Collect Auto Read areas
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                auto_read_info = {
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                if hasattr(area_frame, 'area_coords'):
+                    auto_read_info["coords"] = area_frame.area_coords
+                layout["auto_read_areas"]["areas"].append(auto_read_info)
+        
+        # Collect regular Read Areas
+        for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, _ in self.areas:
+            area_name = area_name_var.get()
+            if area_name.startswith("Auto Read"):
+                continue
+            if hasattr(area_frame, 'area_coords'):
+                voice_to_save = getattr(voice_var, '_full_name', voice_var.get())
+                area_info = {
+                    "coords": area_frame.area_coords,
+                    "name": area_name,
+                    "hotkey": hotkey_button.hotkey if hasattr(hotkey_button, 'hotkey') else None,
+                    "preprocess": preprocess_var.get(),
+                    "voice": voice_to_save,
+                    "speed": speed_var.get(),
+                    "psm": psm_var.get(),
+                    "settings": self.processing_settings.get(area_name, {})
+                }
+                layout["areas"].append(area_info)
+        
+        # Save automations and images (this will add automations to layout dict)
+        # For direct file save, don't prompt user about folder creation (silently create if needed)
+        self._save_automations_to_layout(layout, file_path, prompt_user=False)
+        
+        # Save to file
+        with open(file_path, 'w') as f:
+            json.dump(layout, f, indent=4)
+        
+        # Reset unsaved changes flag
+        self._has_unsaved_changes = False
+        
+        # Save the layout path to settings for auto-loading on next startup
+        # This updates last_layout_path to remember where the layout was saved
+        self.save_last_layout_path(file_path)
+        
+        print(f"Layout saved to {file_path}\n--------------------------")
+
+    def cleanup(self):
+        """Minimal cleanup for fast shutdown - just stop voice and let process exit"""
+        print("Shutting down...")
+        try:
+            # Stop voice player immediately - this is the main blocker
+            if hasattr(self, '_uwp_player') and self._uwp_player is not None:
+                try:
+                    self._uwp_player.pause()
+                except Exception:
+                    pass
+                self._uwp_player = None
+            
+            # Stop TTS engine immediately
+            if hasattr(self, 'engine'):
+                try:
+                    self.engine.stop()
+                except Exception:
+                    pass
+            
+            # Signal threads to stop (but don't wait for them - daemon threads will be killed automatically)
+            if hasattr(self, '_uwp_thread_stop'):
+                self._uwp_thread_stop.set()
+            if hasattr(self, '_uwp_interrupt'):
+                try:
+                    self._uwp_interrupt.set()
+                except Exception:
+                    pass
+            if hasattr(self, 'controller_handler'):
+                try:
+                    self.controller_handler.running = False
+                except Exception:
+                    pass
+            
+            # Skip all other cleanup - daemon threads and resources will be cleaned up by OS
+            # This makes shutdown instant instead of waiting for threads/timeouts
+        except Exception as e:
+            # Suppress errors during fast shutdown
+            pass
+        finally:
+            # Note: We don't need to clean up asyncio event loops here because:
+            # 1. All loops we create are properly closed in their finally blocks
+            # 2. If there's a running loop, we shouldn't close it
+            # 3. get_event_loop() is deprecated when there's no current loop
+            print("Cleanup completed")
+
+    def __del__(self):
+        """Cleanup when the object is destroyed."""
+        self.cleanup()
+
+    def _play_text_log_entry(self, entry):
+        """Helper method to play a text log entry (used for repeat latest functionality)."""
+        text = entry.get('text', '').strip()
+        area_name = entry.get('area_name', '')
+        voice_name = entry.get('voice', None)
+        speed_value = entry.get('speed', None)
+        
+        if not text.strip():
+            return
+        
+        # Stop any current speech
+        self.stop_speaking()
+        
+        # Find the area and get its voice/speed settings (for fallback only)
+        voice_var = None
+        speed_var = None
+        
+        for area in self.areas:
+            # Handle both 8 and 9 element tuples (for backward compatibility)
+            if len(area) >= 9:
+                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var_item, speed_var_item, psm_var, freeze_screen_var = area[:9]
+            else:
+                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var_item, speed_var_item, psm_var = area[:8]
+            if area_name_var.get() == area_name:
+                voice_var = voice_var_item
+                speed_var = speed_var_item
+                break
+        
+        # Prioritize voice from entry (what's shown in dropdown) over area's voice
+        # First try to use the stored voice name from the entry
+        selected_voice = None
+        actual_voice_name = None
+        
+        if voice_name:
+            # Use the voice from the entry (what's shown in the dropdown)
+            actual_voice_name = voice_name
+            try:
+                voices = self.speaker.GetVoices()
+                for voice in voices:
+                    if voice.GetDescription() == voice_name:
+                        selected_voice = voice
+                        break
+            except Exception:
+                pass
+            
+            if not selected_voice and hasattr(self, 'voices'):
+                for voice in self.voices:
+                    if hasattr(voice, 'GetDescription') and voice.GetDescription() == voice_name:
+                        if hasattr(voice, 'GetId'):
+                            selected_voice = voice
+                            break
+        elif voice_var:
+            # Fallback to area's voice if entry doesn't have one
+            actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
+            
+            # Find the voice object
+            try:
+                voices = self.speaker.GetVoices()
+                for voice in voices:
+                    if voice.GetDescription() == actual_voice_name:
+                        selected_voice = voice
+                        break
+            except Exception:
+                pass
+            
+            if not selected_voice and hasattr(self, 'voices'):
+                for voice in self.voices:
+                    if hasattr(voice, 'GetDescription') and voice.GetDescription() == actual_voice_name:
+                        if hasattr(voice, 'GetId'):
+                            selected_voice = voice
+                            break
+        
+        # Set the selected voice
+        if selected_voice and selected_voice != "mock_voice":
+            try:
+                if hasattr(selected_voice, 'GetToken'):
+                    # OneCore voice - use UWP
+                    if _ensure_uwp_available():
+                        loop = None
+                        old_loop = None
+                        try:
+                            loop = asyncio.new_event_loop()
+                            try:
+                                old_loop = asyncio.get_event_loop()
+                            except RuntimeError:
+                                old_loop = None
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(self._speak_with_uwp(text, preferred_desc=actual_voice_name))
+                            return
+                        except Exception as e:
+                            print(f"UWP fallback failed: {e}")
+                        finally:
+                            # Restore previous event loop
+                            if old_loop is not None:
+                                try:
+                                    asyncio.set_event_loop(old_loop)
+                                except Exception:
+                                    pass
+                            # Only close loop if it was created and run successfully
+                            if loop is not None:
+                                try:
+                                    # Only close if loop was actually started (run_until_complete was called)
+                                    if not loop.is_closed():
+                                        try:
+                                            loop.close()
+                                        except RuntimeError as e:
+                                            if "run loop not started" not in str(e).lower():
+                                                raise
+                                except Exception:
+                                    pass
+                else:
+                    # Regular SAPI voice
+                    self.speaker.Voice = selected_voice
+            except Exception as e:
+                print(f"Error setting voice: {e}")
+        
+        # Set speed - prioritize speed from entry over area's speed
+        if speed_value is not None:
+            try:
+                if speed_value > 0:
+                    self.speaker.Rate = (speed_value - 100) // 10
+            except (ValueError, TypeError):
+                pass
+        elif speed_var:
+            try:
+                speed = int(speed_var.get())
+                if speed > 0:
+                    self.speaker.Rate = (speed - 100) // 10
+            except (ValueError, TypeError):
+                pass
+        
+        # Set volume
+        try:
+            vol = int(self.volume.get())
+            if 0 <= vol <= 100:
+                self.speaker.Volume = vol
+            else:
+                self.speaker.Volume = 100
+        except ValueError:
+            self.speaker.Volume = 100
+        
+        # Speak the text
+        try:
+            self._ensure_speech_ready()
+            # Track text and start time for pause/resume functionality
+            self.current_speech_text = text
+            import time
+            self.speech_start_time = time.time()
+            self.paused_text = None
+            self.paused_position = 0
+            self.is_speaking = True
+            self.speaker.Speak(text, 1)  # 1 is SVSFlagsAsync
+            print(f"Repeating text from area '{area_name}'")
+        except Exception as e:
+            print(f"Error repeating text: {e}")
+            self.is_speaking = False
+
+    def is_valid_text(self, text):
+        """Check if text appears to be valid (not gibberish)."""
+        # Skip empty text
+        if not text.strip():  # Skip empty lines
+            return False
+            
+        # Count valid vs invalid characters
+        valid_chars = 0
+        invalid_chars = 0
+        
+        for char in text:
+            # Count letters, numbers, and common punctuation as valid
+            if char.isalnum() or char in ".,!?'\"- ":
+                valid_chars += 1
+            else:
+                invalid_chars += 1
+        
+        # If there are too many invalid characters relative to valid ones, consider it gibberish
+        if invalid_chars > valid_chars / 2:
+            return False
+            
+        # Check for repeated symbols which often appear in OCR artifacts
+        if any(symbol * 2 in text for symbol in "/\\|[]{}=<>+*"):
+            return False
+            
+        # Check minimum length after stripping special charactersa
+        clean_text = ''.join(c for c in text if c.isalnum() or c.isspace())
+        if len(clean_text.strip()) < 2:  # Require at least 2 alphanumeric characters
+            return False
+            
+        return True
+
+    def _show_monitoring_status_if_active(self):
+        """Show monitoring status in main window if area monitoring is active and no other message is showing"""
+        if not hasattr(self, 'status_label'):
+            return
+        
+        # Check if area monitoring is active
+        monitoring_active = False
+        if hasattr(self, '_automations_window') and self._automations_window:
+            try:
+                monitoring_active = getattr(self._automations_window, 'polling_active', False)
+            except:
+                pass
+        
+        # Only show if monitoring is active and status label is currently empty
+        if monitoring_active:
+            current_text = self.status_label.cget('text')
+            if not current_text or current_text.strip() == "":
+                self.status_label.config(text="Area monitoring is active", fg="green", font=("Helvetica", 10, "bold"))
+    
+    def show_processing_feedback(self, area_name):
+        """Show processing feedback with text only"""
+        # Cancel any existing feedback clear timer
+        if hasattr(self, '_feedback_timer') and self._feedback_timer:
+            self.root.after_cancel(self._feedback_timer)
+        
+        # Initialize or increment feedback counter
+        if not hasattr(self, '_feedback_counter'):
+            self._feedback_counter = 0
+        
+        # Increment counter each time (to increase delay)
+        self._feedback_counter += 1
+        
+        # Calculate delay: start at 1300ms, increase by 200ms each time
+        delay = 1300 + (self._feedback_counter - 1) * 200
+        
+        # Update status text with bold font
+        self.status_label.config(text=f"Processing Area: {area_name}", fg="black", font=("Helvetica", 10, "bold"))
+        
+        # Set timer to clear the text and reset font after delay
+        def clear_feedback():
+            self.status_label.config(text="", font=("Helvetica", 10))
+            # After clearing, show monitoring status if active
+            self._show_monitoring_status_if_active()
+            # Reset counter after a delay to allow it to build up again
+            self.root.after(5000, lambda: setattr(self, '_feedback_counter', 0))
+        
+        self._feedback_timer = self.root.after(delay, clear_feedback)
+
+
+# Add this function near the top of the file, after the imports
+def open_url(url):
+    """Helper function to open URLs in the default browser"""
+    try:
+        print(f"Attempting to open URL: {url}")
+        result = webbrowser.open(url)
+        if result:
+            print(f"Successfully opened URL: {url}")
+        else:
+            print(f"Failed to open URL: {url} - webbrowser.open returned False")
+    except Exception as e:
+        print(f"Error opening URL {url}: {e}")
+        # Try alternative method
+        try:
+            import subprocess
+            import platform
+            if platform.system() == "Windows":
+                subprocess.run(["start", url], shell=True, check=True)
+                print(f"Opened URL using Windows start command: {url}")
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", url], check=True)
+                print(f"Opened URL using macOS open command: {url}")
+            else:  # Linux
+                subprocess.run(["xdg-open", url], check=True)
+                print(f"Opened URL using xdg-open: {url}")
+        except Exception as e2:
+            print(f"Alternative method also failed: {e2}")
+
+def get_primary_monitor_info():
+    """
+    Get the primary monitor's position and dimensions using EnumDisplayMonitors.
+    This is more reliable than MonitorFromPoint in multi-monitor setups.
+    Returns: (x, y, width, height) tuple.
+    """
+    try:
+        # Define RECT structure
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ('left', ctypes.c_long),
+                ('top', ctypes.c_long),
+                ('right', ctypes.c_long),
+                ('bottom', ctypes.c_long)
+            ]
+        
+        # Define MONITORINFO structure
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ('cbSize', ctypes.c_uint32),
+                ('rcMonitor', RECT),
+                ('rcWork', RECT),
+                ('dwFlags', ctypes.c_uint32)
+            ]
+        
+        # MONITORINFOF_PRIMARY = 0x00000001
+        MONITORINFOF_PRIMARY = 0x00000001
+        
+        # Store the primary monitor info
+        primary_monitor_info = None
+        
+        def monitor_enum_proc(hmonitor, hdc, lprcMonitor, lParam):
+            """Callback function for EnumDisplayMonitors"""
+            nonlocal primary_monitor_info
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            
+            # Get monitor info
+            if ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
+                # Check if this is the primary monitor
+                if mi.dwFlags & MONITORINFOF_PRIMARY:
+                    rect = mi.rcMonitor
+                    primary_monitor_info = (
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top
+                    )
+            return 1  # Continue enumeration
+        
+        # Define the callback type
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(RECT),
+            ctypes.c_ulong
+        )
+        
+        # Enumerate all monitors
+        callback = MonitorEnumProc(monitor_enum_proc)
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0)
+        
+        if primary_monitor_info:
+            return primary_monitor_info
+        else:
+            # Fallback: use GetSystemMetrics
+            print("Warning: Could not find primary monitor via EnumDisplayMonitors, using fallback")
+            return (0, 0, 
+                   win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
+                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+    
+    except Exception as e:
+        print(f"Error detecting primary monitor: {e}, using fallback")
+        # Fallback: use GetSystemMetrics
+        return (0, 0,
+               win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
+               win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+
+def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None):
+    """
+    Capture screen area across multiple monitors using win32api.
+    
+    Args:
+        x1, y1, x2, y2: Screen coordinates for the area to capture
+        use_printwindow: If True, try to use PrintWindow API (better for fullscreen apps)
+        target_hwnd: Window handle to capture from (for PrintWindow mode)
+    """
+    # Get virtual screen bounds
+    min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
+    min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
+    total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+    total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    max_x = min_x + total_width
+    max_y = min_y + total_height
+    
+  #  print(f"Debug: Screenshot capture - Input coords: ({x1}, {y1}, {x2}, {y2})")
+   # print(f"Debug: Virtual screen bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
+
+    # Clamp coordinates to virtual screen bounds
+    x1 = max(min_x, min(max_x, x1))
+    y1 = max(min_y, min(max_y, y1))
+    x2 = max(min_x, min(max_x, x2))
+    y2 = max(min_y, min(max_y, y2))
+    
+    
+
+    # Ensure valid area (swap if necessary and check size)
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return Image.new('RGB', (1, 1))  # Return a blank 1x1 image for invalid areas
+
+    # Try PrintWindow method first if requested (better for fullscreen apps)
+    if use_printwindow and target_hwnd:
+        try:
+            # Get window rectangle
+            window_rect = win32gui.GetWindowRect(target_hwnd)
+            window_width = window_rect[2] - window_rect[0]
+            window_height = window_rect[3] - window_rect[1]
+            
+            if window_width > 0 and window_height > 0:
+                # Create a device context for the window
+                hwindc = win32gui.GetWindowDC(target_hwnd)
+                if hwindc:
+                    memdc = None
+                    bmp = None
+                    try:
+                        srcdc = win32ui.CreateDCFromHandle(hwindc)
+                        memdc = srcdc.CreateCompatibleDC()
+                        
+                        # Create bitmap for the window
+                        bmp = win32ui.CreateBitmap()
+                        bmp.CreateCompatibleBitmap(srcdc, window_width, window_height)
+                        memdc.SelectObject(bmp)
+                        
+                        # Use PrintWindow to capture the window's content
+                        # PW_RENDERFULLCONTENT = 0x00000002 (captures even if window is occluded)
+                        PW_RENDERFULLCONTENT = 0x00000002
+                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetHandle(), PW_RENDERFULLCONTENT)
+                        
+                        if result:
+                            # Convert bitmap to PIL Image
+                            bmpinfo = bmp.GetInfo()
+                            bmpstr = bmp.GetBitmapBits(True)
+                            full_img = Image.frombuffer(
+                                'RGB',
+                                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                                bmpstr, 'raw', 'BGRX', 0, 1
+                            )
+                            
+                            # Calculate crop coordinates relative to window
+                            # Window position on screen
+                            win_x = window_rect[0]
+                            win_y = window_rect[1]
+                            
+                            # Convert screen coordinates to window-relative coordinates
+                            crop_x1 = max(0, x1 - win_x)
+                            crop_y1 = max(0, y1 - win_y)
+                            crop_x2 = min(window_width, x2 - win_x)
+                            crop_y2 = min(window_height, y2 - win_y)
+                            
+                            # Crop to the requested area
+                            if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                                img = full_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+                                
+                                # Clean up before returning
+                                try:
+                                    if memdc:
+                                        memdc.DeleteDC()
+                                    if bmp:
+                                        win32gui.DeleteObject(bmp.GetHandle())
+                                except Exception:
+                                    pass
+                                
+                                print("Fullscreen mode: Captured using PrintWindow API")
+                                return img
+                    except Exception as e:
+                        print(f"PrintWindow capture error: {e}")
+                    finally:
+                        # Always clean up resources
+                        try:
+                            if memdc:
+                                memdc.DeleteDC()
+                            if bmp:
+                                win32gui.DeleteObject(bmp.GetHandle())
+                        except Exception:
+                            pass
+                        try:
+                            win32gui.ReleaseDC(target_hwnd, hwindc)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Error in PrintWindow capture: {e}")
+            # Fall through to normal BitBlt method
+
+    # Normal BitBlt method (fallback or default)
+    # Get DC from entire virtual screen
+    hwin = win32gui.GetDesktopWindow()
+    hwindc = win32gui.GetWindowDC(hwin)
+    memdc = None
+    bmp = None
+    try:
+        srcdc = win32ui.CreateDCFromHandle(hwindc)
+        memdc = srcdc.CreateCompatibleDC()
+
+        # Create bitmap for capture area
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(srcdc, width, height)
+        memdc.SelectObject(bmp)
+
+        # Copy screen into bitmap
+        memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
+
+        # Convert bitmap to PIL Image
+        bmpinfo = bmp.GetInfo()
+        bmpstr = bmp.GetBitmapBits(True)
+        img = Image.frombuffer(
+            'RGB',
+            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+            bmpstr, 'raw', 'BGRX', 0, 1
+        )
+
+        return img
+    finally:
+        # Always clean up resources
+        try:
+            if memdc:
+                memdc.DeleteDC()
+            if bmp:
+                win32gui.DeleteObject(bmp.GetHandle())
+            win32gui.ReleaseDC(hwin, hwindc)
+        except Exception:
+            pass
+
