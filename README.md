@@ -1,5 +1,8 @@
 # GameTextReader
 
+## 💾 Download:
+Click Releases on the right side of the page (GameTextReader 0.9.2), scroll down to Assets at the bottom, and click do downlad the GameTextReader.exe file.
+
 ## 🎮 About
 As a person with dyslexia, I wanted a program to read text in video games aloud. However, I could never find a solution that was easy to work with, so I made this program with coding help from AI. I know it's not the best code, but in the end, I got the program to the state I envisioned, and I'm now using it in different games to help me 'read' long dialogues. I'm uploading it here so other people can use it as well.
 
