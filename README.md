@@ -1,5 +1,8 @@
 # GameTextReader
 
+## 📺 Tutuorial / walkthrough: 
+Link to Video: https://www.youtube.com/watch?v=GvmhcmowcS8
+
 ## 💾 Download:
 Click Releases on the right side of the page (GameTextReader 0.9.2), scroll down to Assets at the bottom, and click do downlad the GameTextReader.exe file.
 
