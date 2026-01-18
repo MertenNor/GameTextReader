@@ -20,6 +20,9 @@ class TextLogWindow:
         self.window.geometry("700x300")
         self.window.resizable(True, True)
         
+        # Register this window as one that disables hotkeys
+        self.game_text_reader.register_hotkey_disabling_window("Scan History", self.window)
+        
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -171,7 +174,8 @@ class TextLogWindow:
             self.game_text_reader.repeat_latest_hotkey_button._display_button = None
             # Reset config to dummy method
             self.game_text_reader.repeat_latest_hotkey_button.config = lambda **kwargs: None
-        # Clear reference in game_text_reader
+        # Unregister this window and clear reference in game_text_reader
+        self.game_text_reader.unregister_hotkey_disabling_window("Scan History")
         if hasattr(self.game_text_reader, 'text_log_window'):
             self.game_text_reader.text_log_window = None
         self.window.destroy()

@@ -271,6 +271,11 @@ class GameTextReader:
         self.additional_options_window = None  # Reference to additional options window
         self.text_log_window = None  # Reference to text log window
         
+        # Track windows that disable hotkeys
+        self.hotkey_disabling_windows = {}  # Dictionary to track open windows that disable hotkeys
+        self.hotkey_warning_count = 0  # Count of hotkey attempts while disabled
+        self.last_hotkey_warning_time = 0  # Track time of last warning to prevent spam
+        
         # Debouncing for hotkeys to prevent double triggering
         self.last_hotkey_trigger = {}  # Dictionary to track last trigger time for each hotkey
         self.hotkey_debounce_time = 0.1  # 100ms debounce time
@@ -429,6 +434,15 @@ class GameTextReader:
         
         # Add variable for interrupt on new scan
         self.interrupt_on_new_scan_var = tk.BooleanVar(value=True)
+        
+        # Add variable for letters only OCR mode
+        self.letters_only_var = tk.BooleanVar(value=False)
+        # Add variable for also reading numbers in letters only mode
+        self.letters_only_numbers_var = tk.BooleanVar(value=False)
+        # Add variable for reading standalone numbers only (bypasses character normalization)
+        self.standalone_numbers_var = tk.BooleanVar(value=False)
+        # Add variable for character normalization (bundles all common mappings including | to i)
+        self.char_normalization_var = tk.BooleanVar(value=False)
 
         # UWP TTS concurrency control
         self._uwp_lock = threading.Lock()
@@ -1893,14 +1907,19 @@ class GameTextReader:
         if last_end < len(changelog_text):
             parts.append(('text', changelog_text[last_end:]))
         
-        # Helper function to insert text with font formatting
+        # Helper function to insert text with font formatting and clickable links
         def insert_text_with_fonts(text_widget, text):
-            """Insert text and apply font tags like [FONT:FontName]text[/FONT] or [FONT:FontName:Size]text[/FONT]"""
-            # Pattern to match [FONT:name]text[/FONT] or [FONT:name:size]text[/FONT]
+            """Insert text and apply font tags like [FONT:FontName]text[/FONT] or [FONT:FontName:Size]text[/FONT] and make URLs clickable"""
+            import webbrowser
+            import re
+            
             # Pattern to match [FONT:name]text[/FONT] or [FONT:name:size]text[/FONT]
             # Allow optional whitespace around colons for flexibility
             # Pattern supports: [FONT:name], [FONT:name:size], [FONT:name:size:bold], [FONT:name::bold]
             font_pattern = r'\[FONT\s*:\s*([^:\]]+?)(?:\s*:\s*(\d+))?(?:\s*:\s*(bold|normal))?\s*\](.*?)\[/FONT\]'
+            
+            # Pattern to match URLs - http://, https://, and www.
+            url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+'
             
             # Test the pattern on a simple example
             test_text = "[FONT:Helvetica:18]Test[/FONT]"
@@ -1916,6 +1935,27 @@ class GameTextReader:
             current_state = text_widget.cget('state')
             if current_state == 'disabled':
                 text_widget.config(state='normal')
+            
+            # Configure link tag style (blue underlined text)
+            try:
+                text_widget.tag_config('url', foreground='blue', underline=1)
+                # Bind click event for URLs
+                def open_url(event):
+                    try:
+                        url = text_widget.get(tk.CURRENT + "wordstart", tk.CURRENT + "wordend")
+                        # Ensure URL has protocol
+                        if url.startswith('www.'):
+                            url = 'https://' + url
+                        webbrowser.open(url)
+                    except Exception as e:
+                        print(f"Error opening URL: {e}")
+                
+                text_widget.tag_bind('url', '<Button-1>', open_url)
+                # Change cursor to hand when hovering over links
+                text_widget.tag_bind('url', '<Enter>', lambda e: text_widget.config(cursor="hand2"))
+                text_widget.tag_bind('url', '<Leave>', lambda e: text_widget.config(cursor=""))
+            except Exception as e:
+                print(f"Error configuring link tags: {e}")
             
             matches = list(re.finditer(font_pattern, text, re.DOTALL | re.IGNORECASE))
             
@@ -1935,8 +1975,8 @@ class GameTextReader:
                         print(f"    Context: {repr(ctx)}")
             
             if not matches:
-                # No font tags found, just insert the text as-is
-                text_widget.insert('end', text)
+                # No font tags found, process for URLs and insert
+                self._insert_text_with_urls(text_widget, text, url_pattern)
                 if current_state == 'disabled':
                     text_widget.config(state='disabled')
                 return
@@ -1944,7 +1984,7 @@ class GameTextReader:
             for match in matches:
                 # Insert text before the font tag
                 if match.start() > last_end:
-                    text_widget.insert('end', text[last_end:match.start()])
+                    self._insert_text_with_urls(text_widget, text[last_end:match.start()], url_pattern)
                 
                 # Get font name, optional size, and optional weight (bold/normal)
                 font_name = match.group(1).strip()
@@ -1984,30 +2024,18 @@ class GameTextReader:
                     import traceback
                     traceback.print_exc()
                     # Fallback: insert without formatting
-                    text_widget.insert('end', font_text)
+                    self._insert_text_with_urls(text_widget, font_text, url_pattern)
                     last_end = match.end()
                     continue
                 
-                # Insert text with the tag
-                # Get position before insertion (end always has trailing newline, so use end-1c to get actual end)
-                start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
-                # Insert the text
-                text_widget.insert('end', font_text)
-                # Get position after insertion (end-1c to exclude the trailing newline that Tkinter adds)
-                end_pos = text_widget.index('end-1c')
-                # Apply the tag to the inserted text
-                if start_pos != end_pos:  # Only apply if there's actual text
-                    text_widget.tag_add(tag_name, start_pos, end_pos)
-                    weight_info = f", weight={font_weight}" if font_weight else ""
-                    print(f"Applied tag '{tag_name}' (font={font_name}, size={font_size or 'default'}{weight_info}) from {start_pos} to {end_pos}")
-                else:
-                    print(f"Warning: start_pos == end_pos, skipping tag application")
+                # Process font_text for URLs and insert with tags
+                self._insert_text_with_urls_and_font(text_widget, font_text, url_pattern, tag_name)
                 
                 last_end = match.end()
             
-            # Insert remaining text
+            # Insert remaining text with URL processing
             if last_end < len(text):
-                text_widget.insert('end', text[last_end:])
+                self._insert_text_with_urls(text_widget, text[last_end:], url_pattern)
             
             # Restore original state
             if current_state == 'disabled':
@@ -2142,6 +2170,66 @@ class GameTextReader:
         # If no image markers found, still parse and insert text with font formatting
         if not parts:
             insert_text_with_fonts(text_widget, changelog_text)
+    
+    def _insert_text_with_urls(self, text_widget, text, url_pattern):
+        """Insert text and make URLs clickable"""
+        import re
+        
+        last_end = 0
+        for match in re.finditer(url_pattern, text):
+            # Insert text before the URL
+            if match.start() > last_end:
+                text_widget.insert('end', text[last_end:match.start()])
+            
+            # Insert the URL as a clickable link
+            url = match.group(0)
+            start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+            text_widget.insert('end', url)
+            end_pos = text_widget.index('end-1c')
+            
+            # Apply URL tag
+            if start_pos != end_pos:
+                text_widget.tag_add('url', start_pos, end_pos)
+            
+            last_end = match.end()
+        
+        # Insert remaining text
+        if last_end < len(text):
+            text_widget.insert('end', text[last_end:])
+    
+    def _insert_text_with_urls_and_font(self, text_widget, text, url_pattern, font_tag):
+        """Insert text with font styling and make URLs clickable within the font-styled text"""
+        import re
+        
+        last_end = 0
+        for match in re.finditer(url_pattern, text):
+            # Insert text before the URL with font tag
+            if match.start() > last_end:
+                start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+                text_widget.insert('end', text[last_end:match.start()])
+                end_pos = text_widget.index('end-1c')
+                if start_pos != end_pos:
+                    text_widget.tag_add(font_tag, start_pos, end_pos)
+            
+            # Insert the URL with both font and URL tags
+            url = match.group(0)
+            start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+            text_widget.insert('end', url)
+            end_pos = text_widget.index('end-1c')
+            
+            if start_pos != end_pos:
+                text_widget.tag_add(font_tag, start_pos, end_pos)
+                text_widget.tag_add('url', start_pos, end_pos)
+            
+            last_end = match.end()
+        
+        # Insert remaining text with font tag
+        if last_end < len(text):
+            start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+            text_widget.insert('end', text[last_end:])
+            end_pos = text_widget.index('end-1c')
+            if start_pos != end_pos:
+                text_widget.tag_add(font_tag, start_pos, end_pos)
     
     def check_and_save_update(self, local_version, changelog_text_widget):
         """Check for updates and save/display the result."""
@@ -2566,6 +2654,10 @@ class GameTextReader:
         title_label = tk.Label(top_frame, text=f"{APP_NAME} v{APP_VERSION}", font=("Helvetica", 12, "bold"))
         title_label.pack(side='left', padx=(0, 20))
         
+        # Hotkey status notification label (initially hidden)
+        self.hotkey_status_label = tk.Label(top_frame, text="", font=("Helvetica", 10, "bold"), fg="red")
+        self.hotkey_status_label.pack(side='left', padx=(0, 20))
+        
         # Volume control in top frame
         volume_frame = tk.Frame(top_frame)
         volume_frame.pack(side='left', padx=10)
@@ -2913,6 +3005,9 @@ class GameTextReader:
         # Store reference to the window
         self.additional_options_window = options_window
         
+        # Register this window as one that disables hotkeys
+        self.register_hotkey_disabling_window("Additional Options", options_window)
+        
         # Store original values to detect actual changes
         original_bad_word_list = self.bad_word_list.get().strip()
         
@@ -3130,6 +3225,26 @@ class GameTextReader:
                 "var": self.allow_mouse_buttons_var,
                 "label": "Allow mouse left/right as a hotkey:",
                 "description": "Enables the use of left and right mouse buttons as hotkeys for triggering read actions. Provides additional input options beyond keyboard shortcuts."
+            },
+            {
+                "var": self.letters_only_var,
+                "label": "Letters only OCR mode:",
+                "description": "Filters OCR output to only include letters (a-z, A-Z). All numbers, symbols, and special characters will be removed from the recognized text."
+            },
+            {
+                "var": self.letters_only_numbers_var,
+                "label": "  Also read numbers:",
+                "description": "When enabled with 'Letters only OCR mode', also includes numbers (0-9) along with letters. Only letters and numbers will be kept, all other symbols will be removed."
+            },
+            {
+                "var": self.standalone_numbers_var,
+                "label": "  Read standalone numbers only:",
+                "description": "Reads numbers only when they appear alone (not mixed with letters). Bypasses character normalization for pure numbers. Works independently of 'Letters only OCR mode'."
+            },
+            {
+                "var": self.char_normalization_var,
+                "label": "Character normalization:",
+                "description": "Fixes common OCR character recognition errors. Examples: 5→S, 0→O, 2→Z, 8→B, |→i, I→l, 1→l, §→S, €→E. Makes misread text more readable."
             }
         ]
         
@@ -3219,6 +3334,7 @@ class GameTextReader:
                     pass
             
             # Clear the reference when window is closed
+            self.unregister_hotkey_disabling_window("Additional Options")
             self.additional_options_window = None
             options_window.destroy()
         
@@ -12464,6 +12580,8 @@ class GameTextReader:
             "fullscreen_mode": self.fullscreen_mode_var.get(),
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
             "stop_hotkey": self.stop_hotkey,  # 4. Stop Hotkey
             "pause_hotkey": self.pause_hotkey,  # 4b. Pause/Play Hotkey
             "edit_area_hotkey": self.edit_area_hotkey,  # 4c. Edit Area Hotkey
@@ -12621,6 +12739,8 @@ class GameTextReader:
             "fullscreen_mode": self.fullscreen_mode_var.get(),
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
             "stop_hotkey": self.stop_hotkey,
             "pause_hotkey": self.pause_hotkey,
             "edit_area_hotkey": self.edit_area_hotkey,  # 4c. Edit Area Hotkey
@@ -13399,6 +13519,10 @@ class GameTextReader:
                     self.process_freeze_screen_var.set(layout.get("process_freeze_screen", False))
                 if hasattr(self, 'allow_mouse_buttons_var'):
                     self.allow_mouse_buttons_var.set(layout.get("allow_mouse_buttons", False))
+                if hasattr(self, 'letters_only_var'):
+                    self.letters_only_var.set(layout.get("letters_only", False))
+                if hasattr(self, 'char_normalization_var'):
+                    self.char_normalization_var.set(layout.get("char_normalization", False))
                 
                 # Clean up existing areas and unhook all hotkeys
                 # Clean up images
@@ -16314,6 +16438,169 @@ class GameTextReader:
         # Join lines with proper spacing
         filtered_text = ' '.join(filtered_lines)
 
+        # Apply letters-only filtering if enabled
+        if self.letters_only_var.get():
+            # Check if game units processing is enabled
+            game_units_enabled = (hasattr(self, 'read_game_units_var') and self.read_game_units_var.get())
+            
+            if game_units_enabled:
+                # Apply letters-only filtering, but preserve game units replacements
+                # First, collect all game units patterns and their replacements
+                import re
+                units_replaced_text = filtered_text
+                
+                # Apply game units replacements first
+                for short_name, full_name in self.game_units.items():
+                    # Use word boundaries to avoid partial matches
+                    pattern = r'\b' + re.escape(short_name) + r'\b'
+                    units_replaced_text = re.sub(pattern, full_name, units_replaced_text, flags=re.IGNORECASE)
+                
+                # Now apply letters-only filtering to the non-game-units parts
+                # Split by spaces and filter each word
+                words = units_replaced_text.split()
+                filtered_words = []
+                
+                for word in words:
+                    # Check if this word is a game unit replacement (contains only letters and spaces)
+                    if any(full_name.lower() == word.lower() for full_name in self.game_units.values()):
+                        # Keep game unit replacements as they are (no filtering)
+                        filtered_words.append(word)
+                    else:
+                        # Check if this is a standalone number and standalone numbers option is enabled
+                        if self.standalone_numbers_var.get() and word.isdigit():
+                            # Keep pure numbers as-is (bypass character normalization)
+                            filtered_words.append(word)
+                        else:
+                            # Apply character normalization first if enabled
+                            if self.char_normalization_var.get():
+                                # Character mappings for common OCR errors
+                                char_mappings = {
+                                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                                    '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
+                                    '×': 'x', '♥': 'h', '★': '*'
+                                }
+                                # Apply character mappings to this word
+                                for old_char, new_char in char_mappings.items():
+                                    word = word.replace(old_char, new_char)
+                            
+                            # Then apply letters-only filtering (with optional numbers)
+                            if self.letters_only_numbers_var.get():
+                                # Include both letters and numbers
+                                letters_numbers_only = ''.join(c for c in word if c.isalpha() or c.isdigit())
+                                if letters_numbers_only:  # Only keep if there are letters or numbers left
+                                    filtered_words.append(letters_numbers_only)
+                            else:
+                                # Letters only
+                                letters_only = ''.join(c for c in word if c.isalpha())
+                                if letters_only:  # Only keep if there are letters left
+                                    filtered_words.append(letters_only)
+                
+                filtered_text = ' '.join(filtered_words)
+            else:
+                # Simple letters-only filtering when game units is disabled
+                # First handle standalone numbers if that option is enabled
+                if self.standalone_numbers_var.get():
+                    # Split text and process each word
+                    words = filtered_text.split()
+                    processed_words = []
+                    
+                    for word in words:
+                        if word.isdigit():
+                            # Keep pure numbers as-is (bypass character normalization)
+                            processed_words.append(word)
+                        else:
+                            # Apply character normalization first if enabled
+                            if self.char_normalization_var.get():
+                                # Character mappings for common OCR errors
+                                char_mappings = {
+                                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                                    '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
+                                    '×': 'x', '♥': 'h', '★': '*'
+                                }
+                                # Apply character mappings to this word
+                                for old_char, new_char in char_mappings.items():
+                                    word = word.replace(old_char, new_char)
+                            
+                            # Then apply letters-only filtering (with optional numbers)
+                            if self.letters_only_numbers_var.get():
+                                # Include both letters and numbers
+                                letters_numbers_only = ''.join(c for c in word if c.isalpha() or c.isdigit())
+                                if letters_numbers_only:  # Only keep if there are letters or numbers left
+                                    processed_words.append(letters_numbers_only)
+                            else:
+                                # Letters only
+                                letters_only = ''.join(c for c in word if c.isalpha())
+                                if letters_only:  # Only keep if there are letters left
+                                    processed_words.append(letters_only)
+                    
+                    filtered_text = ' '.join(processed_words)
+                else:
+                    # Original simple filtering when standalone numbers is disabled
+                    # Apply character normalization first if enabled
+                    if self.char_normalization_var.get():
+                        # Character mappings for common OCR errors
+                        char_mappings = {
+                            '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                            'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                            '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
+                            '×': 'x', '♥': 'h', '★': '*'
+                        }
+                        # Apply character mappings
+                        for old_char, new_char in char_mappings.items():
+                            filtered_text = filtered_text.replace(old_char, new_char)
+                    
+                    # Then apply letters-only filtering (with optional numbers)
+                    if self.letters_only_numbers_var.get():
+                        # Include both letters and numbers
+                        filtered_text = ''.join(c for c in filtered_text if c.isalpha() or c.isdigit() or c.isspace())
+                    else:
+                        # Letters only
+                        filtered_text = ''.join(c for c in filtered_text if c.isalpha() or c.isspace())
+                    # Clean up multiple spaces
+                    import re
+                    filtered_text = re.sub(r'\s+', ' ', filtered_text).strip()
+        else:
+            # Letters-only mode is disabled, but character normalization or standalone numbers might be enabled
+            if self.standalone_numbers_var.get():
+                # Handle standalone numbers when letters-only is disabled
+                words = filtered_text.split()
+                processed_words = []
+                
+                for word in words:
+                    if word.isdigit():
+                        # Keep pure numbers as-is (bypass character normalization)
+                        processed_words.append(word)
+                    else:
+                        # Apply character normalization if enabled
+                        if self.char_normalization_var.get():
+                            # Character mappings for common OCR errors
+                            char_mappings = {
+                                '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                                '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
+                                '×': 'x', '♥': 'h', '★': '*'
+                            }
+                            # Apply character mappings to this word
+                            for old_char, new_char in char_mappings.items():
+                                word = word.replace(old_char, new_char)
+                        processed_words.append(word)
+                
+                filtered_text = ' '.join(processed_words)
+            elif self.char_normalization_var.get():
+                # Only character normalization when standalone numbers is disabled
+                # Character mappings for common OCR errors
+                char_mappings = {
+                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                    '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
+                    '×': 'x', '♥': 'h', '★': '*'
+                }
+                # Apply character mappings
+                for old_char, new_char in char_mappings.items():
+                    filtered_text = filtered_text.replace(old_char, new_char)
+
         if self.pause_at_punctuation_var.get():
             # Replace punctuation with itself plus a pause marker
             for punct in ['.', '!', '?']:
@@ -16590,6 +16877,69 @@ class GameTextReader:
                 print(f"Error reinitializing speaker: {e2}")
                 self.is_speaking = False
 
+    def register_hotkey_disabling_window(self, window_name, window_ref):
+        """Register a window that disables hotkeys when opened."""
+        self.hotkey_disabling_windows[window_name] = window_ref
+        # If this is the first window, disable hotkeys and show notification
+        if len(self.hotkey_disabling_windows) == 1:
+            self.disable_all_hotkeys()
+            print(f"Hotkeys disabled due to {window_name} window opening")
+            # Show red notification in main window
+            if hasattr(self, 'hotkey_status_label'):
+                self.hotkey_status_label.config(text="Hotkeys disabled - Window open")
+        else:
+            # Update notification to show multiple windows
+            if hasattr(self, 'hotkey_status_label'):
+                self.hotkey_status_label.config(text=f"Hotkeys disabled - {len(self.hotkey_disabling_windows)} windows open")
+    
+    def unregister_hotkey_disabling_window(self, window_name):
+        """Unregister a window that disables hotkeys when closed."""
+        if window_name in self.hotkey_disabling_windows:
+            del self.hotkey_disabling_windows[window_name]
+            # If no more windows, re-enable hotkeys and hide notification
+            if not self.hotkey_disabling_windows:
+                self.restore_all_hotkeys()
+                self.hotkey_warning_count = 0  # Reset warning count
+                print(f"Hotkeys re-enabled after {window_name} window closed")
+                # Hide notification in main window
+                if hasattr(self, 'hotkey_status_label'):
+                    self.hotkey_status_label.config(text="")
+            else:
+                # Update notification to show remaining windows
+                if hasattr(self, 'hotkey_status_label'):
+                    remaining_count = len(self.hotkey_disabling_windows)
+                    if remaining_count == 1:
+                        self.hotkey_status_label.config(text="Hotkeys disabled - Window open")
+                    else:
+                        self.hotkey_status_label.config(text=f"Hotkeys disabled - {remaining_count} windows open")
+    
+    def show_hotkey_disabled_warning(self):
+        """Show warning when hotkeys are pressed while disabled."""
+        import time
+        current_time = time.time()
+        
+        # Only show warning if at least 2 seconds have passed since last warning
+        if current_time - self.last_hotkey_warning_time < 2:
+            return
+        
+        self.hotkey_warning_count += 1
+        self.last_hotkey_warning_time = current_time
+        
+        # Get the list of open windows that disable hotkeys
+        open_windows = list(self.hotkey_disabling_windows.keys())
+        windows_str = ", ".join(open_windows)
+        
+        if self.hotkey_warning_count == 1:
+            message = f"Hotkeys are currently disabled because the following window(s) are open: {windows_str}\n\nPlease close the window(s) to re-enable hotkeys."
+        else:
+            message = f"Hotkeys are still disabled (attempt {self.hotkey_warning_count}). Window(s) open: {windows_str}"
+        
+        messagebox.showwarning("Hotkeys Disabled", message)
+    
+    def are_hotkeys_disabled_by_window(self):
+        """Check if hotkeys are disabled due to open windows."""
+        return len(self.hotkey_disabling_windows) > 0
+
     def on_window_close(self):
         """Handle window close event - check for unsaved changes before closing"""
         # Check if there are unsaved changes
@@ -16712,6 +17062,8 @@ class GameTextReader:
             "fullscreen_mode": self.fullscreen_mode_var.get(),
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
+            "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
             "stop_hotkey": self.stop_hotkey,
             "pause_hotkey": self.pause_hotkey,
             "auto_read_areas": {
