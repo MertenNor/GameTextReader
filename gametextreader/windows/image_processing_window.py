@@ -33,8 +33,8 @@ class ImageProcessingWindow:
         # Check if there is an image for the area
         if area_name not in latest_images:
             messagebox.showerror("Error", "No image to process, generate an image by pressing the hotkey.")
-            # Restore hotkeys before destroying window since on_close won't be called
-            self.game_text_reader.restore_all_hotkeys()
+            # Unregister this window before destroying window since on_close won't be called
+            self.game_text_reader.unregister_hotkey_disabling_window("Image Processing")
             self.window.destroy()
             return
 
@@ -46,8 +46,8 @@ class ImageProcessingWindow:
                                font=("Helvetica", 10, "bold"), foreground='#666666')
         hotkey_note.grid(row=0, column=0, columnspan=5, padx=10, pady=(10, 5), sticky='w')
         
-        # Disable hotkeys when this window opens
-        self.game_text_reader.disable_all_hotkeys()
+        # Register this window as one that disables hotkeys
+        self.game_text_reader.register_hotkey_disabling_window("Image Processing", self.window)
         
         # Create a canvas to display the image
         self.image_frame = ttk.Frame(self.window)
@@ -385,15 +385,15 @@ class ImageProcessingWindow:
                     if hasattr(game_text_reader, '_feedback_timer') and game_text_reader._feedback_timer:
                         game_text_reader.root.after_cancel(game_text_reader._feedback_timer)
                     game_text_reader._feedback_timer = game_text_reader.root.after(2000, lambda: game_text_reader.status_label.config(text=""))
-            # Restore hotkeys before destroying window (since on_close won't be called)
-            self.game_text_reader.restore_all_hotkeys()
+            # Unregister this window before destroying window (since on_close won't be called)
+            self.game_text_reader.unregister_hotkey_disabling_window("Image Processing")
             # Destroy window (if not already destroyed)
             self.window.destroy()
             return
 
         # For all other areas, continue with manual/dialog save logic
-        # Restore hotkeys before destroying window (since on_close won't be called)
-        self.game_text_reader.restore_all_hotkeys()
+        # Unregister this window before destroying window (since on_close won't be called)
+        self.game_text_reader.unregister_hotkey_disabling_window("Image Processing")
         # Destroy window
         self.window.destroy()
         # Now that everything is properly synchronized, save the layout
@@ -447,6 +447,6 @@ class ImageProcessingWindow:
                     self.processed_image.close()
         except Exception:
             pass
-        self.game_text_reader.restore_all_hotkeys()
+        self.game_text_reader.unregister_hotkey_disabling_window("Image Processing")
         self.window.destroy()
 

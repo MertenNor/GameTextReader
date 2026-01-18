@@ -108,6 +108,11 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
     scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
     text.configure(yscrollcommand=scrollbar.set)
     
+    # Configure hyperlink tags
+    text.tag_config("hyperlink", foreground="blue", underline=True)
+    text.tag_bind("hyperlink", "<Enter>", lambda e: text.config(cursor="hand2"))
+    text.tag_bind("hyperlink", "<Leave>", lambda e: text.config(cursor=""))
+    
     text.grid(row=0, column=0, sticky='nsew')
     scrollbar.grid(row=0, column=1, sticky='ns')
     
@@ -120,13 +125,31 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
         # Supports: [IMAGE:url], [IMAGE:url:width], ![alt](url)
         image_pattern = r'\[IMAGE:([^\]]+)\]|!\[([^\]]*)\]\(([^\)]+)\)'
         
+        # Pattern to match URLs (http, https, www)
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+'
+        
         parts = []
         last_end = 0
         
+        # First, split by image markers
         for match in re.finditer(image_pattern, changelog_text):
-            # Add text before the image marker
+            # Add text before image marker
             if match.start() > last_end:
-                parts.append(('text', changelog_text[last_end:match.start()]))
+                text_segment = changelog_text[last_end:match.start()]
+                # Process this segment for URLs
+                url_parts = []
+                url_last_end = 0
+                for url_match in re.finditer(url_pattern, text_segment):
+                    if url_match.start() > url_last_end:
+                        url_parts.append(('text', text_segment[url_last_end:url_match.start()]))
+                    url_parts.append(('url', url_match.group(0)))
+                    url_last_end = url_match.end()
+                
+                # Add remaining text
+                if url_last_end < len(text_segment):
+                    url_parts.append(('text', text_segment[url_last_end:]))
+                
+                parts.extend(url_parts)
             
             # Extract image URL
             if match.group(1):  # [IMAGE:url] format
@@ -148,9 +171,22 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
             parts.append(('image', url, width))
             last_end = match.end()
         
-        # Add remaining text
+        # Add remaining text and process for URLs
         if last_end < len(changelog_text):
-            parts.append(('text', changelog_text[last_end:]))
+            text_segment = changelog_text[last_end:]
+            url_parts = []
+            url_last_end = 0
+            for url_match in re.finditer(url_pattern, text_segment):
+                if url_match.start() > url_last_end:
+                    url_parts.append(('text', text_segment[url_last_end:url_match.start()]))
+                url_parts.append(('url', url_match.group(0)))
+                url_last_end = url_match.end()
+            
+            # Add remaining text
+            if url_last_end < len(text_segment):
+                url_parts.append(('text', text_segment[url_last_end:]))
+            
+            parts.extend(url_parts)
         
         # Helper function to insert text with font formatting
         def insert_text_with_fonts(text_widget, text):
@@ -240,6 +276,21 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
             if part[0] == 'text':
                 if part[1]:  # Only insert if text is not empty
                     insert_text_with_fonts(text_widget, part[1])
+            elif part[0] == 'url':
+                url = part[1]
+                # Ensure URL has protocol
+                if url.startswith('www.'):
+                    url = 'https://' + url
+                
+                # Insert clickable hyperlink
+                def open_url(event, link=url):
+                    webbrowser.open(link)
+                
+                text_widget.insert('end', url)
+                end_pos = text_widget.index('end-1c')
+                start_pos = f"{end_pos}-{len(url)}c"
+                text_widget.tag_add("hyperlink", start_pos, end_pos)
+                text_widget.tag_bind("hyperlink", "<Button-1>", open_url)
             elif part[0] == 'image':
                 url, width = part[1], part[2]
                 # Insert placeholder text
@@ -435,7 +486,7 @@ def check_for_update(root, local_version, force=False):
                     # Sometimes Google Apps Script returns HTML redirect page first
                     # Try to extract JSON if it's wrapped in HTML
                     if '<html' in response_text.lower() or '<!doctype' in response_text.lower():
-                        # Try to find JSON in the response
+                        # Try to find JSON in response
                         json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
                         if json_match:
                             response_text = json_match.group(0)
@@ -495,10 +546,42 @@ def check_for_update(root, local_version, force=False):
             # Otherwise fail silently if no internet or any error
             pass
     else:
-        # If update checking is disabled/misconfigured
-        if force:
-            root.after(100, lambda: show_update_popup(
-                root, local_version, "Unknown", 
-                "Update check not configured. Please check UPDATE_SERVER_URL in constants.py."
-            ))
+        # Use GitHub releases API as fallback when update server is not configured
+        try:
+            print("Update server not configured, using GitHub releases API as fallback")
+            github_api_url = f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest'
+            headers = {
+                'User-Agent': f'{APP_NAME}/{APP_VERSION}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            resp = requests.get(github_api_url, timeout=10, headers=headers)
+            
+            if resp.status_code == 200:
+                release_info = resp.json()
+                remote_version = release_info.get('tag_name', '').lstrip('v')
+                # Remove any non-numeric prefixes like 'release' from version
+                remote_version = re.sub(r'^[a-zA-Z]+', '', remote_version).strip('.')
+                remote_changelog = release_info.get('body', '')
+                download_url = release_info.get('html_url', f'https://github.com/{GITHUB_REPO}/releases')
+                
+                update_available = remote_version and version_tuple(remote_version) > version_tuple(local_version)
+                
+                # Show popup if: force is True, update is available, OR testing flag is enabled
+                if force or update_available or SHOW_UPDATE_POPUP_FOR_TESTING:
+                    root.after(100, lambda: show_update_popup(
+                        root, local_version, remote_version or "Unknown", remote_changelog, download_url
+                    ))
+            else:
+                if force:
+                    root.after(100, lambda: show_update_popup(
+                        root, local_version, "Unknown", 
+                        f"Failed to fetch release information from GitHub.\n\nHTTP {resp.status_code}: {resp.reason}"
+                    ))
+        except Exception as e:
+            print(f"GitHub API error: {e}")
+            if force:
+                root.after(100, lambda: show_update_popup(
+                    root, local_version, "Unknown", 
+                    f"Unable to fetch update information from GitHub.\n\nError: {str(e)[:100]}"
+                ))
 

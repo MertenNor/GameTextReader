@@ -19,6 +19,9 @@ class GameUnitsEditWindow:
         self.window.geometry("500x600")
         self.window.resizable(True, True)
         
+        # Register this window as one that disables hotkeys
+        self.game_text_reader.register_hotkey_disabling_window("Gamer Units", self.window)
+        
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -181,24 +184,40 @@ class GameUnitsEditWindow:
         # Separator
         ttk.Separator(self.window, orient='horizontal').pack(fill='x', padx=10, pady=5)
         
-        # Bottom frame with Add New, Save, and Cancel buttons
+        # Bottom frame with Add New, Delete All, Reset to Default, Save, and Cancel buttons
         bottom_frame = tk.Frame(self.window)
         bottom_frame.pack(fill='x', padx=10, pady=10)
         
+        # Left side buttons
+        left_frame = tk.Frame(bottom_frame)
+        left_frame.pack(side='left', padx=5)
+        
         # Add New button
-        add_button = tk.Button(bottom_frame, text="Add New", command=self.add_new_entry, width=10)
-        add_button.pack(side='left', padx=5)
+        add_button = tk.Button(left_frame, text="Add New", command=self.add_new_entry, width=10)
+        add_button.pack(side='left', padx=2)
+        
+        # Delete All button
+        delete_all_button = tk.Button(left_frame, text="Delete All", command=self.delete_all_entries, width=10)
+        delete_all_button.pack(side='left', padx=2)
+        
+        # Reset to Default button
+        reset_default_button = tk.Button(left_frame, text="Reset to Default", command=self.reset_to_default, width=12)
+        reset_default_button.pack(side='left', padx=2)
         
         # Spacer
         tk.Frame(bottom_frame).pack(side='left', expand=True)
         
+        # Right side buttons
+        right_frame = tk.Frame(bottom_frame)
+        right_frame.pack(side='right', padx=5)
+        
         # Save button
-        save_button = tk.Button(bottom_frame, text="Save", command=self.save_units, width=10)
-        save_button.pack(side='right', padx=5)
+        save_button = tk.Button(right_frame, text="Save", command=self.save_units, width=10)
+        save_button.pack(side='right', padx=2)
         
         # Cancel button
-        cancel_button = tk.Button(bottom_frame, text="Cancel", command=self.cancel_edit, width=10)
-        cancel_button.pack(side='right', padx=5)
+        cancel_button = tk.Button(right_frame, text="Cancel", command=self.cancel_edit, width=10)
+        cancel_button.pack(side='right', padx=2)
     
     def populate_entries(self):
         """Populate the scrollable frame with existing game units."""
@@ -247,6 +266,35 @@ class GameUnitsEditWindow:
         
         # Store widgets
         self.entry_widgets.append((short_name_var, full_name_var, short_entry, full_entry, listen_btn, delete_btn, default_btn, row_frame))
+    
+    def delete_all_entries(self):
+        """Delete all entries from the editor."""
+        if messagebox.askyesno("Delete All", "Are you sure you want to delete all game units? This action cannot be undone."):
+            # Clear all entry widgets
+            for widget in self.entry_widgets:
+                row_frame = widget[7]  # row_frame is at index 7
+                row_frame.destroy()
+            self.entry_widgets.clear()
+            
+            # Add one empty entry row
+            self.add_entry_row("", "")
+    
+    def reset_to_default(self):
+        """Reset all entries to default values."""
+        if messagebox.askyesno("Reset to Default", "This will replace all current entries with the default values. Any custom entries will be lost. Continue?"):
+            # Clear all existing entries
+            for widget in self.entry_widgets:
+                row_frame = widget[7]  # row_frame is at index 7
+                row_frame.destroy()
+            self.entry_widgets.clear()
+            
+            # Add all default entries
+            for short_name, full_name in self.default_units_list:
+                self.add_entry_row(short_name, full_name)
+            
+            # Scroll to top
+            self.canvas.update_idletasks()
+            self.canvas.yview_moveto(0.0)
     
     def add_new_entry(self):
         """Add a new empty entry row."""
@@ -461,14 +509,19 @@ class GameUnitsEditWindow:
             file_path = os.path.join(temp_path, 'gamer_units.json')
             
             with open(file_path, 'w', encoding='utf-8') as f:
-                header = '''//  Game Units Configuration
+                if new_units:
+                    # Only write header and content if there are units to save
+                    header = '''//  Game Units Configuration
 //  Format: "short_name": "Full Name"
 //  Example: "xp" will be read as "Experience Points"
 //  Enable "Read gamer units" in the main window to use this feature
 
 '''
-                f.write(header)
-                json.dump(new_units, f, indent=4, ensure_ascii=False)
+                    f.write(header)
+                    json.dump(new_units, f, indent=4, ensure_ascii=False)
+                else:
+                    # Write empty JSON object for completely empty file
+                    f.write('{}')
             
             # Update the game_text_reader's game_units
             self.game_text_reader.game_units = new_units
@@ -477,7 +530,8 @@ class GameUnitsEditWindow:
             # Show success message
             messagebox.showinfo("Success", "Game units saved successfully!")
             
-            # Clean up reference in game_text_reader
+            # Unregister this window and clean up reference in game_text_reader
+            self.game_text_reader.unregister_hotkey_disabling_window("Gamer Units")
             if hasattr(self.game_text_reader, '_game_units_editor'):
                 self.game_text_reader._game_units_editor = None
             
@@ -505,7 +559,8 @@ class GameUnitsEditWindow:
         # Stop any speech
         self.stop_speech()
         
-        # Clean up reference in game_text_reader
+        # Unregister this window and clean up reference in game_text_reader
+        self.game_text_reader.unregister_hotkey_disabling_window("Gamer Units")
         if hasattr(self.game_text_reader, '_game_units_editor'):
             self.game_text_reader._game_units_editor = None
         

@@ -84,6 +84,26 @@ class ConsoleWindow:
         
         # Configure text tags for formatting
         self.text_widget.tag_configure('bold', font=("Helvetica", 9, "bold"))
+        
+        # Configure URL tag style (blue underlined text)
+        self.text_widget.tag_configure('url', foreground='blue', underline=1)
+        
+        # Bind click event for URLs
+        def open_url(event):
+            try:
+                import webbrowser
+                url = self.text_widget.get(tk.CURRENT + "wordstart", tk.CURRENT + "wordend")
+                # Ensure URL has protocol
+                if url.startswith('www.'):
+                    url = 'https://' + url
+                webbrowser.open(url)
+            except Exception as e:
+                print(f"Error opening URL: {e}")
+        
+        self.text_widget.tag_bind('url', '<Button-1>', open_url)
+        # Change cursor to hand when hovering over links
+        self.text_widget.tag_bind('url', '<Enter>', lambda e: self.text_widget.config(cursor="hand2"))
+        self.text_widget.tag_bind('url', '<Leave>', lambda e: self.text_widget.config(cursor=""))
 
         # Enable mouse wheel scrolling for the debug log
         def _on_mousewheel_debug(event):
@@ -216,21 +236,33 @@ class ConsoleWindow:
         # Update the text widget with formatting support
         self.text_widget.delete(1.0, tk.END)
         
-        # Parse text for [BOLD]...[/BOLD] markers and apply formatting
-        pattern = r'\[BOLD\](.*?)\[/BOLD\]'
+        # Pattern to match URLs - http://, https://, and www.
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+'
+        
+        # Parse text for [BOLD]...[/BOLD] markers and apply formatting, also process URLs
+        bold_pattern = r'\[BOLD\](.*?)\[/BOLD\]'
         last_end = 0
         
-        for match in re.finditer(pattern, text):
-            # Insert text before the bold marker
+        for match in re.finditer(bold_pattern, text):
+            # Process text before the bold marker for URLs
             if match.start() > last_end:
-                self.text_widget.insert(tk.END, text[last_end:match.start()])
-            # Insert bold text
-            self.text_widget.insert(tk.END, match.group(1), 'bold')
+                self._insert_text_with_urls(self.text_widget, text[last_end:match.start()], url_pattern)
+            
+            # Process bold text for URLs and apply bold formatting
+            bold_text = match.group(1)
+            start_pos = self.text_widget.index('end-1c') if self.text_widget.get('1.0', 'end-1c').strip() else '1.0'
+            self._insert_text_with_urls(self.text_widget, bold_text, url_pattern)
+            end_pos = self.text_widget.index('end-1c')
+            
+            # Apply bold tag to the inserted text
+            if start_pos != end_pos:
+                self.text_widget.tag_add('bold', start_pos, end_pos)
+            
             last_end = match.end()
         
-        # Insert remaining text after last match
+        # Process remaining text for URLs
         if last_end < len(text):
-            self.text_widget.insert(tk.END, text[last_end:])
+            self._insert_text_with_urls(self.text_widget, text[last_end:], url_pattern)
         
         self.text_widget.config(state=tk.DISABLED)
         self.text_widget.see(tk.END)
@@ -314,4 +346,29 @@ class ConsoleWindow:
         self.log_buffer.truncate(0)
         
         # Add a confirmation message
+        print("Console cleared.\n--------------------------")
+    
+    def _insert_text_with_urls(self, text_widget, text, url_pattern):
+        """Insert text and make URLs clickable"""
+        last_end = 0
+        for match in re.finditer(url_pattern, text):
+            # Insert text before the URL
+            if match.start() > last_end:
+                text_widget.insert('end', text[last_end:match.start()])
+            
+            # Insert the URL as a clickable link
+            url = match.group(0)
+            start_pos = text_widget.index('end-1c') if text_widget.get('1.0', 'end-1c').strip() else '1.0'
+            text_widget.insert('end', url)
+            end_pos = text_widget.index('end-1c')
+            
+            # Apply URL tag
+            if start_pos != end_pos:
+                text_widget.tag_add('url', start_pos, end_pos)
+            
+            last_end = match.end()
+        
+        # Insert remaining text
+        if last_end < len(text):
+            text_widget.insert('end', text[last_end:])
 
