@@ -106,6 +106,7 @@ class AutomationsWindow:
         # Store hotkey combos (hotkey + list of areas with timers)
         self.hotkey_combos = []  # List of hotkey combo dictionaries
         
+                
         # Registry to store combo callbacks by hotkey name for reliable lookup
         self.combo_callbacks_by_hotkey = {}  # {hotkey_name: callback_function}
         
@@ -404,6 +405,7 @@ class AutomationsWindow:
         )
         add_hotkey_combo_button.pack(side='left')
         
+                
         # Separator
         ttk.Separator(self.window, orient='horizontal').pack(fill='x', padx=10, pady=5)
         
@@ -636,6 +638,7 @@ class AutomationsWindow:
         )
         text_checkbox.pack(side='left', padx=10)
         
+                
         # Line 3: Image preview, Match %, Timer, Read Area dropdown
         line3_row = tk.Frame(automation_frame)
         line3_row.pack(fill='x', pady=2)
@@ -1776,6 +1779,7 @@ class AutomationsWindow:
         area_entry = {
             'area_name': tk.StringVar(value=""),
             'timer_ms': tk.IntVar(value=0),
+            'delay_before': tk.BooleanVar(value=False),  # False = delay after, True = delay before
             'frame': None
         }
         combo['areas'].append(area_entry)
@@ -1784,6 +1788,10 @@ class AutomationsWindow:
     
     def create_area_entry_ui(self, combo, area_entry, index):
         """Create UI for a single area entry in a combo"""
+        # Migration: Ensure delay_before field exists for backward compatibility
+        if 'delay_before' not in area_entry:
+            area_entry['delay_before'] = tk.BooleanVar(value=False)
+        
         # Frame for this area entry
         entry_frame = tk.Frame(combo['areas_frame'], relief='sunken', bd=1, padx=5, pady=5)
         entry_frame.pack(fill='x', padx=5, pady=2)
@@ -1865,6 +1873,11 @@ class AutomationsWindow:
                 pass
         area_entry['timer_ms'].trace('w', on_timer_ms_change)
         
+        # Track changes to delay_before
+        def on_delay_before_change(*args):
+            self._mark_unsaved_changes()
+        area_entry['delay_before'].trace('w', on_delay_before_change)
+        
         # Timer input
         timer_frame = tk.Frame(timer_row)
         timer_frame.pack(side='left', padx=5)
@@ -1873,6 +1886,21 @@ class AutomationsWindow:
         timer_entry = tk.Entry(timer_frame, textvariable=area_entry['timer_ms'], width=6, font=("Helvetica", 9))
         timer_entry.pack(side='left', padx=2)
         tk.Label(timer_frame, text="ms", font=("Helvetica", 9)).pack(side='left')
+        
+        # Delay timing toggle
+        delay_toggle_frame = tk.Frame(timer_row)
+        delay_toggle_frame.pack(side='left', padx=5)
+        
+        delay_checkbox = tk.Checkbutton(
+            delay_toggle_frame,
+            text="Delay before step",
+            variable=area_entry['delay_before'],
+            font=("Helvetica", 8)
+        )
+        delay_checkbox.pack(side='left')
+        
+        # Store reference to delay checkbox
+        area_entry['delay_checkbox'] = delay_checkbox
         
         # Store reference to timer entry for focus removal and state management
         area_entry['timer_entry'] = timer_entry
@@ -2094,7 +2122,8 @@ class AutomationsWindow:
                         'type': 'area',
                         'area_frame': area_frame,
                         'name': trigger_name,
-                        'timer_ms': area_entry['timer_ms'].get()
+                        'timer_ms': area_entry['timer_ms'].get(),
+                        'delay_before': area_entry['delay_before'].get()
                     }
                 
                 if not trigger_info:
@@ -2105,7 +2134,8 @@ class AutomationsWindow:
                                 'type': 'automation',
                                 'automation': automation,
                                 'name': trigger_name,
-                                'timer_ms': area_entry['timer_ms'].get()
+                                'timer_ms': area_entry['timer_ms'].get(),
+                                'delay_before': area_entry['delay_before'].get()
                             }
                             break
                     
@@ -2117,7 +2147,8 @@ class AutomationsWindow:
                                     'type': 'combo',
                                     'combo': other_combo,
                                     'name': trigger_name,
-                                    'timer_ms': area_entry['timer_ms'].get()
+                                    'timer_ms': area_entry['timer_ms'].get(),
+                                    'delay_before': area_entry['delay_before'].get()
                                 }
                                 break
                 
@@ -2188,11 +2219,19 @@ class AutomationsWindow:
         trigger_name = trigger_info['name']
         trigger_type = trigger_info['type']
         timer_ms = trigger_info['timer_ms']
+        delay_before = trigger_info.get('delay_before', False)
         
         print(f"HOTKEY COMBO: Processing trigger {current_index + 1}/{len(valid_areas)}: {trigger_name} (type: {trigger_type})")
         # Update main window status for combo step
         combo_name = combo.get('name', 'Unknown')
         self._update_main_status(f"{combo_name}: Step {current_index + 1}/{len(valid_areas)} - {trigger_name}", "blue", 1500)
+        
+        # Handle delay before step if enabled
+        if delay_before and timer_ms > 0:
+            print(f"HOTKEY COMBO: Delaying {timer_ms}ms BEFORE step (delay_before=True)")
+            # Start timer countdown with progress bar for delay before
+            self._start_delay_before_timer(combo, current_index, timer_ms)
+            return  # Exit and let the timer callback continue execution
         
         # Trigger based on type
         if trigger_type == 'area':
@@ -2279,15 +2318,21 @@ class AutomationsWindow:
         valid_areas = combo.get('_valid_areas', [])
         current_index = combo.get('current_area_index', 0)
         was_cancelled = False
+        delay_before = False
         
         if current_index < len(valid_areas):
             trigger_info = valid_areas[current_index]
+            delay_before = trigger_info.get('delay_before', False)
             if trigger_info.get('type') == 'area' and trigger_info.get('name', '').startswith("Auto Read"):
                 # This is an Auto Read area - check if it was cancelled
                 area_frame = trigger_info.get('area_frame')
                 if area_frame and hasattr(area_frame, '_combo_cancelled') and area_frame._combo_cancelled:
                     was_cancelled = True
                     print(f"HOTKEY COMBO: Auto Read was cancelled for step {current_index + 1}, skipping speech wait")
+        
+        # If delay_before is True, we already handled the delay before the step, so don't delay after
+        if delay_before:
+            timer_ms = 0  # No delay after step when delay_before is True
         
         if was_cancelled:
             # Auto Read was cancelled - no speech to wait for, go straight to timer
@@ -2575,6 +2620,135 @@ class AutomationsWindow:
         # Start checking after a short delay (give speech time to start)
         self.root.after(200, check_speech_and_continue)
     
+    def _start_delay_before_timer(self, combo, area_index, timer_ms):
+        """Start timer countdown for delay before step execution"""
+        # Find the area entry to update its progress bar
+        area_entry = None
+        if area_index < len(combo['areas']):
+            area_entry = combo['areas'][area_index]
+        
+        start_time = time.time()
+        
+        def update_delay_progress():
+            # Check if combo was cancelled
+            if not combo.get('is_triggering'):
+                # Combo was cancelled, reset progress
+                if area_entry and area_entry.get('timer_progress'):
+                    try:
+                        area_entry['timer_progress']['value'] = 0
+                        if area_entry.get('timer_progress_label'):
+                            # Show initial state: 0/total ms
+                            if timer_ms > 0:
+                                area_entry['timer_progress_label'].config(text=f"0/{int(timer_ms)}ms")
+                            else:
+                                area_entry['timer_progress_label'].config(text="0ms")
+                    except:
+                        pass  # Widget was destroyed
+                return
+            
+            elapsed_ms = (time.time() - start_time) * 1000
+            remaining_ms = max(0, timer_ms - elapsed_ms)
+            
+            # Update UI only if window exists
+            window_exists = False
+            try:
+                window_exists = self.window.winfo_exists()
+            except:
+                pass
+            
+            if window_exists:
+                # Window exists - update UI
+                if area_entry and area_entry.get('timer_progress'):
+                    try:
+                        progress = min(100, (elapsed_ms / timer_ms) * 100) if timer_ms > 0 else 0
+                        area_entry['timer_progress']['value'] = progress
+                        
+                        # Update label - show countdown for delay before
+                        if area_entry.get('timer_progress_label'):
+                            if timer_ms > 0:
+                                area_entry['timer_progress_label'].config(text=f"{int(remaining_ms)}/{int(timer_ms)}ms")
+                            else:
+                                area_entry['timer_progress_label'].config(text="0ms")
+                    except:
+                        pass  # Widget was destroyed
+            
+            # Continue timer countdown regardless of window state
+            if remaining_ms > 0:
+                # Still counting down, update again in 50ms for smooth progress
+                # Use root instead of window so it works even when window is closed
+                self.root.after(50, update_delay_progress)
+            else:
+                # Delay complete, reset progress and continue with step execution
+                if window_exists and area_entry and area_entry.get('timer_progress'):
+                    try:
+                        area_entry['timer_progress']['value'] = 0
+                        if area_entry.get('timer_progress_label'):
+                            # Show final state: 0/total ms
+                            if timer_ms > 0:
+                                area_entry['timer_progress_label'].config(text=f"0/{int(timer_ms)}ms")
+                            else:
+                                area_entry['timer_progress_label'].config(text="0ms")
+                    except:
+                        pass  # Widget was destroyed
+                
+                print(f"HOTKEY COMBO: Delay before step complete, continuing with step execution")
+                # Continue with step execution directly (avoid infinite loop)
+                # Get the trigger info and execute the step without checking delay_before again
+                valid_areas = combo.get('_valid_areas', [])
+                if area_index < len(valid_areas):
+                    trigger_info = valid_areas[area_index]
+                    trigger_name = trigger_info['name']
+                    trigger_type = trigger_info['type']
+                    
+                    print(f"HOTKEY COMBO: Processing trigger {area_index + 1}/{len(valid_areas)}: {trigger_name} (type: {trigger_type})")
+                    # Update main window status for combo step
+                    combo_name = combo.get('name', 'Unknown')
+                    self._update_main_status(f"{combo_name}: Step {area_index + 1}/{len(valid_areas)} - {trigger_name}", "blue", 1500)
+                    
+                    # Execute the step based on type (same logic as in _trigger_combo_step but without delay_before check)
+                    if trigger_type == 'area':
+                        area_frame = trigger_info['area_frame']
+                        area_name = trigger_info['name']
+                        
+                        if area_name.startswith("Auto Read"):
+                            # Handle Auto Read area
+                            area_name_var = None
+                            set_area_button = None
+                            found_area_frame = None
+                            for area in self.game_text_reader.areas:
+                                if len(area) >= 4:
+                                    current_area_name_var = area[3]
+                                    if hasattr(current_area_name_var, 'get') and current_area_name_var.get() == area_name:
+                                        found_area_frame = area[0]
+                                        if len(area) >= 9:
+                                            _, _, set_area_button, area_name_var, _, _, _, _, _ = area[:9]
+                                        else:
+                                            _, _, set_area_button, area_name_var, _, _, _, _ = area[:8]
+                                        break
+                            
+                            if area_name_var and found_area_frame:
+                                found_area_frame._combo_callback = lambda: self._start_speech_monitoring_for_combo(combo, 0)  # timer_ms=0 since delay was before
+                                found_area_frame._combo_cancelled = False
+                                self.root.after(0, lambda: self.game_text_reader.set_auto_read_area(found_area_frame, set_area_button))
+                            else:
+                                print(f"HOTKEY COMBO: Auto Read area '{area_name}' not found, moving to next area")
+                                self._move_to_next_area(combo)
+                        else:
+                            # Regular area
+                            area_frame._combo_callback = lambda: self._start_speech_monitoring_for_combo(combo, 0)  # timer_ms=0 since delay was before
+                            self.root.after(0, lambda: self.game_text_reader.read_area(area_frame))
+                    elif trigger_type == 'automation':
+                        automation = trigger_info['automation']
+                        self.root.after(0, lambda: self.game_text_reader.trigger_automation(automation))
+                        self._start_speech_monitoring_for_combo(combo, 0)  # timer_ms=0 since delay was before
+                    elif trigger_type == 'combo':
+                        other_combo = trigger_info['combo']
+                        self.root.after(0, lambda: self._trigger_combo(other_combo))
+                        self._start_speech_monitoring_for_combo(combo, 0)  # timer_ms=0 since delay was before
+        
+        # Start the countdown
+        update_delay_progress()
+    
     def _start_timer_countdown(self, combo, area_index, timer_ms):
         """Start timer countdown with progress bar visualization"""
         # Find the area entry to update its progress bar
@@ -2830,7 +3004,8 @@ class AutomationsWindow:
     def check_all_automations(self):
         """Check all automation rules"""
         for automation in self.automations:
-            if not automation.get('reference_image') or not automation.get('image_area_coords'):
+            # Skip if not configured
+            if not automation.get('reference_image') and not automation.get('image_area_coords'):
                 continue  # Skip if not configured
             
             self.check_automation(automation)
@@ -2917,6 +3092,10 @@ class AutomationsWindow:
     def check_automation(self, automation):
         """Check a single automation rule"""
         try:
+            # Skip automation if not configured
+            if not automation.get('reference_image') and not automation.get('image_area_coords'):
+                return
+            
             # Capture current screen area
             x1, y1, x2, y2 = automation['image_area_coords']
             
@@ -2941,22 +3120,22 @@ class AutomationsWindow:
                 match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
             
             threshold = automation['match_percent'].get()
+            is_matching = match_percent >= threshold
             
             # Store match percent for status display
             automation['_last_match_percent'] = match_percent
-            
-            is_matching = match_percent >= threshold
             was_matching = automation.get('was_matching', False)
             
-            # Check for text only if "Only read if text exists" is enabled
-            # If disabled, skip text detection entirely and set to None (will show gray)
+            # Check for text only if "Only read if text exists" is enabled OR if text color is set
+            # Text detection is disabled by default
             text_found = None  # None means text detection is disabled
+            
             if automation['only_read_if_text'].get():
-                # Text detection is enabled - check for text as long as we're in matching state
-                # This prevents stopping text detection when match % fluctuates slightly
+                # Text detection is enabled - check for text
                 text_found = False
+                
                 if was_matching or is_matching:
-                    # We're in matching state - check for text in the detection area
+                    # Text detection is enabled - only check when image matches
                     text_found = self.has_text_in_area(current_image)
             
             # Calculate timer progress
@@ -2993,44 +3172,41 @@ class AutomationsWindow:
                     else:
                         # Start new timer if conditions are met
                         if automation['only_read_if_text'].get():
-                            # "Only read if text exists" is ON: Require BOTH image match AND text found
+                            # "Only read if text exists" is ON: Require text condition
                             # Use the text_found value we already checked above
                             if text_found:
-                                # Both image and text are "green" - start timer and record when text was found
+                                # Text condition is met - start timer and record when text was found
                                 automation['timer_active'] = True
                                 automation['timer_start_time'] = time.time()
                                 automation['text_last_found_time'] = time.time()
-                            # If no text, don't start timer (wait for both conditions)
+                            # If no text, don't start timer (wait for text condition)
                         else:
-                            # "Only read if text exists" is OFF: Trigger only on image detection (image "green")
+                            # "Only read if text exists" is OFF and no color: Trigger only on image detection (image "green")
                             # No text check needed - start timer immediately when image matches
                             automation['timer_active'] = True
                             automation['timer_start_time'] = time.time()
                 else:
                     # Still matching - check if we need to handle text requirement
                     if automation['only_read_if_text'].get():
-                        # "Only read if text exists" is ON: Require BOTH image match AND text found (both "green")
+                        # "Only read if text exists" is ON: Require text condition
                         if not text_found:
                             # Text not found - but be lenient: only cancel timer if text has been missing for >500ms
                             # This prevents timer reset from brief OCR misses
                             current_time = time.time()
                             if automation.get('text_last_found_time'):
                                 time_since_text_found = (current_time - automation['text_last_found_time']) * 1000
-                                if time_since_text_found > 500:  # 500ms tolerance for OCR misses
+                                if time_since_text_found > 500:
                                     # Text has been missing for >500ms - cancel timer
-                                    if automation['timer_active']:
-                                        automation['timer_active'] = False
-                                        automation['timer_start_time'] = None
-                            else:
-                                # Text was never found - cancel timer immediately
-                                if automation['timer_active']:
                                     automation['timer_active'] = False
-                                    automation['timer_start_time'] = None
-                            # Don't trigger if text is missing
+                                    automation['text_last_found_time'] = None
+                            else:
+                                # No text_last_found_time recorded - cancel timer immediately
+                                automation['timer_active'] = False
+                                automation['text_last_found_time'] = None
                         else:
                             # Text found - update last found time
                             automation['text_last_found_time'] = time.time()
-                            # Both image and text found - check timer if active
+                            # Text condition met - check timer if active
                             if automation['timer_active']:
                                 # Timer is counting down - check if it's expired
                                 timer_elapsed_ms = (time.time() - automation['timer_start_time']) * 1000
@@ -3084,20 +3260,22 @@ class AutomationsWindow:
                                     # Text was found recently - still allow timer to start
                                     automation['timer_active'] = True
                                     automation['timer_start_time'] = time.time()
-                        else:
-                            automation['timer_active'] = True
-                            automation['timer_start_time'] = time.time()
             else:
                 # Image doesn't match - state transition: matching -> not_matching
-                if was_matching:
-                    # Reset state for next match
-                    automation['was_matching'] = False
-                    automation['has_triggered'] = False
-                    automation['text_last_found_time'] = None  # Reset text tracking
-                
-                # Cancel timer if active
-                if automation['timer_active']:
-                    automation['timer_active'] = False
+                automation['was_matching'] = False
+                automation['has_triggered'] = False
+                automation['timer_active'] = False
+                automation['timer_start_time'] = None
+                automation['text_last_found_time'] = None
+            
+            automation['has_triggered'] = False
+            automation['timer_active'] = False
+            automation['timer_start_time'] = None
+            automation['text_last_found_time'] = None
+
+            # Cancel timer if active
+            if automation['timer_active']:
+                automation['timer_active'] = False
         except Exception as e:
             print(f"Error checking automation {automation['id']}: {e}")
     
@@ -3344,16 +3522,99 @@ class AutomationsWindow:
             print(f"Error comparing images with edge detection: {e}")
             return 0.0
     
-    def has_text_in_area(self, image):
-        """Check if text exists in the image using OCR"""
+    def has_text_in_area(self, image, target_color=None, color_tolerance=30):
+        """Check if text exists in the image using OCR, optionally filtering by color"""
         try:
             # Use basic OCR to detect text
             text = pytesseract.image_to_string(image, config='--psm 6')
             # Remove whitespace and check if any text remains
             text = text.strip()
-            return len(text) > 0
+            
+            # If no target color specified, just check if any text exists
+            if target_color is None:
+                return len(text) > 0
+            
+            # If target color is specified, check if text of that color exists
+            if len(text) > 0:
+                return self.has_text_of_color(image, target_color, color_tolerance)
+            
+            return False
         except Exception as e:
             print(f"Error checking for text: {e}")
+            return False
+    
+    def has_text_of_color(self, image, target_color, tolerance=30):
+        """Check if there's text of the specified color in the image"""
+        try:
+            import numpy as np
+            
+            # Convert target_color from hex to RGB if needed
+            if isinstance(target_color, str) and target_color.startswith('#'):
+                target_color = target_color.lstrip('#')
+                target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
+            else:
+                target_rgb = target_color
+            
+            # Get OCR data with bounding boxes
+            import pytesseract
+            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
+            
+            # Convert image to numpy array for color analysis
+            img_array = np.array(image)
+            if len(img_array.shape) == 3:
+                # RGB image
+                height, width = img_array.shape[:2]
+            else:
+                # Grayscale - convert to RGB
+                img_array = np.stack([img_array]*3, axis=-1)
+                height, width = img_array.shape[:2]
+            
+            # Check each detected text region for color match
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 30:  # Only consider confident detections
+                    text = data['text'][i].strip()
+                    if text:  # Non-empty text
+                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                        
+                        # Ensure coordinates are within image bounds
+                        x = max(0, min(x, width - 1))
+                        y = max(0, min(y, height - 1))
+                        x2 = max(0, min(x + w, width - 1))
+                        y2 = max(0, min(y + h, height - 1))
+                        
+                        if x2 > x and y2 > y:
+                            # Extract the text region
+                            text_region = img_array[y:y2, x:x2]
+                            
+                            # Sample the center area of the text region (avoid edges)
+                            if text_region.size > 0:
+                                center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
+                                sample_size = min(3, center_y, center_x)
+                                
+                                if sample_size > 0:
+                                    sample_area = text_region[center_y-sample_size:center_y+sample_size, 
+                                                              center_x-sample_size:center_x+sample_size]
+                                    
+                                    # Get average color of the sample area
+                                    avg_color = np.mean(sample_area, axis=(0, 1))
+                                    
+                                    # Check if color matches target within tolerance
+                                    if self.color_matches(avg_color, target_rgb, tolerance):
+                                        return True
+            
+            return False
+        except Exception as e:
+            print(f"Error checking text color: {e}")
+            return False
+    
+    def color_matches(self, color1, color2, tolerance):
+        """Check if two colors match within tolerance"""
+        try:
+            diff = abs(int(color1[0]) - int(color2[0])) + \
+                   abs(int(color1[1]) - int(color2[1])) + \
+                   abs(int(color1[2]) - int(color2[2]))
+            return diff <= tolerance * 3  # Multiply by 3 for RGB channels
+        except:
             return False
     
     def trigger_read_area(self, automation):
@@ -3431,7 +3692,23 @@ class AutomationsWindow:
                     return
             
             print(f"Could not find trigger target: {target_name}")
+        
         except Exception as e:
             print(f"Error triggering read area: {e}")
-
+    
+    
+    
+    def get_area_names(self):
+        """Get all available area names for dropdown"""
+        area_names = []
+        for area in self.game_text_reader.areas:
+            area_name = area[3].get()  # area_name_var
+            if area_name:
+                area_names.append(area_name)
+        return area_names if area_names else ["No areas available"]
+    
+    
+    
+    
+    
 

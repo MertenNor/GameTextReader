@@ -49,12 +49,12 @@ from ..constants import (
     APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_BACKUP_FILENAME,
     GITHUB_REPO
 )
+from ..image_processing import preprocess_image, filter_by_color
 from ..utils import (
     _ensure_uwp_available, UWP_TTS_AVAILABLE,
     get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
     is_special_character, suggest_alternative_key, InputManager
 )
-from ..image_processing import preprocess_image
 from ..screen_capture import capture_screen_area, get_primary_monitor_info
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
@@ -217,7 +217,9 @@ class GameTextReader:
         self.layout_file = tk.StringVar()
         self.latest_images = {}  # Use a dictionary to store images for each area
         self.latest_images_max_per_area = 3  # Maximum images to keep per area (prevent memory leak)
+        self.original_images = {}  # Store original unprocessed images for comparison
         self.latest_area_name = tk.StringVar()  # Ensure this is defined
+        self.image_cleanup_callbacks = {}  # Track cleanup callbacks for processing windows
         self.areas = []
         self.stop_hotkey = None  # Variable to store the STOP hotkey
         self.pause_hotkey = None  # Variable to store the PAUSE/PLAY hotkey
@@ -475,6 +477,14 @@ class GameTextReader:
         InputManager.allow()
         
         self.setup_gui()
+        
+        # Initialize console window for logging (hidden by default)
+        if not hasattr(sys, 'stdout_original'):
+            sys.stdout_original = sys.stdout
+        
+        self.console_window = ConsoleWindow(self.root, self.log_buffer, self.layout_file, self.latest_images, self.latest_area_name)
+        self.console_window.window.withdraw()  # Hide the window initially
+        sys.stdout = self.console_window
         
         # Load edit view settings from the settings file at startup
         self.load_edit_view_settings()
@@ -4546,14 +4556,23 @@ class GameTextReader:
             return False
             
     def show_debug(self):
-        if not hasattr(sys, 'stdout_original'):
-            sys.stdout_original = sys.stdout
-        
-        if not hasattr(self, 'console_window') or not self.console_window.window.winfo_exists():
-            self.console_window = ConsoleWindow(self.root, self.log_buffer, self.layout_file, self.latest_images, self.latest_area_name)
+        """Toggle debug window visibility"""
+        if hasattr(self, 'console_window') and self.console_window.window.winfo_exists():
+            # Check if window is currently hidden
+            if self.console_window.window.state() == 'withdrawn':
+                self.console_window.window.deiconify()
+                self.console_window.window.lift()
+                self.console_window.window.focus_force()
+                self.console_window.update_console()  # Refresh the display
+            else:
+                self.console_window.window.withdraw()
         else:
-            self.console_window.update_console()
-        sys.stdout = self.console_window
+            # Fallback - create new window if it doesn't exist
+            if not hasattr(sys, 'stdout_original'):
+                sys.stdout_original = sys.stdout
+            
+            self.console_window = ConsoleWindow(self.root, self.log_buffer, self.layout_file, self.latest_images, self.latest_area_name)
+            sys.stdout = self.console_window
         
     def customize_processing(self, area_name_var):
         area_name = area_name_var.get()
@@ -6497,7 +6516,7 @@ class GameTextReader:
         
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
-
+        
         # Add Img. Processing button with checkbox
         customize_button = tk.Button(area_frame, text="Img. Processing...", command=partial(self.customize_processing, area_name_var))
         customize_button.pack(side="left")
@@ -6510,6 +6529,7 @@ class GameTextReader:
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
         preprocess_var.trace('w', on_preprocess_change)
+        
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
@@ -7697,6 +7717,12 @@ class GameTextReader:
                                                                         area_name in self.processing_settings)
                                         
                                         if process_freeze_screen_enabled:
+                                            # Store original frozen screenshot first
+                                            original_screenshot = screenshot_image.copy()
+                                            frame.frozen_screenshot = original_screenshot
+                                            frame.frozen_screenshot_bounds = (window_rect[0], window_rect[1], window_width, window_height)
+                                            
+                                            # Then apply processing for OCR use
                                             settings = self.processing_settings[area_name]
                                             screenshot_image = preprocess_image(
                                                 screenshot_image,
@@ -7707,22 +7733,18 @@ class GameTextReader:
                                                 blur=settings.get('blur', 0.0),
                                                 threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
                                                 hue=settings.get('hue', 0.0),
-                                                exposure=settings.get('exposure', 1.0)
+                                                exposure=settings.get('exposure', 1.0),
+                                                color_mask_enabled=settings.get('color_mask_enabled', False),
+                                                color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                                                color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                                                color_mask_background=settings.get('color_mask_background', 'black'),
+                                                color_mask_position=settings.get('color_mask_position', 'after')
                                             )
                                             print("Image processing applied to frozen screenshot (PrintWindow).")
-                                        
-                                        # Clean up before storing
-                                        try:
-                                            if memdc:
-                                                memdc.DeleteDC()
-                                            if bmp:
-                                                win32gui.DeleteObject(bmp.GetHandle())
-                                        except Exception:
-                                            pass
-                                        
-                                        # Store the full window screenshot for freeze screen
-                                        frame.frozen_screenshot = screenshot_image.copy()
-                                        frame.frozen_screenshot_bounds = (window_rect[0], window_rect[1], window_width, window_height)
+                                        else:
+                                            # Store the full window screenshot for freeze screen (no processing)
+                                            frame.frozen_screenshot = screenshot_image.copy()
+                                            frame.frozen_screenshot_bounds = (window_rect[0], window_rect[1], window_width, window_height)
                                         print(f"Stored frozen screenshot from PrintWindow for reading")
                                     else:
                                         raise Exception("PrintWindow failed")
@@ -7797,6 +7819,12 @@ class GameTextReader:
                                                     area_name in self.processing_settings)
                     
                     if process_freeze_screen_enabled:
+                        # Store original frozen screenshot first
+                        original_screenshot = screenshot_image.copy()
+                        frame.frozen_screenshot = original_screenshot
+                        frame.frozen_screenshot_bounds = (min_x, min_y, virtual_width, virtual_height)
+                        
+                        # Then apply processing for OCR use
                         settings = self.processing_settings[area_name]
                         screenshot_image = preprocess_image(
                             screenshot_image,
@@ -7807,13 +7835,19 @@ class GameTextReader:
                             blur=settings.get('blur', 0.0),
                             threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
                             hue=settings.get('hue', 0.0),
-                            exposure=settings.get('exposure', 1.0)
+                            exposure=settings.get('exposure', 1.0),
+                            color_mask_enabled=settings.get('color_mask_enabled', False),
+                            color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                            color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                            color_mask_background=settings.get('color_mask_background', 'black'),
+                            color_mask_position=settings.get('color_mask_position', 'after')
                         )
                         print("Image processing applied to frozen screenshot (BitBlt).")
+                    else:
+                        # Store the frozen screenshot in the frame for freeze screen (no processing)
+                        frame.frozen_screenshot = screenshot_image.copy()
+                        frame.frozen_screenshot_bounds = (min_x, min_y, virtual_width, virtual_height)
                     
-                    # Store the frozen screenshot in the frame for freeze screen
-                    frame.frozen_screenshot = screenshot_image.copy()
-                    frame.frozen_screenshot_bounds = (min_x, min_y, virtual_width, virtual_height)
                     print(f"Stored frozen screenshot in frame for reading")
             except Exception as e:
                 print(f"Error taking screenshot: {e}")
@@ -12178,7 +12212,9 @@ class GameTextReader:
                 "comparison_method": automation['comparison_method'].get() if hasattr(automation['comparison_method'], 'get') else automation.get('comparison_method', 'SSIM'),
                 "target_read_area": automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else automation.get('target_read_area', ''),
                 "only_read_if_text": automation['only_read_if_text'].get() if hasattr(automation['only_read_if_text'], 'get') else automation.get('only_read_if_text', False),
-                "read_after_ms": automation['read_after_ms'].get() if hasattr(automation['read_after_ms'], 'get') else automation.get('read_after_ms', 0)
+                "read_after_ms": automation['read_after_ms'].get() if hasattr(automation['read_after_ms'], 'get') else automation.get('read_after_ms', 0),
+                "text_color": automation.get('text_color'),
+                "color_tolerance": automation['color_tolerance'].get() if hasattr(automation.get('color_tolerance'), 'get') else automation.get('color_tolerance', 30)
             }
             layout["automations"]["detection_areas"].append(automation_data)
         
@@ -12189,9 +12225,19 @@ class GameTextReader:
             for area_entry in combo.get('areas', []):
                 area_name = area_entry['area_name'].get() if hasattr(area_entry['area_name'], 'get') else area_entry.get('area_name', '')
                 timer_ms = area_entry['timer_ms'].get() if hasattr(area_entry['timer_ms'], 'get') else area_entry.get('timer_ms', 0)
+                
+                # Handle delay_before field robustly - it might not exist in old entries
+                delay_before = False
+                if 'delay_before' in area_entry:
+                    if hasattr(area_entry['delay_before'], 'get'):
+                        delay_before = area_entry['delay_before'].get()
+                    else:
+                        delay_before = bool(area_entry['delay_before'])
+                
                 areas_data.append({
                     'area_name': area_name,
-                    'timer_ms': timer_ms
+                    'timer_ms': timer_ms,
+                    'delay_before': delay_before
                 })
             
             combo_data = {
@@ -12202,6 +12248,7 @@ class GameTextReader:
             }
             layout["automations"]["hotkey_combos"].append(combo_data)
         
+                
         # Save images if file_path is provided
         if file_path and automation_window.automations:
             # Get layout name (filename without extension)
@@ -12386,6 +12433,8 @@ class GameTextReader:
                 'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
                 'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
                 'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
+                'text_color': area_data.get('text_color'),
+                'color_tolerance': tk.IntVar(value=area_data.get('color_tolerance', 30)),
                 'timer_active': False,
                 'timer_start_time': None,
                 'was_matching': False,
@@ -12426,6 +12475,14 @@ class GameTextReader:
             # Update preview if image was loaded
             if automation.get('reference_image'):
                 automation_window.update_preview(automation, automation['reference_image'])
+            
+            # Update color button if text color was set
+            if automation.get('text_color'):
+                # Update color button after UI is created
+                def update_color_button():
+                    if automation.get('color_button'):
+                        automation['color_button'].config(bg=automation['text_color'])
+                automation_window.root.after(100, update_color_button)
             
             # Set up hotkey if it exists
             if automation.get('hotkey'):
@@ -12510,6 +12567,9 @@ class GameTextReader:
                         area_entry = combo['areas'][-1]
                         area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
                         area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
+                        # Ensure delay_before field exists before setting it
+                        if 'delay_before' in area_entry and hasattr(area_entry['delay_before'], 'set'):
+                            area_entry['delay_before'].set(saved_area_entry.get('delay_before', False))
             
             # Set hotkey if it exists
             if combo.get('hotkey'):
@@ -12536,6 +12596,7 @@ class GameTextReader:
                     # Set up the hotkey
                     self.setup_hotkey(hotkey_button, None)
         
+                
         # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
         if automation_window:
             automation_window._has_unsaved_changes = False
@@ -12832,6 +12893,8 @@ class GameTextReader:
     def load_game_units(self):
         """Load game units from JSON file in the app data directory."""
         import tempfile, os, json, re
+        from tkinter import messagebox
+        
         temp_path = APP_DOCUMENTS_DIR
         os.makedirs(temp_path, exist_ok=True)
         
@@ -12848,9 +12911,39 @@ class GameTextReader:
                     # Parse the cleaned JSON
                     return json.loads(content)
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                print(f"Warning: Error reading game units file: {e}, using default units")
+                print(f"Warning: Error reading game units file: {e}")
+                # Prompt user to create new default file
+                if messagebox.askyesno("Game Units File Error", 
+                                      "The game units file is corrupted or invalid.\n\n"
+                                      "Would you like to create a new default game units file?"):
+                    return self._create_default_game_units_file(file_path)
+                else:
+                    # Return empty dict if user declines
+                    return {}
+        else:
+            # File doesn't exist - check if this is first run by looking for any other app files
+            has_other_files = any(os.path.exists(os.path.join(temp_path, f)) 
+                                 for f in os.listdir(temp_path) 
+                                 if f != 'gamer_units.json' and not f.startswith('.'))
+            
+            if not has_other_files:
+                # First run - create default file automatically
+                print("First run detected - creating default game units file")
+                return self._create_default_game_units_file(file_path)
+            else:
+                # Not first run - prompt user
+                if messagebox.askyesno("Game Units File Missing", 
+                                      "No game units file found.\n\n"
+                                      "Would you like to create a new default game units file?"):
+                    return self._create_default_game_units_file(file_path)
+                else:
+                    # Return empty dict if user declines
+                    return {}
+    
+    def _create_default_game_units_file(self, file_path):
+        """Create the default game units file and return the default units."""
+        import json
         
-        # Create default game units if file doesn't exist or is invalid
         default_units = {
             'xp': 'Experience Points',
             'hp': 'Health Points',
@@ -13534,6 +13627,19 @@ class GameTextReader:
                         pass
                 self.latest_images.clear()
                 
+                # Clean up original images
+                for image in self.original_images.values():
+                    try:
+                        image.close()
+                    except (AttributeError, Exception):
+                        # Image may not have close() method
+                        pass
+                self.original_images.clear()
+                
+                # Clean up registered images
+                for area_name in list(self.image_cleanup_callbacks.keys()):
+                    self.cleanup_registered_images(area_name)
+                
                 # Unhook all existing hotkeys
                 keyboard.unhook_all()
                 mouse.unhook_all()
@@ -13952,6 +14058,10 @@ class GameTextReader:
 
                     # Store original or processed image based on settings
                     if preprocess_var.get() and area_info["name"] in self.processing_settings:
+                        # Store the original unprocessed image first
+                        self._store_image_with_bounds(area_name_var.get(), screenshot, is_original=True)
+                        
+                        # Then apply processing for OCR use
                         settings = self.processing_settings[area_info["name"]]
                         processed_image = preprocess_image(
                             screenshot,
@@ -13962,11 +14072,19 @@ class GameTextReader:
                             blur=settings.get('blur', 0.0),
                             threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
                             hue=settings.get('hue', 0.0),
-                            exposure=settings.get('exposure', 1.0)
+                            exposure=settings.get('exposure', 1.0),
+                            color_mask_enabled=settings.get('color_mask_enabled', False),
+                            color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                            color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                            color_mask_background=settings.get('color_mask_background', 'black'),
+                            color_mask_position=settings.get('color_mask_position', 'after')
                         )
-                        self._store_image_with_bounds(area_name_var.get(), processed_image)
+                        # Use processed_image for OCR (but keep original stored)
+                        screenshot = processed_image
+                        # Store the processed image in latest_images
+                        self._store_image_with_bounds(area_name_var.get(), screenshot, is_original=False)
                     else:
-                        self._store_image_with_bounds(area_name_var.get(), screenshot)
+                        self._store_image_with_bounds(area_name_var.get(), screenshot, is_original=True)
                 # --- Handle Auto Read hotkey state after loading ---
                 # If no conflict and auto-read hotkey exists, re-register it
                 if not conflict_area_name and auto_read_hotkey and self.areas and hasattr(self.areas[0][1], 'hotkey'):
@@ -14178,45 +14296,18 @@ class GameTextReader:
             # Define the hotkey handler
             def hotkey_handler():
                 try:
-                    hotkey_name = getattr(button, 'hotkey', 'N/A')
-                    print(f"=" * 80)
-                    print(f"DEBUG HOTKEY HANDLER: hotkey_handler CALLED for hotkey: '{hotkey_name}'")
-                    print(f"DEBUG HOTKEY HANDLER: Button: {button}, Type: {type(button).__name__}")
-                    print(f"=" * 80)
-                    
                     # Check if input is allowed (centralized check for all input types)
                     if not InputManager.is_allowed():
-                        print(f"DEBUG HOTKEY HANDLER: Ignoring hotkey - InputManager is blocked")
                         return
                     if self.setting_hotkey:
-                        print(f"DEBUG: Ignoring hotkey - setting_hotkey mode is active")
                         return
                     
                     # Check if the button itself is still valid
                     if not hasattr(button, 'hotkey') or not button.hotkey:
-                        print(f"Warning: Hotkey triggered for invalid button, ignoring")
                         return
                     
-                    # Get hotkey name early so we can use it in callback lookup and debug output
+                    # Get hotkey name
                     hotkey_name = button.hotkey
-                    
-                    print(f"DEBUG: Button is valid, checking for callbacks...")
-                    print(f"DEBUG: Button type: {type(button).__name__}, Button ID: {id(button)}")
-                    print(f"DEBUG: Hotkey name: '{hotkey_name}'")
-                    print(f"DEBUG: Has _automation_callback attr: {hasattr(button, '_automation_callback')}")
-                    if hasattr(button, '_automation_callback'):
-                        print(f"DEBUG: _automation_callback value: {button._automation_callback}")
-                    print(f"DEBUG: Has _combo_callback attr: {hasattr(button, '_combo_callback')}")
-                    if hasattr(button, '_combo_callback'):
-                        print(f"DEBUG: _combo_callback value: {button._combo_callback}")
-                    print(f"DEBUG: Has _combo_temp_frame attr: {hasattr(button, '_combo_temp_frame')}")
-                    print(f"DEBUG: Has _automations_window: {hasattr(self, '_automations_window')}")
-                    if hasattr(self, '_automations_window') and self._automations_window:
-                        print(f"DEBUG: Automations window exists, has combo_callbacks_by_hotkey: {hasattr(self._automations_window, 'combo_callbacks_by_hotkey')}")
-                        if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
-                            print(f"DEBUG: Registry keys: {list(self._automations_window.combo_callbacks_by_hotkey.keys())}")
-                            if hotkey_name in self._automations_window.combo_callbacks_by_hotkey:
-                                print(f"DEBUG: Found '{hotkey_name}' in registry!")
                     
                     # Debouncing: Check if this hotkey was triggered recently
                     import time
@@ -14224,24 +14315,13 @@ class GameTextReader:
                     
                     if hotkey_name in self.last_hotkey_trigger:
                         time_since_last = current_time - self.last_hotkey_trigger[hotkey_name]
-                        # Only apply debouncing if time_since_last is non-negative (last trigger was in the past)
-                        # If negative, it means clock was adjusted or there's a timing issue - allow the trigger
                         if time_since_last >= 0 and time_since_last < self.hotkey_debounce_time:
-                            print(f"DEBUG: Ignoring duplicate hotkey trigger for '{hotkey_name}' (last triggered {time_since_last:.3f}s ago)")
                             return
-                        # If time_since_last is negative, reset the timer and allow the trigger
                         elif time_since_last < 0:
-                            print(f"DEBUG: Negative time detected for '{hotkey_name}' ({time_since_last:.3f}s), resetting timer")
+                            pass  # Reset timer and allow trigger
                     
                     # Update the last trigger time
                     self.last_hotkey_trigger[hotkey_name] = current_time
-                    
-                    # Debug: Log which hotkey was triggered with more detail
-                    if hasattr(button, 'hotkey'):
-                        import threading
-                        thread_id = threading.current_thread().ident
-                        print(f"Hotkey triggered: '{button.hotkey}' (type: {type(button.hotkey).__name__}, bytes: {button.hotkey.encode('utf-8')}, thread: {thread_id})")
-                        print(f"DEBUG: Handler function ID: {id(hotkey_handler)}")
                     
                     # Check for hotkey conflicts
                     conflict_locations = []
@@ -14329,265 +14409,91 @@ class GameTextReader:
                         return
                         
                     # Handle hotkey combo callback (check BEFORE automation callback)
-                    print(f"DEBUG COMBO HOTKEY: Checking for combo callback for hotkey '{hotkey_name}'")
-                    # Try multiple methods to find the callback for maximum reliability
                     combo_callback = None
                     
-                    # Method 1: Look up by hotkey name in registry (MOST RELIABLE - doesn't depend on button reference)
-                    if not combo_callback and hotkey_name:
-                        print(f"DEBUG COMBO HOTKEY: Method 1 - Checking registry...")
-                        print(f"DEBUG COMBO HOTKEY: Has _automations_window: {hasattr(self, '_automations_window')}")
-                        # Try to find automations window directly from game_text_reader
-                        if hasattr(self, '_automations_window') and self._automations_window:
-                            automation_window = self._automations_window
-                            print(f"DEBUG COMBO HOTKEY: Automation window exists: {automation_window}")
-                            print(f"DEBUG COMBO HOTKEY: Has combo_callbacks_by_hotkey: {hasattr(automation_window, 'combo_callbacks_by_hotkey')}")
-                            if hasattr(automation_window, 'combo_callbacks_by_hotkey'):
-                                print(f"DEBUG COMBO HOTKEY: Registry keys: {list(automation_window.combo_callbacks_by_hotkey.keys())}")
-                                print(f"DEBUG COMBO HOTKEY: Looking for '{hotkey_name}' in registry...")
-                                if hotkey_name in automation_window.combo_callbacks_by_hotkey:
-                                    combo_callback = automation_window.combo_callbacks_by_hotkey[hotkey_name]
-                                    print(f"DEBUG COMBO HOTKEY: ✓ Found combo callback in registry for hotkey '{hotkey_name}' (via game_text_reader)")
-                                else:
-                                    print(f"DEBUG COMBO HOTKEY: ✗ Hotkey '{hotkey_name}' NOT found in registry")
-                            else:
-                                print(f"DEBUG COMBO HOTKEY: ✗ Automation window does not have combo_callbacks_by_hotkey attribute")
-                        else:
-                            print(f"DEBUG COMBO HOTKEY: ✗ No automation window found or window is None")
+                    # Fast lookup: Check registry first (most reliable)
+                    if (hasattr(self, '_automations_window') and self._automations_window and 
+                        hasattr(self._automations_window, 'combo_callbacks_by_hotkey') and
+                        hotkey_name in self._automations_window.combo_callbacks_by_hotkey):
+                        combo_callback = self._automations_window.combo_callbacks_by_hotkey[hotkey_name]
                     
-                    # Method 2: Look up by hotkey name via button's temp_frame
-                    if not combo_callback and hotkey_name:
-                        # Try to find automations window and lookup callback by hotkey
-                        if hasattr(button, '_combo_temp_frame'):
-                            temp_frame = button._combo_temp_frame
-                            if hasattr(temp_frame, '_combo_window'):
-                                automation_window = temp_frame._combo_window
-                                if hasattr(automation_window, 'combo_callbacks_by_hotkey'):
-                                    if hotkey_name in automation_window.combo_callbacks_by_hotkey:
-                                        combo_callback = automation_window.combo_callbacks_by_hotkey[hotkey_name]
-                                        print(f"DEBUG: Found combo callback in registry for hotkey '{hotkey_name}' (via temp_frame)")
-                    
-                    # Method 3: Check button directly
-                    if not combo_callback and hasattr(button, '_combo_callback') and button._combo_callback:
+                    # Fallback: Check button directly
+                    elif hasattr(button, '_combo_callback'):
                         combo_callback = button._combo_callback
-                        print(f"DEBUG: Found combo callback on button directly")
                     
-                    # Method 4: Get from combo backup
+                    # Fallback: Get from combo backup
                     if not combo_callback and hasattr(button, '_combo_temp_frame'):
                         temp_frame = button._combo_temp_frame
                         if hasattr(temp_frame, '_combo_ref'):
                             combo = temp_frame._combo_ref
                             if isinstance(combo, dict) and combo.get('_hotkey_callback_backup'):
                                 combo_callback = combo['_hotkey_callback_backup']
-                                print(f"DEBUG: Found combo callback from combo backup")
                     
                     # If we found a callback, use it
                     if combo_callback:
-                        print(f"DEBUG COMBO HOTKEY: ✓ Hotkey combo callback found, calling it...")
-                        print(f"DEBUG COMBO HOTKEY: Callback function: {combo_callback}")
                         try:
-                            print(f"DEBUG COMBO HOTKEY: Executing callback now...")
                             combo_callback()
-                            print(f"DEBUG COMBO HOTKEY: ✓ Hotkey combo callback executed successfully")
                         except Exception as e:
                             print(f"Error in hotkey combo callback: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        finally:
-                            # ALWAYS restore callback after execution to ensure it persists
-                            # Restore to all possible locations for maximum reliability
-                            button._combo_callback = combo_callback
-                            if hasattr(button, '_combo_temp_frame'):
-                                temp_frame = button._combo_temp_frame
-                                if hasattr(temp_frame, '_combo_ref'):
-                                    combo = temp_frame._combo_ref
-                                    if isinstance(combo, dict):
-                                        combo['_hotkey_callback_backup'] = combo_callback
-                                if hasattr(temp_frame, '_combo_window'):
-                                    automation_window = temp_frame._combo_window
-                                    if hasattr(automation_window, 'combo_callbacks_by_hotkey') and hotkey_name:
-                                        automation_window.combo_callbacks_by_hotkey[hotkey_name] = combo_callback
-                            # Also restore to game_text_reader's automations window registry
-                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
-                                if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
-                                    self._automations_window.combo_callbacks_by_hotkey[hotkey_name] = combo_callback
-                            print(f"DEBUG: Restored combo callback to all locations after execution")
                         return
                     
-                    # If no callback found, log detailed debug info
-                    print(f"DEBUG: WARNING - No combo callback found for hotkey '{hotkey_name}'")
-                    print(f"DEBUG: Button: {button}, Type: {type(button).__name__}")
-                    print(f"DEBUG: Button has hotkey: {hasattr(button, 'hotkey')}, value: {getattr(button, 'hotkey', None)}")
-                    if hasattr(self, '_automations_window') and self._automations_window:
-                        if hasattr(self._automations_window, 'combo_callbacks_by_hotkey'):
-                            print(f"DEBUG: Registry contains: {list(self._automations_window.combo_callbacks_by_hotkey.keys())}")
-                    
                     # Handle automation hotkey callback (check after combo callback)
-                    print(f"DEBUG AUTOMATION HOTKEY: Checking for automation callback for hotkey '{hotkey_name}'")
                     automation_callback = None
                     
-                    # Method 1: Look up by hotkey name in registry (MOST RELIABLE - doesn't depend on button reference)
-                    if not automation_callback and hotkey_name:
-                        print(f"DEBUG AUTOMATION HOTKEY: Method 1 - Checking registry...")
-                        print(f"DEBUG AUTOMATION HOTKEY: Has _automations_window: {hasattr(self, '_automations_window')}")
-                        # Try to find automations window directly from game_text_reader
-                        if hasattr(self, '_automations_window') and self._automations_window:
-                            automation_window = self._automations_window
-                            print(f"DEBUG AUTOMATION HOTKEY: Automation window exists: {automation_window}")
-                            print(f"DEBUG AUTOMATION HOTKEY: Has automation_callbacks_by_hotkey: {hasattr(automation_window, 'automation_callbacks_by_hotkey')}")
-                            if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
-                                print(f"DEBUG AUTOMATION HOTKEY: Registry keys: {list(automation_window.automation_callbacks_by_hotkey.keys())}")
-                                print(f"DEBUG AUTOMATION HOTKEY: Looking for '{hotkey_name}' in registry...")
-                                if hotkey_name in automation_window.automation_callbacks_by_hotkey:
-                                    automation_callback = automation_window.automation_callbacks_by_hotkey[hotkey_name]
-                                    print(f"DEBUG AUTOMATION HOTKEY: ✓ Found automation callback in registry for hotkey '{hotkey_name}' (via game_text_reader)")
-                                else:
-                                    print(f"DEBUG AUTOMATION HOTKEY: ✗ Hotkey '{hotkey_name}' NOT found in registry")
-                            else:
-                                print(f"DEBUG AUTOMATION HOTKEY: ✗ Automation window does not have automation_callbacks_by_hotkey attribute")
-                        else:
-                            print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation window found or window is None")
+                    # Fast lookup: Check registry first
+                    if (hasattr(self, '_automations_window') and self._automations_window and 
+                        hasattr(self._automations_window, 'automation_callbacks_by_hotkey') and
+                        hotkey_name in self._automations_window.automation_callbacks_by_hotkey):
+                        automation_callback = self._automations_window.automation_callbacks_by_hotkey[hotkey_name]
                     
-                    # Method 2: Check button directly (fallback)
-                    if not automation_callback:
-                        print(f"DEBUG AUTOMATION HOTKEY: Method 2 - Checking button directly...")
-                        print(f"DEBUG AUTOMATION HOTKEY: Button has _automation_callback: {hasattr(button, '_automation_callback')}")
-                        if hasattr(button, '_automation_callback') and button._automation_callback:
-                            automation_callback = button._automation_callback
-                            print(f"DEBUG AUTOMATION HOTKEY: ✓ Found automation callback on button directly")
-                        else:
-                            print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation callback on button")
+                    # Fallback: Check button directly
+                    elif hasattr(button, '_automation_callback') and button._automation_callback:
+                        automation_callback = button._automation_callback
                     
                     # If we found a callback, use it
                     if automation_callback:
-                        print(f"DEBUG AUTOMATION HOTKEY: ✓ Automation callback found, calling it...")
-                        print(f"DEBUG AUTOMATION HOTKEY: Callback function: {automation_callback}")
-                        # Store callback before calling in case it gets cleared
-                        callback = automation_callback
                         try:
-                            print(f"DEBUG AUTOMATION HOTKEY: Executing callback now...")
-                            callback()
-                            print(f"DEBUG AUTOMATION HOTKEY: ✓ Automation callback executed successfully")
-                            # Re-set callback after calling to ensure it persists
-                            # This is important because the callback might get cleared
-                            if hasattr(button, '_automation_callback'):
-                                button._automation_callback = callback
-                            # Also restore to registry
-                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
-                                if hasattr(self._automations_window, 'automation_callbacks_by_hotkey'):
-                                    self._automations_window.automation_callbacks_by_hotkey[hotkey_name] = callback
-                            # Also check if there's a backup on the automations window
-                            if hasattr(button, '_automation_temp_frame'):
-                                temp_frame = button._automation_temp_frame
-                                if hasattr(temp_frame, '_automation_window'):
-                                    automation_window = temp_frame._automation_window
-                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
-                                        # Restore from backup if needed
-                                        if not hasattr(button, '_automation_callback') or not button._automation_callback:
-                                            button._automation_callback = automation_window._area_selection_hotkey_callback
-                                            print(f"DEBUG: Restored callback from backup")
+                            automation_callback()
                         except Exception as e:
-                            print(f"DEBUG AUTOMATION HOTKEY: ✗ Error in automation hotkey callback: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            # Try to restore callback even after error
-                            if hasattr(button, '_automation_callback'):
-                                button._automation_callback = callback
-                            # Also restore to registry
-                            if hasattr(self, '_automations_window') and self._automations_window and hotkey_name:
-                                if hasattr(self._automations_window, 'automation_callbacks_by_hotkey'):
-                                    self._automations_window.automation_callbacks_by_hotkey[hotkey_name] = callback
-                                    print(f"DEBUG AUTOMATION HOTKEY: Restored callback to registry after error")
+                            print(f"Error in automation callback: {e}")
                         return
-                    else:
-                        print(f"DEBUG AUTOMATION HOTKEY: ✗ No automation callback found for hotkey '{hotkey_name}'")
                     
-                    # Try to restore combo callback from backup if it wasn't found
-                    if hasattr(button, '_combo_temp_frame'):
-                        temp_frame = button._combo_temp_frame
-                        if hasattr(temp_frame, '_combo_ref'):
-                            combo = temp_frame._combo_ref
-                            # Combo is a dictionary, access it directly
-                            if isinstance(combo, dict) and combo.get('_hotkey_callback_backup'):
-                                if not hasattr(button, '_combo_callback') or not button._combo_callback:
-                                    button._combo_callback = combo['_hotkey_callback_backup']
-                                    print(f"DEBUG: Restored combo callback from backup")
-                                    # Try calling it now
-                                    try:
-                                        button._combo_callback()
-                                        return
-                                    except Exception as e:
-                                        print(f"Error calling restored combo callback: {e}")
-                    
-                    # Try to restore automation callback from backup if it wasn't found
-                    if hasattr(button, '_automation_temp_frame'):
-                        # Debug: Log why callback wasn't found
-                        if not hasattr(button, '_automation_callback'):
-                            print(f"DEBUG: Button {button} does not have _automation_callback attribute")
-                            # Try to restore from backup
-                            if hasattr(button, '_automation_temp_frame'):
-                                temp_frame = button._automation_temp_frame
-                                if hasattr(temp_frame, '_automation_window'):
-                                    automation_window = temp_frame._automation_window
-                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
-                                        button._automation_callback = automation_window._area_selection_hotkey_callback
-                                        print(f"DEBUG: Restored callback from backup (callback was missing)")
-                                        # Try calling it now
-                                        try:
-                                            button._automation_callback()
-                                            return
-                                        except Exception as e:
-                                            print(f"Error calling restored callback: {e}")
-                        elif not button._automation_callback:
-                            print(f"DEBUG: Button {button} has _automation_callback but it is None/empty")
-                            # Try to restore from backup
-                            if hasattr(button, '_automation_temp_frame'):
-                                temp_frame = button._automation_temp_frame
-                                if hasattr(temp_frame, '_automation_window'):
-                                    automation_window = temp_frame._automation_window
-                                    if hasattr(automation_window, '_area_selection_hotkey_callback'):
-                                        button._automation_callback = automation_window._area_selection_hotkey_callback
-                                        print(f"DEBUG: Restored callback from backup (callback was None)")
-                                        # Try calling it now
-                                        try:
-                                            button._automation_callback()
-                                            return
-                                        except Exception as e:
-                                            print(f"Error calling restored callback: {e}")
-                    
-                    # Handle Auto Read area
+                    # Handle area button click (default behavior)
                     if hasattr(button, 'area_frame') and button.area_frame:
-                        # Check if the area still exists in the areas list
-                        area_exists = False
-                        for area in self.areas:
-                            if area[0] is button.area_frame:
-                                area_exists = True
+                        # Check if this is an Auto Read area by checking if its frame is in the auto_read_frame
+                        is_auto_read_area = False
+                        area_name_var = None
+                        
+                        # Find the area name variable for this button
+                        for area_tuple in getattr(self, 'areas', []):
+                            if len(area_tuple) >= 2 and area_tuple[1] is button:
+                                if len(area_tuple) >= 4:
+                                    area_name_var = area_tuple[3]
+                                    if hasattr(area_name_var, 'get'):
+                                        area_name = area_name_var.get()
+                                        # Check if this is an Auto Read area by name
+                                        is_auto_read_area = area_name.startswith("Auto Read")
                                 break
                         
-                        if not area_exists:
-                            print(f"Warning: Hotkey triggered for removed area, ignoring")
-                            return
-                        
-                        area_info = self._get_area_info(button)
-                        if area_info and area_info.get('name', '').startswith("Auto Read"):
-                            self.set_auto_read_area(
-                                area_info['frame'], 
-                                area_info['name_var'], 
-                                area_info['set_area_btn'])
-                            return
-                        
-                        # Handle regular areas
-                        if hasattr(button, 'area_frame'):
+                        if is_auto_read_area and area_name_var:
+                            # For Auto Read areas, trigger area selection instead of reading
+                            print(f"Auto Read hotkey triggered for: {area_name_var.get()}")
+                            self.set_auto_read_area(button.area_frame, area_name_var, None)
+                        else:
+                            # For regular areas, read the existing area
                             self.stop_speaking()
                             threading.Thread(
                                 target=self.read_area, 
                                 args=(button.area_frame,), 
                                 daemon=True
                             ).start()
-                            
+                        return
+                
                 except Exception as e:
                     print(f"Error in hotkey handler: {e}")
-            
+                    import traceback
+                    traceback.print_exc()
+
             # Set up the appropriate hook based on hotkey type
             if button.hotkey.startswith('button'):
                 try:
@@ -14916,6 +14822,25 @@ class GameTextReader:
                         
                         if not modifiers_ok:
                             return None  # Required modifiers not pressed
+                    else:
+                        # This is a single-key hotkey - check if any unwanted modifiers are pressed
+                        modifier_keys_pressed = []
+                        try:
+                            if keyboard.is_pressed('shift'):
+                                modifier_keys_pressed.append('shift')
+                            if keyboard.is_pressed('ctrl'):
+                                modifier_keys_pressed.append('ctrl')
+                            if keyboard.is_pressed('alt'):
+                                modifier_keys_pressed.append('alt')
+                            if keyboard.is_pressed('windows'):
+                                modifier_keys_pressed.append('windows')
+                        except Exception:
+                            pass
+                        
+                        # If modifiers are pressed for a single-key hotkey, don't trigger
+                        if modifier_keys_pressed:
+                            print(f"DEBUG: Ignoring keyboard number hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                            return None
                     
                     import threading
                     import time
@@ -15179,6 +15104,28 @@ class GameTextReader:
                         # Store the current time as the last processed time for this hotkey
                         self._numpad_handler_last_event[hotkey] = current_time
                         
+                        # Check if any modifier keys are pressed for single-key hotkeys
+                        # If this is a single-key hotkey (no modifiers in the hotkey string),
+                        # only trigger if no modifier keys are currently pressed
+                        if len(hotkey_parts) == 1:
+                            modifier_keys_pressed = []
+                            try:
+                                if keyboard.is_pressed('shift'):
+                                    modifier_keys_pressed.append('shift')
+                                if keyboard.is_pressed('ctrl'):
+                                    modifier_keys_pressed.append('ctrl')
+                                if keyboard.is_pressed('alt'):
+                                    modifier_keys_pressed.append('alt')
+                                if keyboard.is_pressed('windows'):
+                                    modifier_keys_pressed.append('windows')
+                            except Exception:
+                                pass
+                            
+                            # If modifiers are pressed for a single-key hotkey, don't trigger
+                            if modifier_keys_pressed:
+                                print(f"DEBUG: Ignoring numpad hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                                return False
+                        
                         print(f"Numpad hotkey triggered: {hotkey} (scan code: {target_scan_code}, event: {event_name}, thread: {thread_id}, numlock: {numlock_is_on})")
                         print(f"DEBUG: Numpad handler function ID: {id(custom_handler)}")
                         
@@ -15356,6 +15303,28 @@ class GameTextReader:
                         # Event name matches arrow key - accept it
                         # (Numpad hotkey check already done above for conflicting codes)
                         
+                        # Check if any modifier keys are pressed for single-key hotkeys
+                        # If this is a single-key hotkey (no modifiers in the hotkey string),
+                        # only trigger if no modifier keys are currently pressed
+                        if len(hotkey_parts) == 1:
+                            modifier_keys_pressed = []
+                            try:
+                                if keyboard.is_pressed('shift'):
+                                    modifier_keys_pressed.append('shift')
+                                if keyboard.is_pressed('ctrl'):
+                                    modifier_keys_pressed.append('ctrl')
+                                if keyboard.is_pressed('alt'):
+                                    modifier_keys_pressed.append('alt')
+                                if keyboard.is_pressed('windows'):
+                                    modifier_keys_pressed.append('windows')
+                            except Exception:
+                                pass
+                            
+                            # If modifiers are pressed for a single-key hotkey, don't trigger
+                            if modifier_keys_pressed:
+                                print(f"DEBUG: Ignoring arrow key hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                                return None
+                        
                         print(f"Arrow key hotkey triggered: {hotkey} (scan code: {target_scan_code}, event: {event_name})")
                         handler_func()
                         # Suppress the event to prevent other handlers from also triggering
@@ -15419,6 +15388,28 @@ class GameTextReader:
                     # Check if this is the correct scan code and it's a key down event
                     if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
                         if hasattr(event, 'event_type') and event.event_type == 'down':
+                            # Check if any modifier keys are pressed for single-key hotkeys
+                            # If this is a single-key hotkey (no modifiers in the hotkey string),
+                            # only trigger if no modifier keys are currently pressed
+                            if len(hotkey_parts) == 1:
+                                modifier_keys_pressed = []
+                                try:
+                                    if keyboard.is_pressed('shift'):
+                                        modifier_keys_pressed.append('shift')
+                                    if keyboard.is_pressed('ctrl'):
+                                        modifier_keys_pressed.append('ctrl')
+                                    if keyboard.is_pressed('alt'):
+                                        modifier_keys_pressed.append('alt')
+                                    if keyboard.is_pressed('windows'):
+                                        modifier_keys_pressed.append('windows')
+                                except Exception:
+                                    pass
+                                
+                                # If modifiers are pressed for a single-key hotkey, don't trigger
+                                if modifier_keys_pressed:
+                                    print(f"DEBUG: Ignoring special key hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                                    return True
+                            
                             print(f"Special key hotkey triggered: {hotkey} (scan code: {target_scan_code})")
                             handler_func()
                             # Don't suppress - allow key to work normally
@@ -15447,6 +15438,28 @@ class GameTextReader:
                     try:
                         # Check if this is the correct scan code
                         if hasattr(event, 'scan_code') and event.scan_code == target_scan_code:
+                            # Check if any modifier keys are pressed for single-key hotkeys
+                            # If this is a single-key hotkey (no modifiers in the hotkey string),
+                            # only trigger if no modifier keys are currently pressed
+                            if len(hotkey_parts) == 1:
+                                modifier_keys_pressed = []
+                                try:
+                                    if keyboard.is_pressed('shift'):
+                                        modifier_keys_pressed.append('shift')
+                                    if keyboard.is_pressed('ctrl'):
+                                        modifier_keys_pressed.append('ctrl')
+                                    if keyboard.is_pressed('alt'):
+                                        modifier_keys_pressed.append('alt')
+                                    if keyboard.is_pressed('windows'):
+                                        modifier_keys_pressed.append('windows')
+                                except Exception:
+                                    pass
+                                
+                                # If modifiers are pressed for a single-key hotkey, don't trigger
+                                if modifier_keys_pressed:
+                                    print(f"DEBUG: Ignoring special key hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                                    return True
+                            
                             print(f"Special key hotkey triggered: {hotkey} (scan code: {target_scan_code})")
                             handler_func()
                             # Suppress the event to prevent other handlers from also triggering
@@ -15495,6 +15508,27 @@ class GameTextReader:
                     # If no event_type, assume it's a key down (hook typically only fires on down)
                     
                     if is_key_down:
+                        # Check if any modifier keys are pressed
+                        # If this is a single-key hotkey (no modifiers in the hotkey string),
+                        # only trigger if no modifier keys are currently pressed
+                        modifier_keys_pressed = []
+                        try:
+                            if keyboard.is_pressed('shift'):
+                                modifier_keys_pressed.append('shift')
+                            if keyboard.is_pressed('ctrl'):
+                                modifier_keys_pressed.append('ctrl')
+                            if keyboard.is_pressed('alt'):
+                                modifier_keys_pressed.append('alt')
+                            if keyboard.is_pressed('windows'):
+                                modifier_keys_pressed.append('windows')
+                        except Exception:
+                            pass
+                        
+                        # If this is a single-key hotkey and modifiers are pressed, don't trigger
+                        if len(hotkey_parts) == 1 and modifier_keys_pressed:
+                            print(f"DEBUG: Ignoring hotkey '{hotkey}' because modifier keys are pressed: {modifier_keys_pressed}")
+                            return True
+                        
                         print(f"Regular keyboard hotkey triggered: {hotkey} (key: '{base_key}')")
                         # Call the handler function (which is hotkey_handler from setup_hotkey)
                         handler_func()
@@ -15770,9 +15804,35 @@ class GameTextReader:
             print(f"Error validating file size: {e}")
             return False
     
-    def _store_image_with_bounds(self, area_name, image):
-        """Store image with bounds checking to prevent memory leaks"""
+    def register_image_cleanup(self, area_name, image):
+        """Register an image for cleanup when the main image is replaced"""
+        if area_name not in self.image_cleanup_callbacks:
+            self.image_cleanup_callbacks[area_name] = []
+        self.image_cleanup_callbacks[area_name].append(image)
+    
+    def cleanup_registered_images(self, area_name):
+        """Clean up all registered images for a specific area"""
+        if area_name in self.image_cleanup_callbacks:
+            for image in self.image_cleanup_callbacks[area_name]:
+                try:
+                    if hasattr(image, 'close'):
+                        image.close()
+                except Exception:
+                    pass
+            del self.image_cleanup_callbacks[area_name]
+
+    def _store_image_with_bounds(self, area_name, image, is_original=False):
+        """Store image with bounds checking to prevent memory leaks
+        
+        Args:
+            area_name: Name of the area
+            image: PIL Image to store
+            is_original: If True, this is the original unprocessed image
+        """
         try:
+            # Clean up registered images (processing window copies) first
+            self.cleanup_registered_images(area_name)
+            
             # Close old image if it exists to free memory
             if area_name in self.latest_images:
                 old_image = self.latest_images[area_name]
@@ -15785,6 +15845,22 @@ class GameTextReader:
             
             # Store new image
             self.latest_images[area_name] = image
+            
+            # Only store original image if this is the original capture
+            if is_original:
+                # Close old original if it exists
+                if area_name in self.original_images:
+                    old_original = self.original_images[area_name]
+                    if hasattr(old_original, 'close'):
+                        try:
+                            old_original.close()
+                        except Exception:
+                            pass
+                    del old_original
+                
+                # Store the new original unprocessed image
+                self.original_images[area_name] = image.copy()
+                print(f"Updated original unprocessed image for {area_name}")
             
             # If we have too many areas with images, clean up oldest ones
             # Keep only images for areas that still exist
@@ -15807,8 +15883,18 @@ class GameTextReader:
                         del self.latest_images[name]
                     except Exception:
                         pass
+                    
+                    # Also clean up original images for removed areas
+                    if name in self.original_images:
+                        try:
+                            orig_img = self.original_images[name]
+                            if hasattr(orig_img, 'close'):
+                                orig_img.close()
+                            del self.original_images[name]
+                        except Exception:
+                            pass
         except Exception as e:
-            print(f"Warning: Error managing image storage: {e}")
+            print(f"Error storing image for {area_name}: {e}")
             # Fallback: just store the image
             self.latest_images[area_name] = image
     
@@ -15864,10 +15950,12 @@ class GameTextReader:
                 if area[0] is area_frame:
                     area_info = area
                     break
+            # Allow Auto Read areas to proceed - they will set coordinates during selection
             if area_info and area_info[3].get().startswith("Auto Read"):
+                print(f"Auto Read area '{area_info[3].get()}' proceeding without coordinates (will be set during selection)")
+            else:
+                messagebox.showerror("Error", "No area coordinates set. Click Set Area to set one.")
                 return
-            messagebox.showerror("Error", "No area coordinates set. Click Set Area to set one.")
-            return
 
         # Ensure speaker is initialized
         if not self.speaker:
@@ -16030,7 +16118,12 @@ class GameTextReader:
                         blur=settings.get('blur', 0.0),
                         threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
                         hue=settings.get('hue', 0.0),
-                        exposure=settings.get('exposure', 1.0)
+                        exposure=settings.get('exposure', 1.0),
+                        color_mask_enabled=settings.get('color_mask_enabled', False),
+                        color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                        color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                        color_mask_background=settings.get('color_mask_background', 'black'),
+                        color_mask_position=settings.get('color_mask_position', 'after')
                     )
                     frozen_screenshot_already_processed = True
                     print("Image processing applied to frozen screenshot (during read).")
@@ -16092,6 +16185,10 @@ class GameTextReader:
         # Store original or processed image based on settings
         # Skip processing if we already processed the frozen screenshot
         if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
+            # Store the original unprocessed image first
+            self._store_image_with_bounds(area_name, screenshot, is_original=True)
+            
+            # Then apply processing for OCR use
             settings = self.processing_settings[area_name]
             processed_image = preprocess_image(
                 screenshot,
@@ -16102,22 +16199,27 @@ class GameTextReader:
                 blur=settings.get('blur', 0.0),
                 threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
                 hue=settings.get('hue', 0.0),
-                exposure=settings.get('exposure', 1.0)
+                exposure=settings.get('exposure', 1.0),
+                color_mask_enabled=settings.get('color_mask_enabled', False),
+                color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                color_mask_background=settings.get('color_mask_background', 'black'),
+                color_mask_position=settings.get('color_mask_position', 'after')
             )
-            # Store with bounds checking to prevent memory leak
-            self._store_image_with_bounds(area_name, processed_image)
             # Use processed image for OCR
-            # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
-            psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
-            text = pytesseract.image_to_string(processed_image, config=f'--psm {psm_value}')
-            print("Image preprocessing applied.")
+            screenshot = processed_image
+            # Store the processed image in latest_images (this is what the image processing window should show)
+            self._store_image_with_bounds(area_name, screenshot, is_original=False)
         else:
-            # Store with bounds checking to prevent memory leak
-            self._store_image_with_bounds(area_name, screenshot)
-            # Use original image for OCR (or already processed image if freeze screen was processed)
-            # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
-            psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
-            text = pytesseract.image_to_string(screenshot, config=f'--psm {psm_value}')
+            # Store with bounds checking to prevent memory leak (no preprocessing)
+            self._store_image_with_bounds(area_name, screenshot, is_original=True)
+        
+        # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
+        psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
+        
+        text = pytesseract.image_to_string(screenshot, config=f'--psm {psm_value}')
+        if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
+            print("Image preprocessing applied.")
 
         import re
         
@@ -17679,3 +17781,82 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         except Exception:
             pass
 
+    def get_text_of_color(self, image, target_color, tolerance=30):
+        """Extract text of specific color from image using OCR"""
+        try:
+            import numpy as np
+            
+            # Convert target_color from hex to RGB if needed
+            if isinstance(target_color, str) and target_color.startswith('#'):
+                target_color = target_color.lstrip('#')
+                target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
+            else:
+                target_rgb = target_color
+            
+            # Get OCR data with bounding boxes
+            import pytesseract
+            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
+            
+            # Convert image to numpy array for color analysis
+            img_array = np.array(image)
+            if len(img_array.shape) == 3:
+                # RGB image
+                height, width = img_array.shape[:2]
+            else:
+                # Grayscale - convert to RGB
+                img_array = np.stack([img_array]*3, axis=-1)
+                height, width = img_array.shape[:2]
+            
+            # Collect text of matching color
+            matching_text = []
+            
+            # Check each detected text region for color match
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 30:  # Only consider confident detections
+                    text = data['text'][i].strip()
+                    if text:  # Non-empty text
+                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                        
+                        # Ensure coordinates are within image bounds
+                        x = max(0, min(x, width - 1))
+                        y = max(0, min(y, height - 1))
+                        x2 = max(0, min(x + w, width - 1))
+                        y2 = max(0, min(y + h, height - 1))
+                        
+                        if x2 > x and y2 > y:
+                            # Extract text region
+                            text_region = img_array[y:y2, x:x2]
+                            
+                            # Sample center area of text region (avoid edges)
+                            if text_region.size > 0:
+                                center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
+                                sample_size = min(3, center_y, center_x)
+                                
+                                if sample_size > 0:
+                                    sample_area = text_region[center_y-sample_size:center_y+sample_size, 
+                                                              center_x-sample_size:center_x+sample_size]
+                                    
+                                    # Get average color of sample area
+                                    avg_color = np.mean(sample_area, axis=(0, 1))
+                                    
+                                    # Check if color matches target within tolerance
+                                    if self.color_matches(avg_color, target_rgb, tolerance):
+                                        matching_text.append(text)
+            
+            # Return combined text or None if no matches
+            return ' '.join(matching_text) if matching_text else None
+        except Exception as e:
+            print(f"Error getting text of color: {e}")
+            return None
+
+    def color_matches(self, color1, color2, tolerance):
+        """Check if two colors match within tolerance"""
+        try:
+            diff = abs(int(color1[0]) - int(color2[0])) + \
+                   abs(int(color1[1]) - int(color2[1])) + \
+                   abs(int(color1[2]) - int(color2[2]))
+            return diff <= tolerance * 3  # Multiply by 3 for RGB channels
+        except:
+            return False
+
+    
