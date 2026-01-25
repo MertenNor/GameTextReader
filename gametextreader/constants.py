@@ -5,7 +5,7 @@ import os
 
 # App information
 APP_NAME = "GameTextReader"
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.3.1"
 APP_SLUG = APP_NAME.lower().replace(" ", "")
 
 # Paths

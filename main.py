@@ -636,7 +636,7 @@ def main():
     loading_window.destroy()
     
     # Prompt to import legacy settings after the UI is visible to avoid blocking on the loading screen
-    root.after(300, lambda: migrate_legacy_settings_file(root, app))
+    # DISABLED: root.after(300, lambda: migrate_legacy_settings_file(root, app))
     
     # Now show the window at the correct size
     app.root.deiconify()

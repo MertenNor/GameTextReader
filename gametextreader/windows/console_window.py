@@ -17,6 +17,9 @@ class ConsoleWindow:
         self.window = tk.Toplevel(root)
         self.window.title("Debug Console")
         
+        # Flag to prevent infinite recursion in update_image_display
+        self._updating_image = False
+        
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -136,14 +139,14 @@ class ConsoleWindow:
         self.update_console()
     
     def on_close(self):
-        """Cleanup PhotoImage on window close to prevent memory leaks"""
+        """Hide the window instead of destroying it for reuse"""
         try:
             if hasattr(self, 'photo') and self.photo is not None:
                 del self.photo
                 self.photo = None
         except Exception:
             pass
-        self.window.destroy()
+        self.window.withdraw()  # Hide instead of destroy
 
     def show_context_menu(self, event):
         """Show the context menu at the mouse position."""
@@ -166,53 +169,153 @@ class ConsoleWindow:
         self.text_widget.tag_add("sel", "1.0", "end")
 
     def update_image_display(self, *args):
+        # Prevent infinite recursion
+        if self._updating_image:
+            return
+            
         if not self.window.winfo_exists():
             return
             
-        area_name = self.latest_area_name_var.get()
-        if self.show_image_var.get() and area_name in self.latest_images:
-            image = self.latest_images[area_name]
-            
-            try:
-                # Scale the image according to the selected percentage
-                scale_factor = int(self.scale_var.get()) / 100
-                if scale_factor != 1:
+        self._updating_image = True
+        
+        try:
+            area_name = self.latest_area_name_var.get()
+            if self.show_image_var.get() and area_name in self.latest_images:
+                # Use original image if available, process it fresh to match preview window
+                from ..image_processing import preprocess_image
+                from ..core.game_text_reader import GameTextReader
+                
+                # Get the game_text_reader instance to access original images and settings
+                game_text_reader = None
+                
+                # Try multiple ways to find the game_text_reader instance
+                try:
+                    # Method 1: Look through top-level windows
+                    for widget in self.window.winfo_toplevel().winfo_children():
+                        if hasattr(widget, 'original_images'):
+                            game_text_reader = widget
+                            break
+                    
+                    # Method 2: If not found, try to get from the window's master
+                    if not game_text_reader and hasattr(self.window, 'master'):
+                        parent = self.window.master
+                        while parent:
+                            if hasattr(parent, 'original_images'):
+                                game_text_reader = parent
+                                break
+                            parent = parent.master
+                    
+                    # Method 3: Try to access global reference if available
+                    if not game_text_reader:
+                        import sys
+                        for module_name in sys.modules:
+                            module = sys.modules[module_name]
+                            if hasattr(module, 'game_text_reader_instance'):
+                                game_text_reader = module.game_text_reader_instance
+                                break
+                                
+                except Exception as e:
+                    # Only print error once, not every time
+                    if not hasattr(self, '_error_printed'):
+                        print(f"[DEBUG] Error finding game_text_reader: {e}")
+                        self._error_printed = True
+                
+                # Only print debug info once
+                if not hasattr(self, '_debug_printed'):
+                    print(f"[DEBUG] game_text_reader found: {game_text_reader is not None}")
+                    if game_text_reader:
+                        print(f"[DEBUG] Area '{area_name}' in original_images: {area_name in game_text_reader.original_images}")
+                        print(f"[DEBUG] Available areas: {list(game_text_reader.original_images.keys())}")
+                    self._debug_printed = True
+                
+                if game_text_reader and area_name in game_text_reader.original_images:
+                    # Use original image and process fresh (like preview window)
+                    original_image = game_text_reader.original_images[area_name]
+                    settings = game_text_reader.processing_settings.get(area_name, {})
+                    
+                    print(f"[DEBUG] Processing settings for {area_name}: {settings}")
+                    print(f"[DEBUG] Color mask enabled: {settings.get('color_mask_enabled', False)}")
+                    print(f"[DEBUG] Color mask color: {settings.get('color_mask_color', '#FF0000')}")
+                    print(f"[DEBUG] Color mask tolerance: {settings.get('color_mask_tolerance', 15)}")
+                    
+                    try:
+                        image = preprocess_image(
+                            original_image,
+                            brightness=settings.get('brightness', 1.0),
+                            contrast=settings.get('contrast', 1.0),
+                            saturation=settings.get('saturation', 1.0),
+                            sharpness=settings.get('sharpness', 1.0),
+                            blur=settings.get('blur', 0.0),
+                            threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                            hue=settings.get('hue', 0.0),
+                            exposure=settings.get('exposure', 1.0),
+                            color_mask_enabled=settings.get('color_mask_enabled', False),
+                            color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                            color_mask_tolerance=settings.get('color_mask_tolerance', 15),
+                            color_mask_background=settings.get('color_mask_background', 'black'),
+                            color_mask_position=settings.get('color_mask_position', 'after')
+                        )
+                        print(f"[DEBUG] Image processed successfully")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to process image: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Fallback to stored image
+                        image = self.latest_images[area_name]
+                else:
+                    # Fallback to stored image
+                    if not hasattr(self, '_fallback_printed'):
+                        print(f"[DEBUG] Using fallback stored image")
+                        self._fallback_printed = True
+                    image = self.latest_images[area_name]
+                
+                try:
+                    # Scale the image according to the selected percentage
+                    scale_factor = int(self.scale_var.get()) / 100
                     new_width = int(image.width * scale_factor)
                     new_height = int(image.height * scale_factor)
-                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    scaled_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+                    # Convert to PhotoImage and display
+                    photo_image = ImageTk.PhotoImage(scaled_image)
+                    self.image_label.config(image=photo_image)
+                    self.image_label.image = photo_image  # Keep a reference
+
+                    # Update window size to fit image
+                    self.window.geometry(f"{max(new_width + 50, 690)}x{max(new_height + 150, 500)}")
                     
-                # Calculate new window height based on scaled image height
-                window_height = image.height + 300  # Add space for controls and log
-                window_height = max(500, window_height)
-                
-                # Get current window position and width
-                window_x = self.window.winfo_x()
-                window_y = self.window.winfo_y()
-                window_width = self.window.winfo_width()
-                
-                # Update window geometry
-                self.window.geometry(f"{window_width}x{window_height}+{window_x}+{window_y}")
-                
-                # Create new photo before deleting old one to prevent AttributeError
-                new_photo = ImageTk.PhotoImage(image)
-                
-                # Clean up previous photo if it exists (after creating new one)
-                if hasattr(self, 'photo') and self.photo is not None:
-                    del self.photo
-                
-                self.photo = new_photo
+                    # Create new photo before deleting old one to prevent AttributeError
+                    new_photo = ImageTk.PhotoImage(image)
+                    
+                    # Clean up previous photo if it exists (after creating new one)
+                    if hasattr(self, 'photo') and self.photo is not None:
+                        del self.photo
+                    
+                    self.photo = new_photo
+                    if self.image_label.winfo_exists():
+                        self.image_label.config(image=self.photo)
+                except Exception as e:
+                    # Silently handle "Operation on closed image" and other common image errors
+                    # since the program works fine anyway
+                    error_msg = str(e).lower()
+                    if "closed image" in error_msg or "cannot identify image file" in error_msg or "image has wrong mode" in error_msg:
+                        # Silently ignore these common image errors
+                        pass
+                    else:
+                        # Only show other unexpected errors
+                        if not hasattr(self, 'photo'):
+                            self.photo = None
+                        # Use sys.stderr.write to avoid recursion with console
+                        import sys
+                        sys.stderr.write(f"Error updating image display: {e}\n")
+            else:
                 if self.image_label.winfo_exists():
-                    self.image_label.config(image=self.photo)
-            except Exception as e:
-                # If anything goes wrong, ensure photo attribute exists
-                if not hasattr(self, 'photo'):
-                    self.photo = None
-                print(f"Error updating image display: {e}")
-        else:
-            if self.image_label.winfo_exists():
-                self.image_label.config(image='')
-            if hasattr(self, 'photo'):
-                del self.photo
+                    self.image_label.config(image='')
+                if hasattr(self, 'photo'):
+                    del self.photo
+                    
+        finally:
+            self._updating_image = False
 
     def update_console(self):
         if not hasattr(self, 'text_widget') or not self.text_widget.winfo_exists():
@@ -268,10 +371,8 @@ class ConsoleWindow:
         self.text_widget.see(tk.END)
 
     def write(self, message):
-        """Write to the console window if it exists"""
-        if not self.window.winfo_exists():
-            return
-        
+        """Write to the console buffer and update UI if window exists"""
+        # Always write to the buffer, even if window is closed
         # Check buffer size and truncate if too large to prevent memory issues
         try:
             buffer_size = len(self.log_buffer.getvalue().encode('utf-8'))
@@ -288,9 +389,12 @@ class ConsoleWindow:
             pass  # If buffer check fails, continue anyway
             
         self.log_buffer.write(message)  # Write to the buffer
-        self.update_console()  # Update the console window with line limit
-        if self.show_image_var.get():  # Update image if checkbox is checked
-            self.update_image_display()
+        
+        # Only update UI if window exists
+        if hasattr(self, 'window') and self.window.winfo_exists():
+            self.update_console()  # Update the console window with line limit
+            if self.show_image_var.get():  # Update image if checkbox is checked
+                self.update_image_display()
 
     def flush(self):
         pass

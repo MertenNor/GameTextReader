@@ -45,7 +45,7 @@ class GameUnitsEditWindow:
         self.default_units_list = [(short, full) for short, full in default_units_dict.items()]
         
         # Store entry widgets and variables
-        self.entry_widgets = []  # List of (short_name_var, full_name_var, short_entry, full_entry, listen_btn, delete_btn, default_btn, row_frame)
+        self.entry_widgets = []  # List of (short_name_var, full_name_var, case_sensitive_var, short_entry, full_entry, case_frame, case_checkbox, listen_btn, delete_btn, default_btn, row_frame)
         
         # Voice selection variables
         self.selected_voice = None
@@ -71,7 +71,7 @@ class GameUnitsEditWindow:
         top_frame.pack(fill='x', padx=10, pady=10)
         
         # Voice selection label
-        tk.Label(top_frame, text="Voice:", font=("Helvetica", 10)).pack(side='left', padx=5)
+        tk.Label(top_frame, text="Preview Voice:", font=("Helvetica", 10)).pack(side='left', padx=5)
         
         # Voice selection dropdown
         voice_display_names = []
@@ -165,17 +165,33 @@ class GameUnitsEditWindow:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # Bind mousewheel to canvas
+        # Bind mousewheel to canvas and canvas_frame for better coverage
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        # Bind to canvas and canvas_frame, and also use bind_all for global capture
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas_frame.bind("<MouseWheel>", _on_mousewheel)
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Also bind Linux mousewheel events
+        def _on_mousewheel_linux(event):
+            canvas.yview_scroll(int(-1*(event.delta)), "units")
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+        
+        # Set focus to canvas when mouse enters
+        def _on_enter(event):
+            canvas.focus_set()
+        canvas.bind("<Enter>", _on_enter)
+        canvas_frame.bind("<Enter>", _on_enter)
         
         # Headers
         header_frame = tk.Frame(self.scrollable_frame)
         header_frame.pack(fill='x', padx=0, pady=5)
-        tk.Label(header_frame, text="Short Name", font=("Helvetica", 10, "bold"), width=12, anchor='w').pack(side='left', padx=5)
-        tk.Label(header_frame, text="Full Name", font=("Helvetica", 10, "bold"), width=20, anchor='w').pack(side='left', padx=5)
-        tk.Label(header_frame, text="Actions", font=("Helvetica", 10, "bold"), width=10, anchor='w').pack(side='left', padx=5)
+        tk.Label(header_frame, text="Detected phrase:", font=("Helvetica", 10, "bold"), width=15, anchor='w').pack(side='left', padx=5)
+        tk.Label(header_frame, text="Will be read as:", font=("Helvetica", 10, "bold"), width=20, anchor='w').pack(side='left', padx=5)
+        tk.Label(header_frame, text="Actions", font=("Helvetica", 10, "bold"), width=15, anchor='w').pack(side='left', padx=5)
         
         # Store canvas and scrollable_frame for later use
         self.canvas = canvas
@@ -219,12 +235,47 @@ class GameUnitsEditWindow:
         cancel_button = tk.Button(right_frame, text="Cancel", command=self.cancel_edit, width=10)
         cancel_button.pack(side='right', padx=2)
     
+    def load_case_sensitive_settings(self):
+        """Load case-sensitive settings from JSON file."""
+        try:
+            temp_path = APP_DOCUMENTS_DIR
+            os.makedirs(temp_path, exist_ok=True)
+            
+            file_path = os.path.join(temp_path, 'gamer_units_case_sensitive.json')
+            
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            else:
+                return {}
+        except Exception as e:
+            print(f"Error loading case-sensitive settings: {e}")
+            return {}
+    
+    def save_case_sensitive_settings(self, case_sensitive_dict):
+        """Save case-sensitive settings to JSON file."""
+        try:
+            temp_path = APP_DOCUMENTS_DIR
+            os.makedirs(temp_path, exist_ok=True)
+            
+            file_path = os.path.join(temp_path, 'gamer_units_case_sensitive.json')
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(case_sensitive_dict, f, indent=4, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error saving case-sensitive settings: {e}")
+    
     def populate_entries(self):
         """Populate the scrollable frame with existing game units."""
+        # Load case-sensitive settings if they exist
+        case_sensitive_settings = self.load_case_sensitive_settings()
+        
         for short_name, full_name in self.game_units.items():
-            self.add_entry_row(short_name, full_name)
+            case_sensitive = case_sensitive_settings.get(short_name, False)
+            self.add_entry_row(short_name, full_name, case_sensitive)
     
-    def add_entry_row(self, short_name="", full_name=""):
+    def add_entry_row(self, short_name="", full_name="", case_sensitive=False):
         """Add a new row for editing a game unit entry."""
         row_frame = tk.Frame(self.scrollable_frame)
         row_frame.pack(fill='x', padx=0, pady=2)
@@ -235,7 +286,7 @@ class GameUnitsEditWindow:
         
         # Short name entry
         short_name_var = tk.StringVar(value=short_name)
-        short_entry = tk.Entry(row_frame, textvariable=short_name_var, width=12)
+        short_entry = tk.Entry(row_frame, textvariable=short_name_var, width=18)
         short_entry.pack(side='left', padx=5)
         
         # Full name entry
@@ -243,36 +294,43 @@ class GameUnitsEditWindow:
         full_entry = tk.Entry(row_frame, textvariable=full_name_var, width=20)
         full_entry.pack(side='left', padx=5)
         
+        # Case sensitive checkbox
+        case_sensitive_var = tk.BooleanVar(value=case_sensitive)
+        case_frame = tk.Frame(row_frame)
+        case_frame.pack(side='left', padx=0)
+        case_checkbox = tk.Checkbutton(case_frame, variable=case_sensitive_var, text="Case\nSensitive")
+        case_checkbox.pack(side='left')
+        
         # Actions frame
         actions_frame = tk.Frame(row_frame)
-        actions_frame.pack(side='left', padx=5)
+        actions_frame.pack(side='left', padx=10)
         
         # Listen button - use lambda with default argument to capture current value
         listen_btn = tk.Button(actions_frame, text="Listen", command=lambda var=full_name_var: self.listen_to_text(var.get()), width=7)
         listen_btn.pack(side='left', padx=2)
         
         # Delete button
-        delete_btn = tk.Button(actions_frame, text="Delete", command=lambda: self.delete_entry(row_frame, short_name_var, full_name_var), width=7)
+        delete_btn = tk.Button(actions_frame, text="Delete", command=lambda: self.delete_entry(row_frame, short_name_var, full_name_var, case_sensitive_var), width=7)
         delete_btn.pack(side='left', padx=2)
         
         # Default button - only add if this row is within the default list range
         default_btn = None
         if has_default:
-            default_btn = tk.Button(actions_frame, text="Default", command=lambda: self.restore_default(short_name_var, full_name_var, row_frame), width=7)
+            default_btn = tk.Button(actions_frame, text="Default", command=lambda: self.restore_default(short_name_var, full_name_var, case_sensitive_var, row_frame), width=7)
             default_btn.pack(side='left', padx=(2, 5))
         else:
             # Add padding to match spacing when there's no Default button
             tk.Frame(actions_frame, width=7).pack(side='left', padx=(2, 5))
         
         # Store widgets
-        self.entry_widgets.append((short_name_var, full_name_var, short_entry, full_entry, listen_btn, delete_btn, default_btn, row_frame))
+        self.entry_widgets.append((short_name_var, full_name_var, case_sensitive_var, short_entry, full_entry, case_frame, case_checkbox, listen_btn, delete_btn, default_btn, row_frame))
     
     def delete_all_entries(self):
         """Delete all entries from the editor."""
         if messagebox.askyesno("Delete All", "Are you sure you want to delete all game units? This action cannot be undone."):
             # Clear all entry widgets
             for widget in self.entry_widgets:
-                row_frame = widget[7]  # row_frame is at index 7
+                row_frame = widget[10]  # row_frame is at index 10 now
                 row_frame.destroy()
             self.entry_widgets.clear()
             
@@ -284,7 +342,7 @@ class GameUnitsEditWindow:
         if messagebox.askyesno("Reset to Default", "This will replace all current entries with the default values. Any custom entries will be lost. Continue?"):
             # Clear all existing entries
             for widget in self.entry_widgets:
-                row_frame = widget[7]  # row_frame is at index 7
+                row_frame = widget[10]  # row_frame is at index 10 now
                 row_frame.destroy()
             self.entry_widgets.clear()
             
@@ -359,11 +417,11 @@ class GameUnitsEditWindow:
             'fg': 'Fragments'
         }
     
-    def restore_default(self, short_name_var, full_name_var, row_frame):
+    def restore_default(self, short_name_var, full_name_var, case_sensitive_var, row_frame):
         """Restore the default value for a game unit entry based on its position in the list."""
         # Find the index of this row in the entry_widgets list
         row_index = None
-        for i, (s_var, f_var, s_entry, f_entry, l_btn, d_btn, def_btn, r_frame) in enumerate(self.entry_widgets):
+        for i, (s_var, f_var, cs_var, s_entry, f_entry, cs_frame, cs_checkbox, l_btn, d_btn, def_btn, r_frame) in enumerate(self.entry_widgets):
             if r_frame == row_frame:
                 row_index = i
                 break
@@ -382,24 +440,28 @@ class GameUnitsEditWindow:
         
         current_short_name = short_name_var.get().strip()
         current_full_name = full_name_var.get().strip()
+        current_case_sensitive = case_sensitive_var.get()
         
         # Check if already at default
-        if current_short_name == default_short_name and current_full_name == default_full_name:
-            messagebox.showinfo("Already Default", f"This row is already set to its default values:\nShort: '{default_short_name}'\nFull: '{default_full_name}'")
+        if (current_short_name == default_short_name and 
+            current_full_name == default_full_name and 
+            not current_case_sensitive):
+            messagebox.showinfo("Already Default", f"This row is already set to its default values:\nShort: '{default_short_name}'\nFull: '{default_full_name}'\nCase Sensitive: No")
             return
         
         # Prompt before applying
         if messagebox.askyesno("Restore Default", 
                                f"Restore this row to default values (position {row_index + 1})?\n\n"
-                               f"Current:\n  Short: {current_short_name or '(empty)'}\n  Full: {current_full_name or '(empty)'}\n\n"
-                               f"Default:\n  Short: {default_short_name}\n  Full: {default_full_name}"):
+                               f"Current:\n  Short: {current_short_name or '(empty)'}\n  Full: {current_full_name or '(empty)'}\n  Case Sensitive: {current_case_sensitive}\n\n"
+                               f"Default:\n  Short: {default_short_name}\n  Full: {default_full_name}\n  Case Sensitive: No"):
             short_name_var.set(default_short_name)
             full_name_var.set(default_full_name)
+            case_sensitive_var.set(False)
     
-    def delete_entry(self, row_frame, short_name_var, full_name_var):
+    def delete_entry(self, row_frame, short_name_var, full_name_var, case_sensitive_var):
         """Delete an entry row."""
         # Remove from entry_widgets list
-        for i, (s_var, f_var, s_entry, f_entry, l_btn, d_btn, def_btn, r_frame) in enumerate(self.entry_widgets):
+        for i, (s_var, f_var, cs_var, s_entry, f_entry, cs_frame, cs_checkbox, l_btn, d_btn, def_btn, r_frame) in enumerate(self.entry_widgets):
             if r_frame == row_frame:
                 self.entry_widgets.pop(i)
                 break
@@ -470,11 +532,13 @@ class GameUnitsEditWindow:
         """Save the game units to the JSON file."""
         # Collect data from all entries
         new_units = {}
+        case_sensitive_settings = {}
         errors = []
         
-        for short_name_var, full_name_var, short_entry, full_entry, listen_btn, delete_btn, default_btn, row_frame in self.entry_widgets:
+        for short_name_var, full_name_var, case_sensitive_var, short_entry, full_entry, case_frame, case_checkbox, listen_btn, delete_btn, default_btn, row_frame in self.entry_widgets:
             short_name = short_name_var.get().strip()
             full_name = full_name_var.get().strip()
+            case_sensitive = case_sensitive_var.get()
             
             # Skip empty entries
             if not short_name and not full_name:
@@ -495,13 +559,14 @@ class GameUnitsEditWindow:
                 continue
             
             new_units[short_name] = full_name
+            case_sensitive_settings[short_name] = case_sensitive
         
         # Show errors if any
         if errors:
             messagebox.showerror("Validation Error", "\n".join(errors))
             return
         
-        # Save to file
+        # Save main units file
         try:
             temp_path = APP_DOCUMENTS_DIR
             os.makedirs(temp_path, exist_ok=True)
@@ -522,6 +587,9 @@ class GameUnitsEditWindow:
                 else:
                     # Write empty JSON object for completely empty file
                     f.write('{}')
+            
+            # Save case-sensitive settings
+            self.save_case_sensitive_settings(case_sensitive_settings)
             
             # Update the game_text_reader's game_units
             self.game_text_reader.game_units = new_units
@@ -546,14 +614,24 @@ class GameUnitsEditWindow:
         """Cancel editing and close the window."""
         # Check if there are unsaved changes
         current_units = {}
-        for short_name_var, full_name_var, short_entry, full_entry, listen_btn, delete_btn, default_btn, row_frame in self.entry_widgets:
+        current_case_sensitive = {}
+        for short_name_var, full_name_var, case_sensitive_var, short_entry, full_entry, case_frame, case_checkbox, listen_btn, delete_btn, default_btn, row_frame in self.entry_widgets:
             short_name = short_name_var.get().strip()
             full_name = full_name_var.get().strip()
+            case_sensitive = case_sensitive_var.get()
             if short_name and full_name:
                 current_units[short_name] = full_name
+                current_case_sensitive[short_name] = case_sensitive
         
-        if current_units != self.original_units:
-            if not messagebox.askyesno("Unsaved Changes", "You have unsaved changes. Are you sure you want to cancel?"):
+        # Load original case-sensitive settings for comparison
+        original_case_sensitive = self.load_case_sensitive_settings()
+        
+        if current_units != self.original_units or current_case_sensitive != original_case_sensitive:
+            if messagebox.askyesno("Unsaved Changes", "You have unsaved changes. Are you sure you want to cancel?"):
+                # User clicked Yes - proceed with cancel
+                pass
+            else:
+                # User clicked No - don't cancel, return to the window
                 return
         
         # Stop any speech
