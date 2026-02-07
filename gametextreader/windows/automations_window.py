@@ -92,7 +92,7 @@ class AutomationsWindow:
             if os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
-            print(f"Error setting automations window icon: {e}")
+            pass
         
         # Center the window
         self.window.update_idletasks()
@@ -135,7 +135,7 @@ class AutomationsWindow:
                 self.polling_active = True
                 self.polling_thread = old_instance.polling_thread
                 game_text_reader._automations_polling_active = True
-                print("AUTOMATION: Restored polling state - thread was still running")
+                pass
             else:
                 # Polling was not active or thread died, check stored state
                 if hasattr(game_text_reader, '_automations_polling_active'):
@@ -195,12 +195,12 @@ class AutomationsWindow:
             # Update button based on shared state (source of truth)
             if is_active:
                 self.polling_button.config(text="Stop Monitoring", bg="#FFB6C1")
-                print(f"POLLING: Button updated to 'Stop Monitoring' (is_active={is_active})")
+                pass
             else:
                 self.polling_button.config(text="Start Monitor Detections", bg="#90EE90")
-                print(f"POLLING: Button updated to 'Start Monitor Detections' (is_active={is_active})")
+                pass
         except Exception as e:
-            print(f"POLLING: Error updating button state: {e}")
+            print(f"[ERROR] Automations: UI update failed: {e}")
             pass  # Button might not exist yet
     
     def _mark_unsaved_changes(self):
@@ -214,7 +214,7 @@ class AutomationsWindow:
                 # Reset flag after successful save
                 self._has_unsaved_changes = False
             except Exception as e:
-                print(f"Error auto-saving automations: {e}")
+                print(f"[ERROR] Automations: Auto-save failed: {e}")
                 # Keep flag set if save failed
     
     def _update_main_status(self, message, color="black", duration=3000):
@@ -305,9 +305,7 @@ class AutomationsWindow:
         # Stop any active triggering for combos, but DON'T clean up hotkeys - they should persist globally
         # Hotkeys are registered globally via keyboard.add_hotkey() and should continue working
         # even when the window is closed
-        print(f"HOTKEY COMBO DEBUG: Window closing - checking registry state...")
-        print(f"HOTKEY COMBO DEBUG: Registry has {len(self.combo_callbacks_by_hotkey)} combo callback(s): {list(self.combo_callbacks_by_hotkey.keys())}")
-        print(f"HOTKEY COMBO DEBUG: Registry has {len(self.automation_callbacks_by_hotkey)} automation callback(s): {list(self.automation_callbacks_by_hotkey.keys())}")
+        pass
         
         for combo in self.hotkey_combos[:]:  # Use slice copy to avoid modification during iteration
             # Stop any active triggering
@@ -319,14 +317,14 @@ class AutomationsWindow:
             hotkey_name = 'N/A'
             if hotkey_button and hasattr(hotkey_button, 'hotkey'):
                 hotkey_name = hotkey_button.hotkey
-            print(f"HOTKEY COMBO DEBUG: Keeping hotkey '{hotkey_name}' active (window closing but hotkey persists)")
+            pass
             # Verify callback is in registry
             if hotkey_name in self.combo_callbacks_by_hotkey:
-                print(f"HOTKEY COMBO DEBUG: ✓ Callback for '{hotkey_name}' confirmed in registry")
+                pass
             else:
-                print(f"HOTKEY COMBO DEBUG: ✗ WARNING - Callback for '{hotkey_name}' NOT in registry!")
+                print(f"[WARNING] Automations: Hotkey '{hotkey_name}' fallback missing.")
         
-        print(f"HOTKEY COMBO DEBUG: Window being destroyed, but registries will persist in game_text_reader._automations_window")
+        pass
         self.window.destroy()
     
     def create_ui(self):
@@ -836,32 +834,31 @@ class AutomationsWindow:
     
     def set_image_area_top_level(self):
         """Set image area from top-level button - immediately starts area selection"""
-        print("=" * 60)
-        print("AUTOMATION: set_image_area_top_level() called")
+        pass
         
         if not self.automations:
-            print("AUTOMATION: No automations found, showing info message")
+            pass
             messagebox.showinfo("No Automations", "Please add an automation first.")
             return
         
         # Check if area selection is already in progress
         if hasattr(self.game_text_reader, 'area_selection_in_progress') and self.game_text_reader.area_selection_in_progress:
-            print("AUTOMATION: Area selection already in progress")
+            pass
             messagebox.showwarning("Area Selection Active", "Please complete or cancel the current area selection first.")
             return
         
         # Immediately start area selection - dialog will show AFTER image is captured
-        print("AUTOMATION: Starting area selection immediately...")
+        pass
         self.start_area_selection_for_automations()
-        print("=" * 60)
+        pass
     
     def set_hotkey_top_level(self):
         """Set hotkey from top-level button - assigns a hotkey that triggers area selection"""
-        print("AUTOMATION: set_hotkey_top_level() called")
+        pass
         
         # If a hotkey is already set, clear it first to allow setting a new one
         if hasattr(self.set_hotkey_button, 'hotkey') and self.set_hotkey_button.hotkey:
-            print("AUTOMATION: Clearing existing hotkey before setting new one")
+            pass
             # Clear the old hotkey
             old_hotkey = self.set_hotkey_button.hotkey
             if hasattr(self.game_text_reader, 'hotkeys') and old_hotkey in self.game_text_reader.hotkeys:
@@ -875,7 +872,7 @@ class AutomationsWindow:
         
         # Ensure we're not in the middle of area selection
         if hasattr(self.game_text_reader, 'area_selection_in_progress') and self.game_text_reader.area_selection_in_progress:
-            print("AUTOMATION: Area selection in progress, cannot set hotkey")
+            pass
             messagebox.showwarning("Area Selection Active", "Please complete or cancel the area selection first.")
             return
         
@@ -888,37 +885,32 @@ class AutomationsWindow:
         # Make it a method that can be restored if lost
         def hotkey_callback():
             # When hotkey is pressed, trigger area selection
-            print("=" * 60)
-            print("AUTOMATION: Area selection hotkey pressed, triggering area selection")
-            print(f"AUTOMATION: Button: {self.set_hotkey_button}")
-            print(f"AUTOMATION: Has callback attr: {hasattr(self.set_hotkey_button, '_automation_callback')}")
-            if hasattr(self.set_hotkey_button, '_automation_callback'):
-                print(f"AUTOMATION: Callback value: {self.set_hotkey_button._automation_callback}")
+            pass
             # Check if area selection is already in progress
             if hasattr(self.game_text_reader, 'area_selection_in_progress') and self.game_text_reader.area_selection_in_progress:
-                print("AUTOMATION: Area selection already in progress, ignoring hotkey")
+                pass
                 return
             self.start_area_selection_for_automations()
             # Re-set callback after use to ensure it persists
             # This is critical - the callback must persist after being called
             if hasattr(self, 'set_hotkey_button') and self.set_hotkey_button:
                 self.set_hotkey_button._automation_callback = hotkey_callback
-                print("AUTOMATION: Callback re-set after execution")
-            print("=" * 60)
+                pass
+            pass
         
         # Store callback on button IMMEDIATELY so it's available when setup_hotkey creates the handler
         # Also store it on the window as a backup in case button reference changes
-        print(f"AUTOMATION: Setting callback on button: {self.set_hotkey_button}")
+        pass
         self.set_hotkey_button._automation_callback = hotkey_callback
         self.set_hotkey_button._automation_temp_frame = temp_frame
         # Store as backup on window
         self._area_selection_hotkey_callback = hotkey_callback
         self._area_selection_hotkey_button = self.set_hotkey_button
-        print(f"AUTOMATION: Callback set: {hasattr(self.set_hotkey_button, '_automation_callback')}")
-        print(f"AUTOMATION: Callback value: {self.set_hotkey_button._automation_callback}")
+        pass
+        pass
         
         # Use existing hotkey system to start hotkey assignment
-        print("AUTOMATION: Starting hotkey assignment mode for area selection...")
+        pass
         self.game_text_reader.set_hotkey(self.set_hotkey_button, temp_frame)
         
         # After hotkey is assigned, ensure callback is set and update the display
@@ -927,11 +919,11 @@ class AutomationsWindow:
         def update_after_hotkey_set():
             """Update button display after hotkey is set and ensure callback is preserved"""
             if hasattr(self.set_hotkey_button, 'hotkey') and self.set_hotkey_button.hotkey:
-                print(f"AUTOMATION: Area selection hotkey assigned: {self.set_hotkey_button.hotkey}")
+                pass
                 
                 # CRITICAL: Re-set the callback after setup_hotkey completes
                 # The handler in setup_hotkey checks for this callback at runtime, so it must exist
-                print("AUTOMATION: Re-setting callback after hotkey setup completes")
+                pass
                 self.set_hotkey_button._automation_callback = hotkey_callback
                 # Also update backup
                 self._area_selection_hotkey_callback = hotkey_callback
@@ -939,14 +931,14 @@ class AutomationsWindow:
                 
                 # Verify it's set
                 if hasattr(self.set_hotkey_button, '_automation_callback') and self.set_hotkey_button._automation_callback:
-                    print("AUTOMATION: ✓ Callback is set and ready")
-                    print(f"AUTOMATION: Callback function: {self.set_hotkey_button._automation_callback}")
+                    pass
+                    pass
                 else:
-                    print("AUTOMATION: ✗ ERROR - Callback is NOT set!")
-                    print(f"AUTOMATION: Button: {self.set_hotkey_button}")
-                    print(f"AUTOMATION: Has attr: {hasattr(self.set_hotkey_button, '_automation_callback')}")
+                    print("[ERROR] Automations: Callback failed to set!")
+                    pass
+                    pass
                     if hasattr(self.set_hotkey_button, '_automation_callback'):
-                        print(f"AUTOMATION: Callback value: {self.set_hotkey_button._automation_callback}")
+                        pass
                 
                 # Also ensure the temp_frame reference is preserved
                 if not hasattr(self.set_hotkey_button, '_automation_temp_frame'):
@@ -967,7 +959,7 @@ class AutomationsWindow:
                             if not hasattr(self.set_hotkey_button, '_automation_callback') or not self.set_hotkey_button._automation_callback:
                                 # Restore from backup
                                 if hasattr(self, '_area_selection_hotkey_callback'):
-                                    print("AUTOMATION: Restoring lost callback from backup")
+                                    pass
                                     self.set_hotkey_button._automation_callback = self._area_selection_hotkey_callback
                             # Schedule next check
                             self.window.after(2000, ensure_callback_persists)
@@ -988,8 +980,8 @@ class AutomationsWindow:
     
     def start_area_selection_for_automations(self):
         """Start area selection - after capture, show dialog to select which automation(s) to assign image to"""
-        print("=" * 60)
-        print("AUTOMATION: start_area_selection_for_automations() called")
+        pass
+        pass
         
         # Check if window exists - if not, just return (don't open window)
         window_exists = False
@@ -999,79 +991,79 @@ class AutomationsWindow:
             pass
         
         if not window_exists:
-            print("AUTOMATION: Window is closed, cannot start area selection")
+            pass
             return
         
-        print(f"AUTOMATION: Freeze screen setting: {self.freeze_screen_var.get()}")
+        pass
         
         # Create a temporary frame to store coordinates
         temp_frame = tk.Frame()
-        print(f"AUTOMATION: Created temp_frame: {temp_frame}")
+        pass
         
         # Create callback to handle area selection completion
         def on_area_selected(frame):
-            print("=" * 60)
-            print(f"AUTOMATION: on_area_selected() callback triggered")
-            print(f"AUTOMATION: Frame object: {frame}")
-            print(f"AUTOMATION: Frame has area_coords attr: {hasattr(frame, 'area_coords')}")
+            pass
+            pass
+            pass
+            pass
             
             try:
                 if hasattr(frame, 'area_coords') and frame.area_coords:
                     coords = frame.area_coords
-                    print(f"AUTOMATION: Area coordinates found: {coords}")
+                    pass
                     x1, y1, x2, y2 = coords
                     
                     # Capture reference image first
-                    print(f"AUTOMATION: Capturing reference image at ({x1}, {y1}, {x2}, {y2})")
+                    pass
                     freeze_screen = self.freeze_screen_var.get()
-                    print(f"AUTOMATION: Freeze screen for capture: {freeze_screen}")
+                    pass
                     captured_image = self.capture_image_for_automations(x1, y1, x2, y2, freeze_screen, frame)
                     
                     if captured_image:
                         # Now show dialog to select which automation(s) to assign this image to
                         # Add a delay to ensure area selection window is fully closed first
                         # Use root window for scheduling to avoid issues if automation window is closed
-                        print("AUTOMATION: Showing automation selection dialog...")
+                        pass
                         self.root.after(200, lambda: self.show_automation_selection_dialog(captured_image, coords))
                     else:
-                        print("AUTOMATION: Failed to capture image")
+                        pass
                 else:
-                    print(f"AUTOMATION: WARNING - No area coordinates found in frame")
+                    pass
                     if hasattr(frame, 'area_coords'):
-                        print(f"AUTOMATION: Frame.area_coords exists but is: {frame.area_coords}")
+                        pass
                     else:
-                        print("AUTOMATION: Frame does not have area_coords attribute")
+                        pass
             except Exception as e:
-                print(f"AUTOMATION: ERROR in on_area_selected callback: {e}")
+                print(f"[ERROR] Automations: {e}")
                 import traceback
                 traceback.print_exc()
             finally:
                 # Don't restore focus immediately - let the dialog show first
                 # Focus will be restored after dialog is closed
                 pass
-            print("=" * 60)
+            pass
         
         # Store the callback in the frame for later use
         temp_frame._automation_callback = on_area_selected
-        print(f"AUTOMATION: Stored callback in temp_frame")
+        pass
         
         # Use the helper method from game_text_reader with top-level freeze screen setting
         try:
-            print(f"AUTOMATION: Calling game_text_reader.set_area_for_automation()...")
-            print(f"AUTOMATION: - temp_frame: {temp_frame}")
-            print(f"AUTOMATION: - callback: {on_area_selected}")
-            print(f"AUTOMATION: - freeze_screen: {self.freeze_screen_var.get()}")
+            pass
+            pass
+            pass
+            pass
             
             self.game_text_reader.set_area_for_automation(temp_frame, on_area_selected, self.freeze_screen_var.get())
             
-            print(f"AUTOMATION: set_area_for_automation() returned successfully")
-            print(f"AUTOMATION: Area selection should start now - window should appear")
+            pass
+            pass
         except Exception as e:
-            print(f"AUTOMATION: ERROR starting area selection: {e}")
+            print(f"[ERROR] Automations: {e}")
             import traceback
             traceback.print_exc()
             messagebox.showerror("Error", f"Failed to start area selection: {e}")
-        print("=" * 60)
+        pass
     
     def capture_image_for_automations(self, x1, y1, x2, y2, freeze_screen, frame=None):
         """Capture image for automation assignment - returns the captured image
@@ -1079,7 +1071,7 @@ class AutomationsWindow:
         try:
             # Check if we should use frozen screenshot
             if freeze_screen and frame and hasattr(frame, 'frozen_screenshot') and frame.frozen_screenshot is not None:
-                print(f"AUTOMATION: Using frozen screenshot for capture")
+                pass
                 frozen_img = frame.frozen_screenshot
                 
                 # Get frozen screenshot bounds
@@ -1109,18 +1101,18 @@ class AutomationsWindow:
                 # Extract the region from the frozen screenshot
                 if crop_x2 > crop_x1 and crop_y2 > crop_y1:
                     image = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                    print(f"AUTOMATION: Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
+                    pass
                     return image.copy()
                 else:
-                    print(f"AUTOMATION: Invalid crop area from frozen screenshot, falling back to live capture")
+                    pass
                     # Fall through to live capture
             
             # Default: capture from live screen
             image = capture_screen_area(x1, y1, x2, y2)
-            print(f"AUTOMATION: Image captured from live screen: {image.size}")
+            pass
             return image.copy()  # Return a copy
         except Exception as e:
-            print(f"AUTOMATION: Error capturing image: {e}")
+            print(f"[ERROR] Automations: Capture failed: {e}")
             import traceback
             traceback.print_exc()
             messagebox.showerror("Error", f"Failed to capture image: {e}")
@@ -1128,9 +1120,9 @@ class AutomationsWindow:
     
     def show_automation_selection_dialog(self, captured_image, coords):
         """Show dialog to select which automation(s) to assign the captured image to"""
-        print("=" * 60)
-        print("AUTOMATION: show_automation_selection_dialog() called")
-        print(f"AUTOMATION: Number of automations: {len(self.automations)}")
+        pass
+        pass
+        pass
         
         # Check if window still exists - if not, reopen it
         window_exists = False
@@ -1142,7 +1134,7 @@ class AutomationsWindow:
         # Get the current window instance (might be different if window was reopened)
         current_window_instance = self
         if not window_exists:
-            print("AUTOMATION: Window no longer exists, reopening it...")
+            pass
             # Reopen the automation window
             self.game_text_reader.open_automations_window()
             # Wait a bit for window to be created
@@ -1150,7 +1142,7 @@ class AutomationsWindow:
             # Get reference to the current window instance
             if hasattr(self.game_text_reader, '_automations_window') and self.game_text_reader._automations_window:
                 current_window_instance = self.game_text_reader._automations_window
-                print("AUTOMATION: Using current window instance")
+                pass
         
         # Use the current window instance for all operations
         window_instance = current_window_instance
@@ -1167,7 +1159,7 @@ class AutomationsWindow:
         try:
             selection_window = tk.Toplevel(window_instance.window)
         except Exception as e:
-            print(f"AUTOMATION: Error creating selection dialog: {e}")
+            print(f"[ERROR] Automations: {e}")
             return
         selection_window.title("Select Automation(s)")
         # Make window taller to accommodate multiple checkboxes
@@ -1197,7 +1189,7 @@ class AutomationsWindow:
         
         # Create checkboxes for each automation
         checkbox_vars = {}  # Dictionary to store checkbox variables
-        print(f"AUTOMATION: Creating checkboxes for {len(self.automations)} automations")
+        pass
         
         # Create a frame with scrollbar if needed
         checkbox_frame = tk.Frame(selection_window)
@@ -1220,7 +1212,7 @@ class AutomationsWindow:
         
         # Add checkboxes for existing automations
         for automation in window_instance.automations:
-            print(f"AUTOMATION: Adding checkbox for {automation['name']}")
+            pass
             var = tk.BooleanVar(value=False)  # Default to unchecked
             checkbox_vars[automation['id']] = var
             cb = tk.Checkbutton(
@@ -1232,28 +1224,28 @@ class AutomationsWindow:
             cb.pack(anchor='w', padx=20, pady=2)
         
         def confirm_selection():
-            print("AUTOMATION: confirm_selection() called")
+            pass
             selected_automations.clear()
             create_new_automation = new_automation_var.get()
             
             # Collect selected existing automations
             for automation in window_instance.automations:
                 if checkbox_vars[automation['id']].get():
-                    print(f"AUTOMATION: Automation selected: {automation['name']} (ID: {automation['id']})")
+                    pass
                     selected_automations.append(automation)
             
             # Check if at least one option is selected
             if not selected_automations and not create_new_automation:
-                print("AUTOMATION: WARNING - No automations selected")
+                pass
                 messagebox.showwarning("No Selection", "Please select at least one automation or 'New automation area'.")
                 return  # Don't close the dialog if nothing is selected
             
-            print("AUTOMATION: Destroying selection window...")
+            pass
             selection_window.destroy()
-            print("AUTOMATION: Selection window destroyed")
+            pass
         
         def cancel_selection():
-            print("AUTOMATION: cancel_selection() called")
+            pass
             selection_window.destroy()
         
         button_frame = tk.Frame(selection_window)
@@ -1262,41 +1254,41 @@ class AutomationsWindow:
         tk.Button(button_frame, text="OK", command=confirm_selection, width=10).pack(side='left', padx=5)
         tk.Button(button_frame, text="Cancel", command=cancel_selection, width=10).pack(side='left', padx=5)
         
-        print("AUTOMATION: Waiting for selection window to close...")
+        pass
         selection_window.wait_window()
-        print("AUTOMATION: Selection window closed, wait_window() returned")
+        pass
         
         # Update the main window to ensure it processes events
-        print("AUTOMATION: Updating main window...")
+        pass
         window_instance.window.update()
-        print("AUTOMATION: Main window updated")
+        pass
         
         # Check if "New automation area" was selected
         create_new = new_automation_var.get()
         
         if create_new:
-            print("AUTOMATION: Creating new automation area...")
+            pass
             # Create a new automation using the current window instance
             window_instance.add_automation()
             # Get the newly created automation (it's the last one in the list)
             new_automation = window_instance.automations[-1]
             # Add to selected automations list so it gets processed below
             selected_automations.append(new_automation)
-            print(f"AUTOMATION: Created new automation: {new_automation['name']}")
+            pass
         
         if selected_automations:
-            print(f"AUTOMATION: {len(selected_automations)} automation(s) selected")
+            pass
             # Assign the same image and coordinates to all selected automations
             for automation in selected_automations:
-                print(f"AUTOMATION: Assigning image to {automation['name']} (ID: {automation['id']})")
+                pass
                 automation['image_area_coords'] = coords
                 automation['reference_image'] = captured_image.copy()  # Use same image for all
                 # Update preview
                 window_instance.update_preview(automation, captured_image)
-            print("AUTOMATION: All selected automations updated")
+            pass
             window_instance._mark_unsaved_changes()
         else:
-            print("AUTOMATION: No automations selected")
+            pass
         
         # Restore focus to automation window after dialog is closed
         def restore_window_focus():
@@ -1305,12 +1297,12 @@ class AutomationsWindow:
                     window_instance.window.focus_force()
                     window_instance.window.lift()
                     window_instance.window.update_idletasks()
-                    print(f"AUTOMATION: Restored focus to automation window")
+                    pass
             except Exception as e:
-                print(f"AUTOMATION: Error restoring window focus: {e}")
+                pass
         
         window_instance.window.after(100, restore_window_focus)
-        print("=" * 60)
+        pass
     
     def set_image_area(self, automation):
         """Set the image area for detection using existing area selection method"""
@@ -1329,9 +1321,9 @@ class AutomationsWindow:
             # Update preview (scale to 40x40px)
             self.update_preview(automation, image)
             
-            print(f"Reference image captured for automation {automation['id']}: {image.size}")
+            pass
         except Exception as e:
-            print(f"Error capturing reference image: {e}")
+            print(f"[ERROR] Automations: Capture failed: {e}")
             messagebox.showerror("Error", f"Failed to capture reference image: {e}")
     
     def update_preview(self, automation, image):
@@ -1394,12 +1386,12 @@ class AutomationsWindow:
             self.window.after(400, ensure_window_focus)
             self.window.after(700, ensure_window_focus)
         except Exception as e:
-            print(f"Error updating preview: {e}")
+            print(f"[ERROR] Automations: Preview update failed: {e}")
     
     def set_automation_hotkey(self, button, automation):
         """Set hotkey for automation - the hotkey will trigger image area selection when pressed"""
-        print(f"AUTOMATION: set_automation_hotkey() called for {automation['name']}")
-        print(f"AUTOMATION: Button: {button}")
+        pass
+        pass
         
         # Create a temporary frame for compatibility with hotkey system
         temp_frame = tk.Frame()
@@ -1410,7 +1402,7 @@ class AutomationsWindow:
         # Store callback for when hotkey is pressed (not when setting it)
         def hotkey_callback():
             # When hotkey is pressed, trigger area selection
-            print(f"AUTOMATION: Hotkey pressed for {automation['name']}, triggering area selection")
+            pass
             # Check if window exists - if not, reopen it
             window_exists = False
             try:
@@ -1419,7 +1411,7 @@ class AutomationsWindow:
                 pass
             
             if not window_exists:
-                print("AUTOMATION: Window closed, reopening it...")
+                pass
                 # Reopen the automation window
                 self.game_text_reader.open_automations_window()
                 # Wait a bit for window to be created
@@ -1450,15 +1442,15 @@ class AutomationsWindow:
         # Also store callback in registry for persistence (works even when window is closed)
         if hasattr(button, 'hotkey') and button.hotkey:
             self.automation_callbacks_by_hotkey[button.hotkey] = hotkey_callback
-            print(f"AUTOMATION DEBUG: Stored callback in registry for hotkey '{button.hotkey}'")
-            print(f"AUTOMATION DEBUG: Registry now has {len(self.automation_callbacks_by_hotkey)} automation callback(s)")
-            print(f"AUTOMATION DEBUG: Registry keys: {list(self.automation_callbacks_by_hotkey.keys())}")
+            pass
+            pass
+            pass
         else:
-            print(f"AUTOMATION DEBUG: Button has no hotkey yet, will store in registry after hotkey is assigned")
+            pass
         
         # Use existing hotkey system to start hotkey assignment
         # This will put the system in hotkey assignment mode
-        print(f"AUTOMATION: Starting hotkey assignment mode...")
+        pass
         self.game_text_reader.set_hotkey(button, temp_frame)
         
         # After hotkey is assigned, update the automation and displays
@@ -1466,15 +1458,15 @@ class AutomationsWindow:
         def update_after_hotkey_set():
             """Update automation after hotkey is set"""
             if hasattr(button, 'hotkey') and button.hotkey:
-                print(f"AUTOMATION DEBUG: Hotkey assigned: {button.hotkey}")
+                pass
                 automation['hotkey'] = button.hotkey
                 # Store callback in registry for persistence (works even when window is closed)
                 self.automation_callbacks_by_hotkey[button.hotkey] = hotkey_callback
-                print(f"AUTOMATION DEBUG: Stored callback in registry for hotkey '{button.hotkey}' after assignment")
-                print(f"AUTOMATION DEBUG: Registry now has {len(self.automation_callbacks_by_hotkey)} automation callback(s)")
-                print(f"AUTOMATION DEBUG: Registry keys: {list(self.automation_callbacks_by_hotkey.keys())}")
-                print(f"AUTOMATION DEBUG: Callback function: {hotkey_callback}")
-                print(f"AUTOMATION DEBUG: Window exists: {self.window.winfo_exists() if hasattr(self, 'window') else 'N/A'}")
+                pass
+                pass
+                pass
+                pass
+                pass
                 # Update displays
                 self.update_hotkey_display(automation)
                 self.update_top_hotkey_button()
@@ -1622,7 +1614,7 @@ class AutomationsWindow:
     
     def set_combo_hotkey(self, button, combo):
         """Set hotkey for a combo - uses same robust pattern as automation hotkey"""
-        print(f"HOTKEY COMBO: set_combo_hotkey() called for {combo['name']}")
+        pass
         
         # Create a temporary frame for compatibility with hotkey system
         temp_frame = tk.Frame()
@@ -1634,12 +1626,12 @@ class AutomationsWindow:
         # Make it a method that can be restored if lost
         def hotkey_callback():
             # When hotkey is pressed, trigger the combo
-            print("=" * 60)
-            print(f"HOTKEY COMBO: Hotkey pressed for {combo['name']}")
-            print(f"HOTKEY COMBO: Button: {button}")
-            print(f"HOTKEY COMBO: Has callback attr: {hasattr(button, '_combo_callback')}")
+            pass
+            pass
+            pass
+            pass
             if hasattr(button, '_combo_callback'):
-                print(f"HOTKEY COMBO: Callback value: {button._combo_callback}")
+                pass
             try:
                 self.trigger_hotkey_combo(combo)
             finally:
@@ -1648,28 +1640,28 @@ class AutomationsWindow:
                 # Use the backup from combo dictionary as the source of truth
                 if combo.get('_hotkey_callback_backup'):
                     button._combo_callback = combo['_hotkey_callback_backup']
-                    print("HOTKEY COMBO: Callback restored from backup after execution")
+                    pass
                 elif hasattr(button, '_combo_callback'):
                     button._combo_callback = hotkey_callback
-                    print("HOTKEY COMBO: Callback re-set after execution")
-            print("=" * 60)
+                    pass
+            pass
         
         combo['hotkey_callback'] = hotkey_callback
         
         # Store callback on button IMMEDIATELY so it's available when setup_hotkey creates the handler
         # Also store it on the combo as a backup in case button reference changes
-        print(f"HOTKEY COMBO: Setting callback on button: {button}")
+        pass
         button._combo_callback = hotkey_callback
         button._combo_temp_frame = temp_frame
         button._combo_ref = combo
         # Store as backup on combo
         combo['_hotkey_callback_backup'] = hotkey_callback
         combo['_hotkey_button'] = button
-        print(f"HOTKEY COMBO: Callback set: {hasattr(button, '_combo_callback')}")
-        print(f"HOTKEY COMBO: Callback value: {button._combo_callback}")
+        pass
+        pass
         
         # Use existing hotkey system to start hotkey assignment
-        print("HOTKEY COMBO: Starting hotkey assignment mode...")
+        pass
         self.game_text_reader.set_hotkey(button, temp_frame)
         
         # After hotkey is assigned, ensure callback is set and update the display
@@ -1678,11 +1670,11 @@ class AutomationsWindow:
         def update_after_hotkey_set():
             """Update button display after hotkey is set and ensure callback is preserved"""
             if hasattr(button, 'hotkey') and button.hotkey:
-                print(f"HOTKEY COMBO: Hotkey assigned: {button.hotkey}")
+                pass
                 
                 # CRITICAL: Re-set the callback after setup_hotkey completes
                 # The handler in setup_hotkey checks for this callback at runtime, so it must exist
-                print("HOTKEY COMBO: Re-setting callback after hotkey setup completes")
+                pass
                 button._combo_callback = hotkey_callback
                 # Also update backup
                 combo['_hotkey_callback_backup'] = hotkey_callback
@@ -1698,7 +1690,7 @@ class AutomationsWindow:
                 # setup_hotkey is already called in _finalize_hotkey, but we call it again
                 # to ensure the callback is properly set when the handler is created
                 # However, we need to clean up any existing hook first to avoid duplicates
-                print("HOTKEY COMBO: Ensuring hotkey is properly registered with callback")
+                pass
                 try:
                     # Clean up any existing hook first to avoid duplicates
                     if hasattr(button, 'keyboard_hook') and button.keyboard_hook:
@@ -1708,9 +1700,9 @@ class AutomationsWindow:
                                 keyboard.remove_hotkey(button.keyboard_hook)
                             else:
                                 keyboard.unhook(button.keyboard_hook)
-                            print("HOTKEY COMBO: Cleaned up existing hook before re-registering")
+                            pass
                         except Exception as e:
-                            print(f"HOTKEY COMBO: Warning: Error cleaning up existing hook: {e}")
+                            pass
                         finally:
                             button.keyboard_hook = None
                     
@@ -1719,27 +1711,27 @@ class AutomationsWindow:
                     self.game_text_reader.setup_hotkey(button, None)
                     # Re-set callback after setup_hotkey in case it got cleared
                     button._combo_callback = hotkey_callback
-                    print("HOTKEY COMBO: setup_hotkey called successfully, callback preserved")
+                    pass
                 except Exception as e:
-                    print(f"HOTKEY COMBO: Error calling setup_hotkey: {e}")
+                    print(f"[ERROR] Automations: Combo setup failed: {e}")
                     import traceback
                     traceback.print_exc()
                 
                 # Verify it's set
                 if hasattr(button, '_combo_callback') and button._combo_callback:
-                    print("HOTKEY COMBO: ✓ Callback is set and ready")
-                    print(f"HOTKEY COMBO: Callback function: {button._combo_callback}")
+                    pass
+                    pass
                 else:
-                    print("HOTKEY COMBO: ✗ ERROR - Callback is NOT set!")
-                    print(f"HOTKEY COMBO: Button: {button}")
-                    print(f"HOTKEY COMBO: Has attr: {hasattr(button, '_combo_callback')}")
+                    print("[ERROR] Automations: Combo callback missing.")
+                    pass
+                    pass
                     if hasattr(button, '_combo_callback'):
-                        print(f"HOTKEY COMBO: Callback value: {button._combo_callback}")
+                        pass
                 
                 combo['hotkey'] = button.hotkey
                 # Store callback in registry by hotkey name for reliable lookup
                 self.combo_callbacks_by_hotkey[button.hotkey] = hotkey_callback
-                print(f"HOTKEY COMBO: Stored callback in registry for hotkey '{button.hotkey}'")
+                pass
                 
                 display_name = button.hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
                 button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
@@ -1755,7 +1747,7 @@ class AutomationsWindow:
                             if not hasattr(button_ref, '_combo_callback') or not button_ref._combo_callback:
                                 # Restore from backup
                                 if combo.get('_hotkey_callback_backup'):
-                                    print("HOTKEY COMBO: Restoring lost callback from backup")
+                                    pass
                                     button_ref._combo_callback = combo['_hotkey_callback_backup']
                             # Schedule next check
                             self.window.after(2000, ensure_callback_persists)
@@ -2006,7 +1998,7 @@ class AutomationsWindow:
         if combo.get('hotkey'):
             if combo['hotkey'] in self.combo_callbacks_by_hotkey:
                 del self.combo_callbacks_by_hotkey[combo['hotkey']]
-                print(f"HOTKEY COMBO: Removed callback from registry for hotkey '{combo['hotkey']}'")
+                pass
         
         # Remove from game_text_reader.hotkeys dictionary if it exists
         hotkey_button = combo.get('hotkey_button')
@@ -2015,9 +2007,9 @@ class AutomationsWindow:
                 try:
                     self.game_text_reader.hotkeys[hotkey_button.hotkey].unhook()
                     del self.game_text_reader.hotkeys[hotkey_button.hotkey]
-                    print(f"HOTKEY COMBO: Removed from game_text_reader.hotkeys: {hotkey_button.hotkey}")
+                    pass
                 except Exception as e:
-                    print(f"HOTKEY COMBO: Error removing from game_text_reader.hotkeys: {e}")
+                    pass
         
         # Clean up hotkey hook if it exists - try multiple methods to ensure it's removed
         if hotkey_button and hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
@@ -2026,9 +2018,9 @@ class AutomationsWindow:
                 # Method 1: Remove by hotkey name (most reliable for add_hotkey)
                 try:
                     keyboard.remove_hotkey(hotkey_button.hotkey)
-                    print(f"HOTKEY COMBO: Removed hotkey '{hotkey_button.hotkey}' by name")
+                    pass
                 except Exception as e:
-                    print(f"HOTKEY COMBO: Could not remove hotkey by name: {e}")
+                    pass
                 
                 # Method 2: Remove by hook object if it exists
                 if hasattr(hotkey_button, 'keyboard_hook') and hotkey_button.keyboard_hook:
@@ -2037,27 +2029,27 @@ class AutomationsWindow:
                         if hasattr(hotkey_button.keyboard_hook, 'remove'):
                             # This is an add_hotkey hook
                             keyboard.remove_hotkey(hotkey_button.keyboard_hook)
-                            print(f"HOTKEY COMBO: Removed hotkey hook object for {combo['name']}")
+                            pass
                         else:
                             # This is a custom on_press hook or hook ID
                             keyboard.unhook(hotkey_button.keyboard_hook)
-                            print(f"HOTKEY COMBO: Unhooked custom keyboard hook for {combo['name']}")
+                            pass
                     except Exception as e:
-                        print(f"HOTKEY COMBO: Warning: Error removing hook object: {e}")
+                        pass
                     finally:
                         # Always set to None to prevent future errors
                         hotkey_button.keyboard_hook = None
             except Exception as e:
-                print(f"HOTKEY COMBO: Warning: Error cleaning up keyboard hook: {e}")
+                pass
         
         # Clean up mouse hook if it exists
         if hotkey_button and hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
             try:
                 import mouse
                 mouse.unhook(hotkey_button.mouse_hook_id)
-                print(f"HOTKEY COMBO: Removed mouse hook for {combo['name']}")
+                pass
             except Exception as e:
-                print(f"HOTKEY COMBO: Warning: Error cleaning up mouse hook: {e}")
+                pass
             finally:
                 hotkey_button.mouse_hook_id = None
         
@@ -2092,11 +2084,11 @@ class AutomationsWindow:
         """Trigger a hotkey combo - sequentially read areas with timers"""
         # Check if combo is already running - prevent re-triggering
         if combo.get('is_triggering', False):
-            print(f"HOTKEY COMBO: Already triggering {combo['name']}, ignoring duplicate trigger")
+            pass
             return
         
         if not combo['areas']:
-            print(f"HOTKEY COMBO: No areas configured for {combo['name']}")
+            print(f"[ERROR] Automations: No areas configured for {combo['name']}")
             return
         
         # Filter out invalid triggers (areas, automations, or area combos)
@@ -2156,7 +2148,7 @@ class AutomationsWindow:
                     valid_triggers.append(trigger_info)
         
         if not valid_triggers:
-            print(f"HOTKEY COMBO: No valid triggers found for {combo['name']}")
+            print(f"[ERROR] Automations: No valid triggers found for {combo['name']}")
             # Show warning dialog
             messagebox.showwarning(
                 "No Steps Configured",
@@ -2166,7 +2158,7 @@ class AutomationsWindow:
             )
             return
         
-        print(f"HOTKEY COMBO: Triggering {combo['name']} with {len(valid_triggers)} triggers")
+        pass
         # Update main window status
         self._update_main_status(f"{combo['name']} started ({len(valid_triggers)} steps)", "blue", 2000)
         # Set flag BEFORE starting to prevent race conditions
@@ -2181,7 +2173,7 @@ class AutomationsWindow:
         """Process the next area in a combo"""
         # Double-check flag is still set
         if not combo.get('is_triggering', False):
-            print(f"HOTKEY COMBO: Combo {combo['name']} is no longer triggering, stopping")
+            pass
             return
         
         valid_areas = combo.get('_valid_areas', [])
@@ -2189,14 +2181,14 @@ class AutomationsWindow:
         
         if current_index >= len(valid_areas):
             # All areas processed
-            print(f"HOTKEY COMBO: Completed {combo['name']}")
+            pass
             # Update main window status
             self._update_main_status(f"{combo['name']} completed", "green", 2000)
             # Clear flag immediately to allow re-triggering
             combo['is_triggering'] = False
             combo['current_area_index'] = 0
             combo['_valid_areas'] = []
-            print(f"HOTKEY COMBO: Flag cleared for {combo['name']}, ready for next trigger")
+            pass
             
             # Re-enable all timer entries in this combo to ensure they're editable
             def re_enable_combo_entries():
@@ -2221,14 +2213,14 @@ class AutomationsWindow:
         timer_ms = trigger_info['timer_ms']
         delay_before = trigger_info.get('delay_before', False)
         
-        print(f"HOTKEY COMBO: Processing trigger {current_index + 1}/{len(valid_areas)}: {trigger_name} (type: {trigger_type})")
+        print(f"Executing: {trigger_name} ({trigger_type})")
         # Update main window status for combo step
         combo_name = combo.get('name', 'Unknown')
         self._update_main_status(f"{combo_name}: Step {current_index + 1}/{len(valid_areas)} - {trigger_name}", "blue", 1500)
         
         # Handle delay before step if enabled
         if delay_before and timer_ms > 0:
-            print(f"HOTKEY COMBO: Delaying {timer_ms}ms BEFORE step (delay_before=True)")
+            print(f"Waiting {timer_ms}ms...")
             # Start timer countdown with progress bar for delay before
             self._start_delay_before_timer(combo, current_index, timer_ms)
             return  # Exit and let the timer callback continue execution
@@ -2241,7 +2233,7 @@ class AutomationsWindow:
             
             # Check if this is an Auto Read area - if so, trigger area selection dialog
             if area_name.startswith("Auto Read"):
-                print(f"HOTKEY COMBO: Triggering Auto Read area '{area_name}' - opening area selection dialog")
+                pass
                 # Find the area info to get area_name_var and set_area_button
                 # Match by area name (more reliable than frame reference)
                 area_name_var = None
@@ -2269,12 +2261,12 @@ class AutomationsWindow:
                     # Note: set_area_button is None for Auto Read areas, which is fine - set_auto_read_area doesn't use it
                     def trigger_auto_read():
                         try:
-                            print(f"HOTKEY COMBO: Calling set_auto_read_area for '{area_name}' (frame={found_area_frame}, area_name_var={area_name_var})")
+                            pass
                             # Use game_text_reader.root to ensure we're using the correct root window
                             self.game_text_reader.set_auto_read_area(found_area_frame, area_name_var, set_area_button)
-                            print(f"HOTKEY COMBO: set_auto_read_area call completed for '{area_name}'")
+                            pass
                         except Exception as e:
-                            print(f"HOTKEY COMBO: Error calling set_auto_read_area for '{area_name}': {e}")
+                            print(f"[ERROR] Automations: Area read failed for '{area_name}': {e}")
                             import traceback
                             traceback.print_exc()
                             # If Auto Read fails, skip to next step
@@ -2286,7 +2278,7 @@ class AutomationsWindow:
                     # The combo callback will start monitoring after read_area() is called
                     return
                 else:
-                    print(f"HOTKEY COMBO: Warning - Could not find area info for Auto Read area '{area_name}' (area_name_var={area_name_var}, set_area_button={set_area_button}, found_area_frame={found_area_frame}), skipping")
+                    pass
                     # Move to next area if we can't trigger this one
                     combo['current_area_index'] += 1
                     self.root.after(0, lambda: self._process_next_area_in_combo(combo))
@@ -2328,7 +2320,7 @@ class AutomationsWindow:
                 area_frame = trigger_info.get('area_frame')
                 if area_frame and hasattr(area_frame, '_combo_cancelled') and area_frame._combo_cancelled:
                     was_cancelled = True
-                    print(f"HOTKEY COMBO: Auto Read was cancelled for step {current_index + 1}, skipping speech wait")
+                    pass
         
         # If delay_before is True, we already handled the delay before the step, so don't delay after
         if delay_before:
@@ -2336,15 +2328,15 @@ class AutomationsWindow:
         
         if was_cancelled:
             # Auto Read was cancelled - no speech to wait for, go straight to timer
-            print(f"HOTKEY COMBO: Auto Read cancelled, starting timer immediately (if set)")
+            pass
             # Mark this step as cancelled in the combo to prevent any speech monitoring
             combo['_current_step_cancelled'] = True
             if timer_ms > 0:
-                print(f"HOTKEY COMBO: Waiting {timer_ms}ms before next area")
+                print(f"Waiting {timer_ms}ms...")
                 self._start_timer_countdown(combo, current_index, timer_ms)
             else:
                 # No timer, move to next area immediately
-                print(f"HOTKEY COMBO: Moving to next area immediately (no timer)")
+                pass
                 self._move_to_next_area(combo)
             return
         
@@ -2367,7 +2359,7 @@ class AutomationsWindow:
             # This prevents speech monitoring from continuing if cancellation happened
             if combo.get('_current_step_cancelled', False):
                 # This step was cancelled - stop speech monitoring immediately
-                print(f"HOTKEY COMBO: Step {current_index + 1} was cancelled, stopping speech monitoring checks")
+                pass
                 return
             
             # Also check the frame directly as a backup
@@ -2378,7 +2370,7 @@ class AutomationsWindow:
                     area_frame = trigger_info.get('area_frame')
                     if area_frame and hasattr(area_frame, '_combo_cancelled') and area_frame._combo_cancelled:
                         # This was cancelled - stop speech monitoring immediately
-                        print(f"HOTKEY COMBO: Detected cancellation via frame check for step {current_index + 1}, stopping speech checks")
+                        pass
                         combo['_current_step_cancelled'] = True
                         return
             
@@ -2414,15 +2406,15 @@ class AutomationsWindow:
                     # Flag says not speaking and enough time has passed - trust it and skip speech monitoring
                     # This handles cases where there's no text OR speech finished quickly
                     if speech_confirmed_started:
-                        print(f"HOTKEY COMBO: Speech finished for area {current_index + 1} (is_speaking=False after {time_since_start:.1f}s)")
+                        pass
                     else:
-                        print(f"HOTKEY COMBO: No text detected for area {current_index + 1} (is_speaking=False after {time_since_start:.1f}s), skipping speech wait")
+                        pass
                     # Go straight to timer or next step
                     if timer_ms > 0:
-                        print(f"HOTKEY COMBO: Waiting {timer_ms}ms before next area")
+                        print(f"Waiting {timer_ms}ms...")
                         self._start_timer_countdown(combo, current_index, timer_ms)
                     else:
-                        print(f"HOTKEY COMBO: Moving to next area immediately (no timer)")
+                        pass
                         self._move_to_next_area(combo)
                     return
                 # If less than 0.4s has passed and flag is False, wait a bit more
@@ -2445,14 +2437,14 @@ class AutomationsWindow:
                             running_state = status.RunningState
                             # Only print if SAPI says running (to reduce console spam when no text)
                             if running_state == 1:
-                                print(f"HOTKEY COMBO: SAPI RunningState={running_state} for area {current_index + 1}")
+                                pass
                             if running_state == 1:  # 1 = SPEVSF_RUNNING
                                 # SAPI confirms speaking - but check if flag disagrees
                                 # If is_speaking is False and enough time has passed, trust the flag
                                 # (SAPI can report "running" even when there's no text)
                                 if not self.game_text_reader.is_speaking and time_since_start > 0.6:
                                     # Flag says not speaking - trust it over SAPI (flag is more reliable)
-                                    print(f"HOTKEY COMBO: SAPI says running but is_speaking flag is False (after {time_since_start:.1f}s) - trusting flag, no text detected")
+                                    pass
                                     is_still_speaking = False
                                     speech_has_started = True
                                 else:
@@ -2461,7 +2453,7 @@ class AutomationsWindow:
                                     speech_has_started = True
                                     # Only print if flag also says speaking (to reduce spam when no text)
                                     if self.game_text_reader.is_speaking:
-                                        print(f"HOTKEY COMBO: SAPI confirms speech is running")
+                                        pass
                             else:
                                 # SAPI says not running
                                 if is_still_speaking is None:
@@ -2473,19 +2465,19 @@ class AutomationsWindow:
                                         # Very early - speech probably hasn't started yet
                                         is_still_speaking = None  # Still unknown, wait a bit more
                                         speech_has_started = False
-                                        print(f"HOTKEY COMBO: Too early ({time_since_start:.2f}s) - speech may not have started yet, waiting...")
+                                        pass
                                     elif not self.game_text_reader.is_speaking and time_since_start >= 0.8:
                                         # Flag says not speaking AND SAPI says not running AND enough time passed
                                         # This is more reliable - both agree and enough time has passed
                                         is_still_speaking = False
                                         speech_has_started = True
-                                        print(f"HOTKEY COMBO: Both flag and SAPI confirm speech complete (RunningState={running_state}, elapsed: {time_since_start:.1f}s)")
+                                        pass
                                     else:
                                         # SAPI says not running but flag might still be True or not enough time passed
                                         # Wait a bit more to be sure
                                         is_still_speaking = None  # Still unknown, wait more
                                         speech_has_started = False
-                                        print(f"HOTKEY COMBO: SAPI says not running but waiting to confirm (elapsed: {time_since_start:.2f}s, is_speaking={self.game_text_reader.is_speaking})...")
+                                        pass
                                 else:
                                     # We already knew status - but double-check flag before trusting SAPI
                                     if self.game_text_reader.is_speaking:
@@ -2494,12 +2486,12 @@ class AutomationsWindow:
                                         speech_has_started = True
                                         # Only log periodically to reduce console spam (every 0.5 seconds)
                                         if int(time_since_start * 2) % 2 == 0:
-                                            print(f"HOTKEY COMBO: Flag says speaking but SAPI says not running - trusting flag (elapsed: {time_since_start:.1f}s)")
+                                            pass
                                     else:
                                         # Both agree - speech is done
                                         is_still_speaking = False
                                         speech_has_started = True
-                                        print(f"HOTKEY COMBO: Both flag and SAPI confirm speech complete")
+                                        pass
                     except AttributeError:
                         # Status might not have RunningState, try alternative method
                         # Use WaitUntilDone with 0 timeout (non-blocking check)
@@ -2513,7 +2505,7 @@ class AutomationsWindow:
                                     # Still speaking
                                     is_still_speaking = True
                                     speech_has_started = True
-                                    print(f"HOTKEY COMBO: SAPI WaitUntilDone confirms speech is running")
+                                    pass
                                 else:
                                     # Speech is done
                                     if is_still_speaking is None:
@@ -2522,12 +2514,12 @@ class AutomationsWindow:
                                             # Too early - speech probably hasn't started
                                             is_still_speaking = None
                                             speech_has_started = False
-                                            print(f"HOTKEY COMBO: Too early ({time_since_start:.2f}s) - speech may not have started yet")
+                                            pass
                                         else:
                                             # Enough time passed - speech is done
                                             is_still_speaking = False
                                             speech_has_started = True
-                                            print(f"HOTKEY COMBO: SAPI WaitUntilDone reports speech complete")
+                                            pass
                                     else:
                                         is_still_speaking = False
                                         speech_has_started = True
@@ -2557,25 +2549,25 @@ class AutomationsWindow:
             # Check for stuck SAPI state - if SAPI has been reporting "running" for too long, force continue
             # This handles cases where SAPI gets stuck in a running state even though speech finished
             if is_still_speaking and speech_has_started and time_since_start >= max_wait_for_stuck_sapi:
-                print(f"HOTKEY COMBO: SAPI stuck detection - been reporting 'running' for {time_since_start:.1f}s (max: {max_wait_for_stuck_sapi}s)")
-                print(f"HOTKEY COMBO: is_speaking flag = {self.game_text_reader.is_speaking}")
+                pass
+                pass
                 # If the is_speaking flag is False but SAPI says running, trust the flag (it's more reliable)
                 if not self.game_text_reader.is_speaking:
-                    print(f"HOTKEY COMBO: is_speaking flag is False but SAPI says running - trusting flag and continuing")
+                    pass
                     is_still_speaking = False
                 else:
                     # Both say running but it's been too long - force continue anyway
-                    print(f"HOTKEY COMBO: Forcing continue due to stuck SAPI state (clearing flags)")
+                    pass
                     self.game_text_reader.is_speaking = False
                     is_still_speaking = False
                     speech_has_started = True
             
             # Check timeout - if we've been waiting too long, force continue regardless of SAPI status
             if time_since_start >= max_wait_for_speech_finish:
-                print(f"HOTKEY COMBO: Timeout reached ({max_wait_for_speech_finish}s) for area {current_index + 1}, forcing continue...")
+                pass
                 # Force clear the speaking flag to prevent getting stuck
                 if self.game_text_reader.is_speaking:
-                    print(f"HOTKEY COMBO: Clearing stuck is_speaking flag due to timeout")
+                    pass
                     self.game_text_reader.is_speaking = False
                 # Continue to next area despite timeout
                 is_still_speaking = False
@@ -2585,9 +2577,9 @@ class AutomationsWindow:
             if is_still_speaking is None or (not speech_has_started and time_since_start < max_wait_for_speech_start):
                 # Speech status unknown or hasn't started yet, wait a bit longer
                 if is_still_speaking is None:
-                    print(f"HOTKEY COMBO: Speech status unknown for area {current_index + 1}, waiting... (elapsed: {time_since_start:.2f}s)")
+                    pass
                 else:
-                    print(f"HOTKEY COMBO: Speech hasn't started yet for area {current_index + 1}, waiting... (elapsed: {time_since_start:.2f}s)")
+                    pass
                 self.root.after(100, check_speech_and_continue)
                 return
             
@@ -2595,26 +2587,26 @@ class AutomationsWindow:
                 # Still speaking - wait for it to finish
                 # Only log periodically to reduce console spam (every 1 second)
                 if int(time_since_start * 10) % 10 == 0:  # Log roughly every 1 second
-                    print(f"HOTKEY COMBO: Still speaking area {current_index + 1}... (waited {time_since_start:.1f}s)")
+                    pass
                 self.root.after(100, check_speech_and_continue)
             else:
                 # Speech appears to be done - but only start timer if we confirmed speech started first
                 # This prevents starting timer too early if speech hasn't actually started yet
                 if not speech_confirmed_started and time_since_start < max_wait_for_speech_start:
                     # Speech hasn't started yet - wait a bit more
-                    print(f"HOTKEY COMBO: Speech hasn't started yet for area {current_index + 1}, waiting... (elapsed: {time_since_start:.2f}s)")
+                    pass
                     self.root.after(100, check_speech_and_continue)
                     return
                 
                 # Speech is done (or never started and enough time passed) - NOW start the timer
-                print(f"HOTKEY COMBO: Speech confirmed done for area {current_index + 1}")
+                pass
                 if timer_ms > 0:
-                    print(f"HOTKEY COMBO: Waiting {timer_ms}ms before next area")
+                    print(f"Waiting {timer_ms}ms...")
                     # Start timer countdown with progress bar
                     self._start_timer_countdown(combo, current_index, timer_ms)
                 else:
                     # No timer, move to next area immediately
-                    print(f"HOTKEY COMBO: Moving to next area immediately (no timer)")
+                    pass
                     self._move_to_next_area(combo)
         
         # Start checking after a short delay (give speech time to start)
@@ -2691,7 +2683,7 @@ class AutomationsWindow:
                     except:
                         pass  # Widget was destroyed
                 
-                print(f"HOTKEY COMBO: Delay before step complete, continuing with step execution")
+                pass
                 # Continue with step execution directly (avoid infinite loop)
                 # Get the trigger info and execute the step without checking delay_before again
                 valid_areas = combo.get('_valid_areas', [])
@@ -2731,7 +2723,7 @@ class AutomationsWindow:
                                 found_area_frame._combo_cancelled = False
                                 self.root.after(0, lambda: self.game_text_reader.set_auto_read_area(found_area_frame, set_area_button))
                             else:
-                                print(f"HOTKEY COMBO: Auto Read area '{area_name}' not found, moving to next area")
+                                pass
                                 self._move_to_next_area(combo)
                         else:
                             # Regular area
@@ -2987,11 +2979,12 @@ class AutomationsWindow:
         self.root.after(0, self._update_polling_button_state)
         
         # Clear monitoring status from main window if no other message is showing
-        if hasattr(self.game_text_reader, 'status_label'):
+        # Clear monitoring status from main window (Top Label - was moved from status_label)
+        if hasattr(self.game_text_reader, 'hotkey_status_label'):
             try:
-                current_text = self.game_text_reader.status_label.cget('text')
+                current_text = self.game_text_reader.hotkey_status_label.cget('text')
                 if current_text == "Area monitoring is active":
-                    self.game_text_reader.status_label.config(text="", font=("Helvetica", 10))
+                    self.game_text_reader.hotkey_status_label.config(text="", font=("Helvetica", 10))
             except:
                 pass
         

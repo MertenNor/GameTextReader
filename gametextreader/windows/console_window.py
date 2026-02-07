@@ -4,6 +4,7 @@ Debug console window for viewing logs and processed images
 import datetime
 import os
 import re
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
@@ -13,7 +14,8 @@ MAX_LOG_BUFFER_SIZE = 10 * 1024 * 1024
 
 
 class ConsoleWindow:
-    def __init__(self, root, log_buffer, layout_file_var, latest_images, latest_area_name_var):
+    def __init__(self, root, log_buffer, layout_file_var, latest_images, latest_area_name_var, game_reader=None):
+        self.game_reader = game_reader
         self.window = tk.Toplevel(root)
         self.window.title("Debug Console")
         
@@ -26,7 +28,7 @@ class ConsoleWindow:
             if os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
-            print(f"Error setting console window icon: {e}")
+            pass
         
         self.latest_images = latest_images
         self.window.geometry("690x500")  # Initial size, will adjust based on image
@@ -101,7 +103,7 @@ class ConsoleWindow:
                     url = 'https://' + url
                 webbrowser.open(url)
             except Exception as e:
-                print(f"Error opening URL: {e}")
+                print(f"[ERROR] Console: URL open failed: {e}")
         
         self.text_widget.tag_bind('url', '<Button-1>', open_url)
         # Change cursor to hand when hovering over links
@@ -186,57 +188,77 @@ class ConsoleWindow:
                 from ..core.game_text_reader import GameTextReader
                 
                 # Get the game_text_reader instance to access original images and settings
-                game_text_reader = None
+                game_text_reader = getattr(self, 'game_reader', None)
                 
-                # Try multiple ways to find the game_text_reader instance
-                try:
-                    # Method 1: Look through top-level windows
-                    for widget in self.window.winfo_toplevel().winfo_children():
-                        if hasattr(widget, 'original_images'):
-                            game_text_reader = widget
-                            break
-                    
-                    # Method 2: If not found, try to get from the window's master
-                    if not game_text_reader and hasattr(self.window, 'master'):
-                        parent = self.window.master
-                        while parent:
-                            if hasattr(parent, 'original_images'):
-                                game_text_reader = parent
+                # Try multiple ways to find the game_text_reader instance if not provided directly
+                if not game_text_reader:
+                    try:
+                        # Method 1: Look through top-level windows
+                        for widget in self.window.winfo_toplevel().winfo_children():
+                            if hasattr(widget, 'original_images') and not str(type(widget)).count('OpNamespace'):
+                                game_text_reader = widget
                                 break
-                            parent = parent.master
-                    
-                    # Method 3: Try to access global reference if available
-                    if not game_text_reader:
-                        import sys
-                        for module_name in sys.modules:
-                            module = sys.modules[module_name]
-                            if hasattr(module, 'game_text_reader_instance'):
-                                game_text_reader = module.game_text_reader_instance
-                                break
-                                
-                except Exception as e:
-                    # Only print error once, not every time
-                    if not hasattr(self, '_error_printed'):
-                        print(f"[DEBUG] Error finding game_text_reader: {e}")
-                        self._error_printed = True
+                        
+                        # Method 2: If not found, try to get from the window's master
+                        if not game_text_reader and hasattr(self.window, 'master'):
+                            parent = self.window.master
+                            while parent:
+                                if hasattr(parent, 'original_images') and not str(type(parent)).count('OpNamespace'):
+                                    game_text_reader = parent
+                                    break
+                                parent = parent.master
+                        
+                        # Method 3: Try to access global reference if available
+                        if not game_text_reader:
+                            import sys
+                            for module_name in list(sys.modules.keys()):
+                                # Skip torch and other libraries that might have dynamic attributes causing false positives
+                                if 'torch' in module_name or 'cv2' in module_name or 'numpy' in module_name:
+                                    continue
+                                    
+                                try:
+                                    module = sys.modules[module_name]
+                                    if hasattr(module, 'game_text_reader_instance'):
+                                        candidate = module.game_text_reader_instance
+                                        # Verify it's not an OpNamespace object (common torch artifact that implements __getattr__)
+                                        if candidate and not str(type(candidate)).count('OpNamespace'):
+                                            game_text_reader = candidate
+                                            break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
                 
                 # Only print debug info once
                 if not hasattr(self, '_debug_printed'):
-                    print(f"[DEBUG] game_text_reader found: {game_text_reader is not None}")
                     if game_text_reader:
-                        print(f"[DEBUG] Area '{area_name}' in original_images: {area_name in game_text_reader.original_images}")
-                        print(f"[DEBUG] Available areas: {list(game_text_reader.original_images.keys())}")
+                        try:
+                            # Use hasattr+isinstance check before accessing to prevent crash on proxy objects
+                            has_orig = hasattr(game_text_reader, 'original_images') and isinstance(game_text_reader.original_images, dict)
+                            if not has_orig:
+                                pass
+                        except Exception:
+                            pass
                     self._debug_printed = True
                 
-                if game_text_reader and area_name in game_text_reader.original_images:
+                # Safety check: ensure game_text_reader has the expected attribute
+                # (Prevents AttributeError: '_OpNamespace' object has no attribute 'original_images')
+                is_valid_reader = False
+                if game_text_reader:
+                    try:
+                        # Just checking hasattr might not be enough if it's a weird proxy object that errors on getattr check
+                        if hasattr(game_text_reader, 'original_images') and isinstance(game_text_reader.original_images, dict):
+                            is_valid_reader = True
+                    except Exception:
+                        pass
+                
+                if is_valid_reader and area_name in game_text_reader.original_images:
                     # Use original image and process fresh (like preview window)
                     original_image = game_text_reader.original_images[area_name]
                     settings = game_text_reader.processing_settings.get(area_name, {})
                     
-                    print(f"[DEBUG] Processing settings for {area_name}: {settings}")
-                    print(f"[DEBUG] Color mask enabled: {settings.get('color_mask_enabled', False)}")
-                    print(f"[DEBUG] Color mask color: {settings.get('color_mask_color', '#FF0000')}")
-                    print(f"[DEBUG] Color mask tolerance: {settings.get('color_mask_tolerance', 15)}")
+                    
+
                     
                     try:
                         image = preprocess_image(
@@ -255,9 +277,9 @@ class ConsoleWindow:
                             color_mask_background=settings.get('color_mask_background', 'black'),
                             color_mask_position=settings.get('color_mask_position', 'after')
                         )
-                        print(f"[DEBUG] Image processed successfully")
+                        # print(f"[DEBUG] Image processed successfully")
                     except Exception as e:
-                        print(f"[ERROR] Failed to process image: {e}")
+                        print(f"[ERROR] Console: Image processing failed: {e}")
                         import traceback
                         traceback.print_exc()
                         # Fallback to stored image
@@ -372,6 +394,13 @@ class ConsoleWindow:
 
     def write(self, message):
         """Write to the console buffer and update UI if window exists"""
+        # Write to original stdout if available (to show in terminal/IDE)
+        if hasattr(sys, 'stdout_original'):
+            try:
+                sys.stdout_original.write(message)
+            except Exception:
+                pass
+
         # Always write to the buffer, even if window is closed
         # Check buffer size and truncate if too large to prevent memory issues
         try:
@@ -397,7 +426,11 @@ class ConsoleWindow:
                 self.update_image_display()
 
     def flush(self):
-        pass
+        if hasattr(sys, 'stdout_original'):
+            try:
+                sys.stdout_original.flush()
+            except Exception:
+                pass
 
     def save_log(self):
         # Get the current date and time
@@ -410,7 +443,7 @@ class ConsoleWindow:
         if file_path:
             with open(file_path, 'w') as f:
                 f.write(self.log_buffer.getvalue())
-            print(f"Log saved to {file_path}\n--------------------------")
+            print("Console: Log saved.")
      
             
     def save_image(self):
@@ -433,7 +466,7 @@ class ConsoleWindow:
         )
         if file_path:
             latest_image.save(file_path, "PNG")
-            print(f"Image saved to {file_path}\n--------------------------")
+            print("Console: Image saved.")
 
     def clear_console(self):
         """Clear the console text widget and log buffer"""
@@ -450,7 +483,7 @@ class ConsoleWindow:
         self.log_buffer.truncate(0)
         
         # Add a confirmation message
-        print("Console cleared.\n--------------------------")
+        print("Console: Cleared.")
     
     def _insert_text_with_urls(self, text_widget, text, url_pattern):
         """Insert text and make URLs clickable"""

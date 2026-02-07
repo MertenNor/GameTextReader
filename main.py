@@ -8,14 +8,41 @@ import tempfile
 import datetime
 from tkinter import messagebox
 
+
+import sys
+import subprocess
 import tkinter as tk
+
+# Monkey-patch subprocess.Popen to prevent console window flashing on Windows
+if sys.platform.startswith('win'):
+    _original_Popen = subprocess.Popen
+    
+    class Popen(_original_Popen):
+        def __init__(self, *args, **kwargs):
+            # Force CREATE_NO_WINDOW flag
+            if 'creationflags' not in kwargs:
+                kwargs['creationflags'] = 0
+            kwargs['creationflags'] |= 0x08000000  # CREATE_NO_WINDOW
+            
+            # Ensure STARTUPINFO hides window if not explicitly provided
+            if 'startupinfo' not in kwargs:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs['startupinfo'] = si
+                
+            super().__init__(*args, **kwargs)
+            
+    subprocess.Popen = Popen
+
+# Rest of imports
 from PIL import Image, ImageTk
 
 from gametextreader.constants import (
     APP_NAME, APP_VERSION, APP_DOCUMENTS_DIR, APP_LAYOUTS_DIR,
     APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_FILENAME
 )
-from gametextreader.core.game_text_reader import GameTextReader, show_thinkr_warning, show_hotkey_conflict_warning
+
 
 # Try to import tkinterdnd2 for drag and drop functionality
 try:
@@ -23,7 +50,78 @@ try:
     TKDND_AVAILABLE = True
 except ImportError:
     TKDND_AVAILABLE = False
-    print("Warning: tkinterdnd2 not available. Drag and drop functionality will be disabled.")
+    # Warning: tkinterdnd2 not available. Drag and drop functionality disabled.
+    pass
+
+import inspect
+
+# Try to import PyInstaller splash screen support
+try:
+    import pyi_splash
+    SPLASH_AVAILABLE = True
+except ImportError:
+    SPLASH_AVAILABLE = False
+
+
+def setup_logging():
+    """Sets up logging to a file in the user's documents folder"""
+    try:
+        # Create log directory if it doesn't exist
+        log_dir = os.path.join(APP_DOCUMENTS_DIR, "Logs")
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+            
+        log_file_path = os.path.join(log_dir, "debug_log.txt")
+        
+        # Open file in append mode
+        log_file = open(log_file_path, "a", encoding="utf-8")
+        
+        # Write session separator
+        log_file.write(f"\n{'='*60}\n")
+        log_file.write(f"SESSION START: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"APP VERSION:  {APP_VERSION}\n")
+        log_file.write(f"PLATFORM:     {sys.platform}\n")
+        log_file.write(f"{'='*60}\n\n")
+        log_file.flush()
+        
+        class Tee(object):
+            def __init__(self, file, stream):
+                self.file = file
+                self.stream = stream
+            def write(self, data):
+                if data:
+                    try:
+                        self.file.write(data)
+                        self.file.flush()
+                    except:
+                        pass
+                    if self.stream:
+                        try:
+                            self.stream.write(data)
+                        except:
+                            pass
+            def flush(self):
+                try:
+                    self.file.flush()
+                except:
+                    pass
+                if self.stream:
+                    try:
+                        self.stream.flush()
+                    except:
+                        pass
+
+        # Redirect stdout and stderr to both the console (if any) and the log file
+        sys.stdout = Tee(log_file, sys.stdout)
+        sys.stderr = Tee(log_file, sys.stderr)
+    except Exception as e:
+        print(f"CRITICAL: Failed to initialize logging: {e}")
+
+# Logging will be initialized after the loading window is shown
+# This ensures the loading window appears as fast as possible
+
+
+
 
 
 def migrate_legacy_settings_file(root=None, app=None):
@@ -59,9 +157,8 @@ def migrate_legacy_settings_file(root=None, app=None):
                     continue
                 try:
                     shutil.copy2(src_file, dst_file)
-                    print(f"Copied legacy file {name} to {dst_file}")
-                except Exception as e:
-                    print(f"Warning: Failed to copy {name}: {e}")
+                except Exception:
+                    pass
 
         os.makedirs(APP_DOCUMENTS_DIR, exist_ok=True)
         new_path = APP_SETTINGS_PATH
@@ -395,16 +492,15 @@ def migrate_legacy_settings_file(root=None, app=None):
         if selected_path and os.path.exists(selected_path):
             # Always copy/rename the legacy settings into the new filename
             shutil.copy2(selected_path, new_path)
-            print(f"Migrated legacy settings file from {selected_path} to {new_path}")
+            # Migrated legacy settings
             copied_settings = True
             # Remove legacy filename if it's different from the new one
             legacy_name = os.path.basename(selected_path)
             if legacy_name != APP_SETTINGS_FILENAME:
                 try:
                     os.remove(selected_path)
-                    print(f"Removed old settings file: {selected_path}")
-                except Exception as e:
-                    print(f"Warning: Copied settings but could not delete old file {selected_path}: {e}")
+                except Exception:
+                    pass
         elif selected_path and not os.path.exists(selected_path):
             print(f"Selected legacy settings file not found at {selected_path}, skipping settings copy.")
 
@@ -446,9 +542,8 @@ def migrate_legacy_settings_file(root=None, app=None):
                     try:
                         os.makedirs(APP_LAYOUTS_DIR, exist_ok=True)
                         copy_directory_contents(legacy_layouts, APP_LAYOUTS_DIR)
-                        print(f"Copied legacy layouts from {legacy_layouts} to {APP_LAYOUTS_DIR}")
-                    except Exception as e:
-                        print(f"Warning: Failed to copy legacy layouts from {legacy_layouts}: {e}")
+                    except Exception:
+                        pass
                 else:
                     sibling_layouts = os.path.join(os.path.dirname(d), "GameReader", "Layouts")
                     if os.path.isdir(sibling_layouts):
@@ -456,11 +551,10 @@ def migrate_legacy_settings_file(root=None, app=None):
                         try:
                             os.makedirs(APP_LAYOUTS_DIR, exist_ok=True)
                             copy_directory_contents(sibling_layouts, APP_LAYOUTS_DIR)
-                            print(f"Copied legacy layouts from {sibling_layouts} to {APP_LAYOUTS_DIR}")
-                        except Exception as e:
-                            print(f"Warning: Failed to copy legacy layouts from sibling folder {sibling_layouts}: {e}")
+                        except Exception:
+                            pass
             if not found_layouts:
-                print("No legacy Layouts folder found to copy.")
+                pass
 
         if asset_dirs_to_copy and copy_units:
             found_units = False
@@ -571,6 +665,7 @@ def main():
     root.withdraw()
     
     # Create loading window as a Toplevel of the main root
+    # This happens BEFORE any heavy imports to show the window as fast as possible
     loading_window = tk.Toplevel(root)
     loading_window.title("Loading")
     loading_window.geometry("200x100")
@@ -582,34 +677,47 @@ def main():
     loading_window.geometry(f"300x100+{x}+{y}")
     # Remove window decorations for a cleaner look
     loading_window.overrideredirect(True)
+    loading_window.configure(bg='black')
     
-    # Add top border bar
-    top_border = tk.Frame(loading_window, bg="#545252", height=2)
-    top_border.pack(fill=tk.X, side=tk.TOP)
-    
-    # Load and display logo
+    # Load and display splash image
     try:
-        icon_path = os.path.join(os.path.dirname(__file__), 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            # Load icon and resize to 25x25px
-            icon_img = Image.open(icon_path)
-            icon_img = icon_img.resize((40, 40), Image.Resampling.LANCZOS)
-            icon_photo = ImageTk.PhotoImage(icon_img)
-            logo_label = tk.Label(loading_window, image=icon_photo)
-            logo_label.image = icon_photo  # Keep a reference
-            logo_label.pack(pady=(15, 5))
+        splash_path = os.path.join(os.path.dirname(__file__), 'Assets', 'splash.png')
+        if os.path.exists(splash_path):
+            # Load splash image
+            splash_img = Image.open(splash_path)
+            # Ensure it matches window size exactly
+            splash_img = splash_img.resize((300, 100), Image.Resampling.LANCZOS)
+            splash_photo = ImageTk.PhotoImage(splash_img)
+            
+            splash_label = tk.Label(loading_window, image=splash_photo, borderwidth=0, highlightthickness=0)
+            splash_label.image = splash_photo  # Keep a reference
+            splash_label.pack(fill="both", expand=True)
+        else:
+            # Fallback if splash image is missing
+            tk.Label(loading_window, text=f"Loading {APP_NAME}...", fg="white", bg="black", font=("Helvetica", 12)).pack(expand=True)
     except Exception as e:
-        print(f"Error loading logo for loading window: {e}")
+        print(f"Error loading splash image for loading window: {e}")
+        # Fallback
+        tk.Label(loading_window, text=f"Loading {APP_NAME}...", fg="white", bg="black", font=("Helvetica", 12)).pack(expand=True)
     
-    # Create label with loading text
-    loading_label = tk.Label(loading_window, text=f"Loading {APP_NAME}...", font=("Helvetica", 12, "bold"))
-    loading_label.pack(expand=True)
-    
-    # Add bottom border bar
-    bottom_border = tk.Frame(loading_window, bg="#545252", height=2)
-    bottom_border.pack(fill=tk.X, side=tk.BOTTOM)
-    
+    # Force the loading window to appear NOW before any heavy imports
     loading_window.update()
+    loading_window.lift()
+    loading_window.focus_force()
+    
+    # Close PyInstaller splash screen now that our loading window is visible
+    if SPLASH_AVAILABLE:
+        try:
+            pyi_splash.close()
+        except Exception:
+            pass
+    
+    # Initialize logging after the loading window is shown
+    setup_logging()
+    
+    # Import GameTextReader here to allow loading window to appear first
+    # This delays the loading of heavy dependencies (OCR, TTS, etc.) until after UI is shown
+    from gametextreader.core.game_text_reader import GameTextReader
     
     # Set the window icon
     try:
@@ -640,6 +748,16 @@ def main():
     
     # Now show the window at the correct size
     app.root.deiconify()
+    
+    # Force hotkey re-registration after window is shown to ensure hotkeys work immediately
+    # This fixes the issue where hotkeys don't work until a window is opened and closed
+    # Delay of 1000ms ensures layout loading is complete before restoring hotkeys
+    def enable_hotkeys_after_startup():
+        from gametextreader.utils import InputManager
+        InputManager.allow()
+        app.restore_all_hotkeys()
+    
+    app.root.after(1000, enable_hotkeys_after_startup)
     
     # Check if Tesseract OCR is installed and show warning if not
     def check_tesseract_on_startup():
@@ -678,7 +796,6 @@ def main():
         def load_last_layout():
             try:
                 app._load_layout_file(last_layout_path)
-                print(f"Loaded last layout on startup: {last_layout_path}")
             except Exception as e:
                 print(f"Warning: Failed to load last layout on startup: {e}")
         # Schedule layout loading after a short delay to ensure window is ready

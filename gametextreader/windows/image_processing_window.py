@@ -22,7 +22,7 @@ class ImageProcessingWindow:
             if os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
-            print(f"Error setting image processing window icon: {e}")
+            pass
         
         self.area_name = area_name
         self.latest_images = latest_images
@@ -47,9 +47,9 @@ class ImageProcessingWindow:
                 self.original_image.load()  # Test if image is still valid
                 self.image = self.original_image.copy()  # Start with original, not processed
                 self.using_fallback_original = False
-                print(f"Using original image for preview: {area_name}")
+                pass
             except (ValueError, AttributeError):
-                print(f"Original image closed, using latest_images for: {area_name}")
+                pass
                 self.image = latest_images[area_name].copy()
                 self.original_image = self.image.copy()
                 self.using_fallback_original = True
@@ -73,41 +73,41 @@ class ImageProcessingWindow:
                     fresh_capture = capture_screen_area(x1, y1, x2, y2)
                     self.original_image = fresh_capture
                     self.using_fallback_original = False
-                    print(f"Captured fresh original image for {area_name}")
+                    pass
                 else:
                     raise Exception("Area coordinates not found")
                     
             except Exception as e:
-                print(f"Could not capture fresh original image for {area_name}: {e}")
+                print(f"[ERROR] Image Processing: Fresh capture failed: {e}")
                 # Fallback: use current processed image (but mark as fallback)
                 self.original_image = self.image.copy()
                 self.using_fallback_original = True
-                print(f"Warning: Using processed image as fallback for {area_name} - no true original available")
+                pass
         
         # Create a copy for processed image (with error handling for closed images)
         try:
             self.processed_image = self.image.copy()  # Start with the processed image that was used for OCR
         except Exception as e:
-            print(f"Warning: Could not copy processed image (may be closed): {e}")
+            pass
             # Try to reload from original if available
             if hasattr(self, 'original_image') and self.original_image:
                 try:
                     self.processed_image = self.original_image.copy()
                     self.image = self.original_image.copy()
-                    print("Reloaded image from original")
+                    pass
                 except Exception as e2:
-                    print(f"Error: Could not reload from original: {e2}")
+                    print(f"[ERROR] Image Processing: Reload failed: {e2}")
                     # Create a blank fallback image
                     from PIL import Image
                     self.processed_image = Image.new('RGB', (100, 100), color='white')
                     self.image = Image.new('RGB', (100, 100), color='white')
-                    print("Created blank fallback image")
+                    pass
             else:
                 # Create a blank fallback image
                 from PIL import Image
                 self.processed_image = Image.new('RGB', (100, 100), color='white')
                 self.image = Image.new('RGB', (100, 100), color='white')
-                print("Created blank fallback image")
+                pass
         
         # Toggle state for reset button
         self.showing_original = False
@@ -343,7 +343,7 @@ class ImageProcessingWindow:
         # Calculate grid position (7 columns per row so all fit in one row)
         row = position // 7
         col = position % 7
-        print(f"Creating slider '{label}' at position {position} -> row {row}, col {col}")
+        pass
         
         # Create slider directly in scrollable frame without extra frame
         label_frame = ttk.Frame(self.scrollable_frame, relief='solid', borderwidth=1)
@@ -615,7 +615,7 @@ class ImageProcessingWindow:
                 self.color_button.config(bg=hex_color)
                 self.update_image()
         except Exception as e:
-            print(f"Error picking color: {e}")
+            print(f"[ERROR] Image Processing: Color picker failed: {e}")
     
     def clear_color_mask(self):
         """Clear the color mask"""
@@ -649,7 +649,7 @@ class ImageProcessingWindow:
                 picker_window.destroy()
                 
         except Exception as e:
-            print(f"Error confirming color selection: {e}")
+            print(f"[ERROR] Image Processing: Selection confirmation failed: {e}")
 
     def pick_color_from_image(self):
         """Open a new window to pick color from the image"""
@@ -666,7 +666,7 @@ class ImageProcessingWindow:
                 if os.path.exists(icon_path):
                     picker_window.iconbitmap(icon_path)
             except Exception as e:
-                print(f"Error setting color picker window icon: {e}")
+                pass
             
             # Center the window
             picker_window.update_idletasks()
@@ -860,7 +860,7 @@ class ImageProcessingWindow:
                         picker_window.destroy()
                         
                 except Exception as e:
-                    print(f"Error picking color: {e}")
+                    print(f"[ERROR] Image Processing: Color picker failed: {e}")
             
             # Function to handle mouse motion for live preview
             def on_mouse_motion(event):
@@ -959,7 +959,7 @@ class ImageProcessingWindow:
             picker_window.focus_set()
             
         except Exception as e:
-            print(f"Error opening color picker window: {e}")
+            print(f"[ERROR] Image Processing: Window open failed: {e}")
             if 'picker_window' in locals():
                 picker_window.destroy()
         
@@ -1073,7 +1073,7 @@ class ImageProcessingWindow:
         # Update to show the new state
         self.update_image()
         
-        print("Reset edits - unedited image copied to replace edited image")
+        pass
 
     def reset_all(self):
         """Reset all sliders to default values and show processed image"""
@@ -1254,7 +1254,7 @@ class ImageProcessingWindow:
                             game_text_reader.root.after_cancel(game_text_reader._feedback_timer)
                         game_text_reader._feedback_timer = game_text_reader.root.after(2000, lambda: game_text_reader.status_label.config(text=""))
                 except Exception as e:
-                    print(f"Warning: Could not auto-save layout file: {e}")
+                    print(f"[ERROR] Auto-save: {e}")
                     # Still show success message since settings are saved in memory
                     if hasattr(game_text_reader, 'status_label'):
                         game_text_reader.status_label.config(text="Settings saved (layout file not available)", fg="orange")
@@ -1288,7 +1288,7 @@ class ImageProcessingWindow:
                         game_text_reader.root.after_cancel(game_text_reader._feedback_timer)
                     game_text_reader._feedback_timer = game_text_reader.root.after(2000, lambda: game_text_reader.status_label.config(text=""))
             except Exception as e:
-                print(f"Warning: Could not auto-save layout file: {e}")
+                print(f"[ERROR] Auto-save: {e}")
                 # Still show success message since settings are saved in memory
                 if hasattr(game_text_reader, 'status_label'):
                     game_text_reader.status_label.config(text="Settings saved (layout file not available)", fg="orange")

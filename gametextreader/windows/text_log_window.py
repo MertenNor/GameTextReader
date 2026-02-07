@@ -29,7 +29,7 @@ class TextLogWindow:
             if os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
-            print(f"Error setting Scan History window icon: {e}")
+            pass
         
         # Center the window
         self.window.update_idletasks()
@@ -281,7 +281,7 @@ class TextLogWindow:
                     voice_display_names.append(display_name)
                     voice_full_names[display_name] = full_name
             except Exception as e:
-                print(f"Error getting voices for dropdown: {e}")
+                print(f"[ERROR] Scan History: Voice lookup failed: {e}")
         
         # Find current voice in list
         current_voice = entry.get('voice', None)
@@ -447,7 +447,7 @@ class TextLogWindow:
         # If no voice is selected, show error
         if not has_voice:
             messagebox.showerror("Error", "No voice selected. Please select a voice.")
-            print("Error: Did not speak, Reason: No voice selected in scan history window.")
+            print("[ERROR] Scan History: No voice selected.")
             return
         
         # Prioritize voice from entry (scan history window selection) over area voice
@@ -498,7 +498,7 @@ class TextLogWindow:
                                 loop.run_until_complete(self.game_text_reader._speak_with_uwp(text, preferred_desc=voice_to_use))
                                 return
                             except Exception as e:
-                                print(f"UWP fallback failed: {e}")
+                                print(f"[ERROR] Scan History: UWP fallback failed: {e}")
                             finally:
                                 # Restore previous event loop
                                 if old_loop is not None:
@@ -523,7 +523,7 @@ class TextLogWindow:
                         # Regular SAPI voice
                         self.game_text_reader.speaker.Voice = selected_voice
                 except Exception as e:
-                    print(f"Error setting voice: {e}")
+                    print(f"[ERROR] Scan History: Voice set failed: {e}")
             elif selected_voice == "mock_voice" and _ensure_uwp_available():
                 # Mock voice - use UWP
                 loop = None
@@ -538,7 +538,7 @@ class TextLogWindow:
                     loop.run_until_complete(self.game_text_reader._speak_with_uwp(text, preferred_desc=voice_to_use))
                     return
                 except Exception as e:
-                    print(f"UWP fallback failed: {e}")
+                    print(f"[ERROR] Scan History: UWP fallback failed: {e}")
                 finally:
                     # Restore previous event loop
                     if old_loop is not None:
@@ -594,17 +594,17 @@ class TextLogWindow:
             self.game_text_reader.paused_position = 0
             self.game_text_reader.is_speaking = True
             self.game_text_reader.speaker.Speak(text, 1)  # 1 is SVSFlagsAsync
-            print(f"Playing text from area '{area_name}'")
+            print(f"[NOTE] Scan History: Playing area '{area_name}'")
             # Start monitoring speech completion
             self.game_text_reader._start_speech_monitor()
         except Exception as e:
-            print(f"Error playing text: {e}")
+            print(f"[ERROR] Scan History: Play failed: {e}")
             self.game_text_reader.is_speaking = False
     
     def repeat_latest_area_text(self):
         """Repeat the latest area text from the Scan History."""
         if not hasattr(self.game_text_reader, 'text_log_history') or not self.game_text_reader.text_log_history:
-            print("No Scan History available to repeat.")
+            print("[NOTE] Scan History: No entries available.")
             return
         
         # Get the latest entry (last one in the list)

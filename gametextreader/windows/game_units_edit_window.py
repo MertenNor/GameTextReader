@@ -28,7 +28,7 @@ class GameUnitsEditWindow:
             if os.path.exists(icon_path):
                 self.window.iconbitmap(icon_path)
         except Exception as e:
-            print(f"Error setting game units editor icon: {e}")
+            pass
         
         # Center the window
         self.window.update_idletasks()
@@ -103,7 +103,7 @@ class GameUnitsEditWindow:
                     voice_display_names.append(display_name)
                     voice_full_names[display_name] = full_name
             except Exception as e:
-                print(f"Warning: Could not get voice descriptions: {e}")
+                print(f"[WARNING] Game Units Editor: Voice lookup failed: {e}")
         
         # Set default to first voice or fallback
         default_voice_display = voice_display_names[0] if voice_display_names else "No voices available"
@@ -249,7 +249,7 @@ class GameUnitsEditWindow:
             else:
                 return {}
         except Exception as e:
-            print(f"Error loading case-sensitive settings: {e}")
+            print(f"[ERROR] Game Units Editor: Load failed: {e}")
             return {}
     
     def save_case_sensitive_settings(self, case_sensitive_dict):
@@ -264,7 +264,7 @@ class GameUnitsEditWindow:
                 json.dump(case_sensitive_dict, f, indent=4, ensure_ascii=False)
                 
         except Exception as e:
-            print(f"Error saving case-sensitive settings: {e}")
+            print(f"[ERROR] Game Units Editor: Save failed: {e}")
     
     def populate_entries(self):
         """Populate the scrollable frame with existing game units."""
@@ -512,7 +512,7 @@ class GameUnitsEditWindow:
             # Speak the text
             self.current_speaker.Speak(text, 1)  # 1 is SVSFlagsAsync
         except Exception as e:
-            print(f"Error speaking text: {e}")
+            print(f"[ERROR] Game Units Editor: Play failed: {e}")
             messagebox.showerror("Error", f"Could not read text: {e}")
     
     def stop_speech(self):
@@ -522,7 +522,7 @@ class GameUnitsEditWindow:
                 self.current_speaker.Speak("", 2)  # 2 is SVSFPurgeBeforeSpeak
                 self.current_speaker = None
         except Exception as e:
-            print(f"Error stopping speech: {e}")
+            print(f"[ERROR] Game Units Editor: Stop failed: {e}")
         
         # Also stop main window speech if needed
         if hasattr(self.game_text_reader, 'stop_speaking'):
@@ -608,7 +608,7 @@ class GameUnitsEditWindow:
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save game units: {str(e)}")
-            print(f"Error saving game units: {e}")
+            print(f"[ERROR] Game Units Editor: Save failed: {e}")
     
     def cancel_edit(self):
         """Cancel editing and close the window."""
