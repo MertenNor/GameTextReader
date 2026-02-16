@@ -379,6 +379,8 @@ class AutomationsWindow:
             font=("Helvetica", 10)
         )
         self.set_hotkey_button.pack(side='left', padx=(10, 0))
+        self.set_hotkey_button.bind("<Button-3>", lambda e: self.game_text_reader._show_hotkey_context_menu(self.set_hotkey_button, None, e))
+        self.set_hotkey_button._is_automation_area_hotkey = True
         
         # Right side of line 1: Start/Stop monitoring button
         # Initial state will be set by _update_polling_button_state after UI creation
@@ -1585,6 +1587,8 @@ class AutomationsWindow:
             font=("Helvetica", 9)
         )
         hotkey_button.pack(side='left', padx=5)
+        hotkey_button.bind("<Button-3>", lambda e: self.game_text_reader._show_hotkey_context_menu(hotkey_button, None, e))
+        hotkey_button._combo_ref = combo
         combo['hotkey_button'] = hotkey_button
         
         # Remove button

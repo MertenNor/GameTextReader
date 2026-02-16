@@ -316,7 +316,7 @@ class GameTextReader:
         
         # Debouncing for hotkeys to prevent double triggering
         self.last_hotkey_trigger = {}  # Dictionary to track last trigger time for each hotkey
-        self.hotkey_debounce_time = 0.1  # 100ms debounce time
+        self.hotkey_debounce_time = 0.3  # 300ms debounce time (avoid accidental double-triggers)
         self.shown_conflicts = set()  # Track which hotkey conflicts have been shown to avoid spam
         
         # Controller support
@@ -2939,7 +2939,13 @@ class GameTextReader:
                      else:
                          self.status_label.config(text=f"Hotkeys disabled - {remaining_count} windows open", fg="red", font=("Helvetica", 10, "bold"))
                 else:
-                    self.status_label.config(text="", font=("Helvetica", 10))
+                    # If hotkeys are enabled, clear the text. 
+                    # If they are disabled, we want it to stay persistent!
+                    if self.master_hotkeys_enabled:
+                         self.status_label.config(text="", font=("Helvetica", 10))
+                    else:
+                         # Ensure it shows DISABLED if we are in disabled state
+                         self.status_label.config(text="HOTKEYS DISABLED", fg="red", font=("Helvetica", 10, "bold"))
             
             # Hide after 2 seconds
             self.root.after(2000, clear_master_hotkey_feedback)
@@ -3177,6 +3183,7 @@ class GameTextReader:
         # Master Hotkey Button
         self.master_hotkey_button = tk.Button(buttons_frame, text="Master Hotkey", 
                                             command=self.set_master_hotkey)
+        self.master_hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(self.master_hotkey_button, None, e))
         self.master_hotkey_button.is_master_hotkey_button = True
         self.master_hotkey_button.pack(side='left', padx=5)
         
@@ -3261,12 +3268,16 @@ class GameTextReader:
         # Set Stop Hotkey button
         self.stop_hotkey_button = tk.Button(buttons_right_frame, text="Set STOP Hotkey", 
                                           command=self.set_stop_hotkey)
+        self.stop_hotkey_button.is_stop_button = True
         self.stop_hotkey_button.pack(side='right', padx=5)
+        self.stop_hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(self.stop_hotkey_button, None, e))
         
         # Set Pause/Play Hotkey button
         self.pause_hotkey_button = tk.Button(buttons_right_frame, text="Set Pause/Play Hotkey", 
                                           command=self.set_pause_hotkey)
+        self.pause_hotkey_button.is_pause_button = True
         self.pause_hotkey_button.pack(side='right', padx=5)
+        self.pause_hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(self.pause_hotkey_button, None, e))
         
         # Status label - centered between pause button and loaded layout name, on same line as Stop Hotkey button
         self.status_label = tk.Label(buttons_right_frame, text="", 
@@ -7422,6 +7433,7 @@ class GameTextReader:
         # Always add hotkey button for all areas, including Auto Read
         hotkey_button = tk.Button(area_frame, text="Set Hotkey")
         hotkey_button.config(command=lambda: self.set_hotkey(hotkey_button, area_frame))
+        hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(hotkey_button, area_frame, e))
         hotkey_button.pack(side="left")
         
         # Add separator
@@ -10852,6 +10864,8 @@ class GameTextReader:
                                            relief="flat", bd=0,
                                            padx=5, pady=4,
                                            justify='center')
+        edit_area_hotkey_button.is_edit_area_button = True
+        edit_area_hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(edit_area_hotkey_button, None, e))
         edit_area_hotkey_button.pack()
         
         # Store reference to button for restore_all_hotkeys
@@ -11525,6 +11539,179 @@ class GameTextReader:
             if has_controller_hotkeys and not self.controller_handler.running:
                 self.controller_handler.start_monitoring()
 
+    def _hotkey_to_display_name(self, hotkey):
+        """Convert a hotkey string to a nicer display format"""
+        if not hotkey:
+            return "None"
+        return hotkey.replace('numpad ', 'NUMPAD ').replace('num_', 'num:') \
+                     .replace('ctrl','CTRL') \
+                     .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                     .replace('left shift','L-SHIFT').replace('right shift','R-SHIFT') \
+                     .replace('windows','WIN') \
+                     .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+
+    def _save_master_hotkey(self, hotkey):
+        """Save master hotkey to app settings"""
+        try:
+            if os.path.exists(APP_SETTINGS_PATH):
+                with open(APP_SETTINGS_PATH, 'r') as f:
+                    settings = json.load(f)
+            else:
+                settings = {}
+            settings['master_hotkey'] = hotkey
+            with open(APP_SETTINGS_PATH, 'w') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving master hotkey: {e}")
+
+    def clear_hotkey(self, button, area_frame=None):
+        """Prompt to clear the hotkey from a button"""
+        # Get the hotkey string
+        hotkey_str = getattr(button, 'hotkey', None)
+        if not hotkey_str:
+            if hasattr(button, 'mock_button') and hasattr(button.mock_button, 'hotkey'):
+                hotkey_str = button.mock_button.hotkey
+            elif hasattr(button, 'is_stop_button'):
+                hotkey_str = getattr(self, 'stop_hotkey', None)
+            elif hasattr(button, 'is_pause_button'):
+                hotkey_str = getattr(self, 'pause_hotkey', None)
+            elif hasattr(button, 'is_master_hotkey_button'):
+                hotkey_str = getattr(self, 'master_hotkey', None)
+                
+        if not hotkey_str:
+            from tkinter import messagebox
+            messagebox.showinfo("Clear Hotkey", "No hotkey assigned to this button.")
+            return
+            
+        from tkinter import messagebox
+        if not messagebox.askyesno("Clear Hotkey", f"Are you sure you want to clear the hotkey '{hotkey_str}'?"):
+            return
+            
+        print(f"Clearing hotkey '{hotkey_str}'")
+        
+        # Cleanup actual registered hotkeys/hooks
+        try:
+            if hasattr(self, '_cleanup_hooks'):
+                if hasattr(button, 'mock_button') and button.mock_button:
+                    self._cleanup_hooks(button.mock_button)
+                self._cleanup_hooks(button)
+
+            # Manual unhook for lingering ones
+            if hasattr(button, 'keyboard_hook'):
+                try: keyboard.unhook(button.keyboard_hook)
+                except: pass
+                delattr(button, 'keyboard_hook')
+            if hasattr(button, 'mouse_hook'):
+                try: mouse.unhook(button.mouse_hook)
+                except: pass
+                delattr(button, 'mouse_hook')
+            # Same for mock_button
+            if hasattr(button, 'mock_button'):
+                if hasattr(button.mock_button, 'keyboard_hook'):
+                    try: keyboard.unhook(button.mock_button.keyboard_hook)
+                    except: pass
+                    delattr(button.mock_button, 'keyboard_hook')
+                if hasattr(button.mock_button, 'mouse_hook'):
+                    try: mouse.unhook(button.mock_button.mouse_hook)
+                    except: pass
+                    delattr(button.mock_button, 'mouse_hook')
+
+        except Exception as e:
+            print(f"Error during hook cleanup: {e}")
+
+        # Update state and settings
+        hotkey_type = "Hotkey"
+        
+        is_stop = hasattr(button, 'is_stop_button') or (hasattr(button, 'mock_button') and getattr(button.mock_button, 'is_stop_button', False))
+        is_pause = hasattr(button, 'is_pause_button') or (hasattr(button, 'mock_button') and getattr(button.mock_button, 'is_pause_button', False))
+        is_master = hasattr(button, 'is_master_hotkey_button') or (hasattr(button, 'mock_button') and getattr(button.mock_button, 'is_master_hotkey_button', False))
+        is_repeat = hasattr(button, 'is_repeat_latest_button') or (hasattr(button, 'mock_button') and getattr(button.mock_button, 'is_repeat_latest_button', False))
+        is_edit = hasattr(button, 'is_edit_area_button') or (hasattr(button, 'mock_button') and getattr(button.mock_button, 'is_edit_area_button', False))
+
+        if is_stop:
+            self.stop_hotkey = None
+            self._save_stop_hotkey(None)
+            self.stop_hotkey_button.config(text="Set STOP Hotkey")
+            if hasattr(self.stop_hotkey_button, 'mock_button'):
+                self.stop_hotkey_button.mock_button.hotkey = None
+            hotkey_type = "Stop Hotkey"
+            
+        elif is_pause:
+            self.pause_hotkey = None
+            self._save_pause_hotkey(None)
+            self.pause_hotkey_button.config(text="Set Pause/Play Hotkey")
+            if hasattr(self.pause_hotkey_button, 'mock_button'):
+                self.pause_hotkey_button.mock_button.hotkey = None
+            hotkey_type = "Pause/Play Hotkey"
+            
+        elif is_master:
+            self.master_hotkey = None
+            self._save_master_hotkey(None)
+            if hasattr(button, 'config'):
+                button.config(text="Master Hotkey")
+            button.hotkey = None
+            hotkey_type = "Master Hotkey"
+            
+        elif is_repeat:
+            self.repeat_latest_hotkey = None
+            self._save_repeat_latest_hotkey(None)
+            button.hotkey = None
+            if hasattr(button, 'config'):
+                button.config(text="Set Hotkey")
+            if hasattr(button, '_display_button') and button._display_button:
+                button._display_button.config(text="Set Hotkey")
+            hotkey_type = "Repeat Last Scan Hotkey"
+            
+        elif is_edit:
+            self.edit_area_hotkey = None
+            if hasattr(self, '_save_edit_area_hotkey'):
+                self._save_edit_area_hotkey(None)
+            if hasattr(button, 'config'):
+                button.config(text="Set Hotkey")
+            button.hotkey = None
+            hotkey_type = "Editor Toggle Hotkey"
+            
+        elif area_frame is not None:
+             button.hotkey = None
+             button.config(text="Set Hotkey")
+             hotkey_type = "Area Hotkey"
+        
+        elif hasattr(button, '_is_automation_area_hotkey'):
+             button.hotkey = None
+             button.config(text="Set Hotkey")
+             hotkey_type = "Automation Detection Area Hotkey"
+             
+        elif hasattr(button, '_combo_ref'):
+             button._combo_ref['hotkey'] = None
+             button.hotkey = None  # Ensure button hotkey attribute is also cleared
+             button.config(text="Set Hotkey")
+             hotkey_type = "Automation Combo Hotkey"
+        else:
+             button.hotkey = None
+             button.config(text="Set Hotkey")
+
+        # CRITICAL: Force a full refresh of all hotkeys to ensure the cleared one is actually removed from memory
+        try:
+            self.restore_all_hotkeys()
+        except Exception as e:
+            print(f"Error restoring hotkeys after clearing: {e}")
+
+        # CRITICAL: Auto-save the layout so the change is persisted
+        try:
+            self.save_layout_auto()
+        except Exception as e:
+            print(f"Error auto-saving layout after clearing hotkey: {e}")
+
+        print(f"Successfully cleared {hotkey_type}")
+
+        self._set_unsaved_changes('hotkey_cleared', hotkey_type)
+        self._ensure_window_width()
+        print(f"Hotkey cleared successfully.")
+
+    def _show_hotkey_context_menu(self, button, area_frame=None, event=None):
+        """Skip the menu and go straight to clearing confirmation"""
+        self.clear_hotkey(button, area_frame)
+
     def set_hotkey(self, button, area_frame):
         # AGGRESSIVE CLEANUP: Cancel all existing timers and jobs FIRST to prevent accumulation
         try:
@@ -11599,9 +11786,11 @@ class GameTextReader:
         combo_state = {
             'non_modifier_pressed': False, 
             'held_modifiers': set(),
+            'held_non_modifiers': set(), # Track multiple held non-modifiers for chords
             'pending_hotkey': None,  # The hotkey combination being built
             'pending_base_key': None,  # The base (non-modifier) key for release detection
-            'finalize_timer': None   # Timer ID for delayed finalization
+            'finalize_timer': None,   # Timer ID for delayed finalization
+            'bare_modifier_timer': None # Single timer for modifier assignment
         }
 
         # Live preview of currently held modifiers while waiting for a non-modifier key
@@ -11818,14 +12007,28 @@ class GameTextReader:
             # Track modifiers as they're pressed and mark non-modifiers
             if name not in ('ctrl','alt','left alt','right alt','shift','windows'):
                 combo_state['non_modifier_pressed'] = True
-                print(f"Debug: Non-modifier key detected: '{name}'")
+                combo_state['held_non_modifiers'].add(name) # Track for chords
+                # Cancel any pending bare modifier timer immediately - user is playing a combo
+                if combo_state.get('bare_modifier_timer'):
+                    try:
+                        self.root.after_cancel(combo_state['bare_modifier_timer'])
+                        combo_state['bare_modifier_timer'] = None
+                        print(f"Debug: Cancelled bare modifier timer because non-modifier '{name}' was pressed")
+                    except: pass
+                print(f"Debug: Non-modifier key detected: '{name}', held: {combo_state['held_non_modifiers']}")
             else:
                 # Add modifier to our tracking set
                 combo_state['held_modifiers'].add(name)
+                # Cancel previous modifier timer if starts a new one
+                if combo_state.get('bare_modifier_timer'):
+                    try:
+                        self.root.after_cancel(combo_state['bare_modifier_timer'])
+                        combo_state['bare_modifier_timer'] = None
+                    except: pass
                 print(f"Debug: Modifier key detected: '{name}', held modifiers: {combo_state['held_modifiers']}")
             if name in ('ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows'):
                 # Allow assigning a bare modifier when released, if user doesn't press another key
-                # Start a short timer to check if still only this modifier is held
+                # Start a timer to check if still only this modifier is held
                 def _assign_bare_modifier(modifier_name):
                     if self._hotkey_assignment_cancelled or not self.setting_hotkey:
                         return
@@ -11867,16 +12070,15 @@ class GameTextReader:
                                     if hasattr(button, 'keyboard_hook_temp'):
                                         keyboard.unhook(button.keyboard_hook_temp)
                                         delattr(button, 'keyboard_hook_temp')
+                                    if hasattr(button, 'keyboard_release_hook_temp'):
+                                        keyboard.unhook(button.keyboard_release_hook_temp)
+                                        delattr(button, 'keyboard_release_hook_temp')
                                     if hasattr(button, 'mouse_hook_temp'):
                                         mouse.unhook(button.mouse_hook_temp)
                                         delattr(button, 'mouse_hook_temp')
-                                except Exception:
-                                    pass
+                                except: pass
                                 finish_hotkey_assignment()
-                                try:
-                                    messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
-                                except Exception:
-                                    pass
+                                messagebox.showwarning("Hotkey In Use", "This hotkey is already assigned to: Stop Hotkey")
                                 return
 
                             # Prevent duplicates: other areas
@@ -11888,18 +12090,19 @@ class GameTextReader:
                                         if hasattr(button, 'keyboard_hook_temp'):
                                             keyboard.unhook(button.keyboard_hook_temp)
                                             delattr(button, 'keyboard_hook_temp')
+                                        if hasattr(button, 'keyboard_release_hook_temp'):
+                                            keyboard.unhook(button.keyboard_release_hook_temp)
+                                            delattr(button, 'keyboard_release_hook_temp')
                                         if hasattr(button, 'mouse_hook_temp'):
                                             mouse.unhook(button.mouse_hook_temp)
                                             delattr(button, 'mouse_hook_temp')
-                                    except Exception:
-                                        pass
+                                    except: pass
                                     finish_hotkey_assignment()
                                     area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
                                     show_thinkr_warning(self, area_name)
                                     return
 
-                            button.hotkey = key_name
-                            # Determine which hotkey is being changed
+                            # Determine which hotkey is being changed for unsaved changes tracking
                             hotkey_name = None
                             if hasattr(button, 'is_stop_button'):
                                 hotkey_name = 'Stop Hotkey'
@@ -11908,7 +12111,6 @@ class GameTextReader:
                             elif hasattr(button, 'is_edit_area_button'):
                                 hotkey_name = 'Editor Toggle Hotkey'
                             elif area_frame is not None:
-                                # This is an area hotkey - find the area name
                                 for area in self.areas:
                                     if area[0] == area_frame:
                                         area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
@@ -11916,46 +12118,61 @@ class GameTextReader:
                                         break
                             
                             if hotkey_name:
-                                self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
+                                self._set_unsaved_changes('hotkey_changed', hotkey_name)
                             else:
-                                self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
-                            # Display mapping
+                                self._set_unsaved_changes()
+
+                            # Update UI first
                             disp = key_name.upper().replace('LEFT ALT','L-ALT').replace('RIGHT ALT','R-ALT') \
                                                 .replace('WINDOWS','WIN').replace('CTRL','CTRL')
-                            display_name = disp
-                            button.config(text=f"Set Hotkey: [ {display_name} ]")
-                            self.setup_hotkey(button, area_frame)
-                            # Cleanup temp hooks and preview
-                            try:
-                                if hasattr(button, 'keyboard_hook_temp'):
-                                    keyboard.unhook(button.keyboard_hook_temp)
-                                    delattr(button, 'keyboard_hook_temp')
-                                if hasattr(button, 'mouse_hook_temp'):
-                                    mouse.unhook(button.mouse_hook_temp)
-                                    delattr(button, 'mouse_hook_temp')
-                            except Exception:
-                                pass
-                            # Don't call restore_all_hotkeys - we just registered the hotkey
-                            try:
-                                self.stop_speaking()
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
-                                    self.root.after_cancel(self._hotkey_preview_job)
-                                    self._hotkey_preview_job = None
-                            except Exception:
-                                pass
-                            self.setting_hotkey = False
+                            button.config(text=f"Set Hotkey: [ {disp} ]")
+                            
+                            # CRITICAL: Wait for the key to be released before finalizing
+                            # This prevents the hotkey from triggering immediately because it's still held
+                            def wait_for_release():
+                                if self._hotkey_assignment_cancelled: return
+                                
+                                still_down = False
+                                try:
+                                    if only == 'ctrl':
+                                        l, r = detect_ctrl_keys()
+                                        still_down = l or r
+                                    else:
+                                        still_down = keyboard.is_pressed(only)
+                                except: pass
+                                
+                                if still_down:
+                                    self.root.after(50, wait_for_release)
+                                    return
+                                
+                                # Key released! Now register
+                                button.hotkey = key_name
+                                self.setup_hotkey(button, area_frame)
+                                self.setting_hotkey = False
+                                # Cleanup hooks
+                                try:
+                                    if hasattr(button, 'keyboard_hook_temp'):
+                                        keyboard.unhook(button.keyboard_hook_temp)
+                                        delattr(button, 'keyboard_hook_temp')
+                                    if hasattr(button, 'keyboard_release_tracking_hook_temp'):
+                                        keyboard.unhook(button.keyboard_release_tracking_hook_temp)
+                                        delattr(button, 'keyboard_release_tracking_hook_temp')
+                                    if hasattr(button, 'keyboard_release_hook_temp'):
+                                        keyboard.unhook(button.keyboard_release_hook_temp)
+                                        delattr(button, 'keyboard_release_hook_temp')
+                                    if hasattr(button, 'mouse_hook_temp'):
+                                        mouse.unhook(button.mouse_hook_temp)
+                                        delattr(button, 'mouse_hook_temp')
+                                except: pass
+                                finish_hotkey_assignment()
+
+                            wait_for_release()
                             return
                     except Exception:
                         pass
-                # Delay a bit to allow combination keys; if user presses another key quickly, normal path will handle it
-                # Using 300ms to give user enough time to press all keys in a multi-key combination (reduced from 800ms)
+                # Delay 500ms to allow combos; cancelled if another key is pressed
                 try:
-                    print(f"Debug: Setting timer for _assign_bare_modifier with modifier_name: '{name}'")
-                    self.root.after(300, lambda: _assign_bare_modifier(name))
-                    print(f"Debug: Timer set successfully for {name}")
+                    combo_state['bare_modifier_timer'] = self.root.after(500, lambda: _assign_bare_modifier(name))
                 except Exception as e:
                     print(f"Debug: Error setting timer: {e}")
                 return
@@ -11967,22 +12184,10 @@ class GameTextReader:
                 return
             
             print(f"Debug: Building combination for non-modifier key")
-
-            # Build combination string from tracked held modifiers + key
-            try:
-                # Use our tracked modifiers instead of keyboard.is_pressed()
-                mods = list(combo_state['held_modifiers'])
-                
-                # Debug output
-                print(f"Debug: Pressed key '{name}', tracked modifiers: {mods}")
-            except Exception:
-                mods = []
-
             # The name is already determined by event name detection above, so use it directly
             base_key = name
 
             # Check if this is a mouse button (button1 or button2) and validate against checkbox
-            # Check if base_key is button1 or button2, or contains them (for combinations)
             is_mouse_button = base_key in ['button1', 'button2'] or 'button1' in base_key or 'button2' in base_key
             if is_mouse_button:
                 # Get the current state of the allow_mouse_buttons checkbox
@@ -12005,11 +12210,20 @@ class GameTextReader:
                         self._mouse_button_error_shown = True
                     return
 
-            # If base_key itself is a modifier, include it if not already in mods; otherwise avoid duplicate
-            if base_key in ("ctrl", "shift", "alt", "windows", "left alt", "right alt"):
-                combo_parts = (mods + [base_key]) if base_key not in mods else mods[:]
-            else:
-                combo_parts = mods + [base_key]
+            # Build combination string from tracked held modifiers + all held non-modifiers
+            try:
+                # Use our tracked modifiers
+                mods = sorted(list(combo_state['held_modifiers']))
+                non_mods = sorted(list(combo_state['held_non_modifiers']))
+                
+                # Debug output
+                print(f"Debug: New key press: '{name}', currently held mods: {mods}, held non-mods: {non_mods}")
+                
+                # Order: Modifiers + Non-modifiers
+                combo_parts = mods + non_mods
+            except Exception:
+                combo_parts = [name]
+
             key_name = "+".join(p for p in combo_parts if p)
             
             # Debug output
@@ -12039,369 +12253,221 @@ class GameTextReader:
                 except Exception:
                     pass
             
-            # Start new finalization timer - 250ms delay before accepting the hotkey (reduced from 800ms for better responsiveness)
+            # Start new finalization timer - 250ms delay before accepting the hotkey
             def _finalize_hotkey():
                 if self._hotkey_assignment_cancelled or not self.setting_hotkey:
                     return
                 
-                pending_key = combo_state['pending_hotkey']
-                if not pending_key:
-                    return
-                
-                print(f"Debug: Finalizing hotkey: '{pending_key}'")
-                
-                # Prevent duplicates against Stop hotkey
-                if getattr(self, 'stop_hotkey', None) == pending_key:
-                    # Unhook temp hooks and set flags BEFORE showing the warning
-                    preview_active['active'] = False  # Stop preview updates
-                    self.setting_hotkey = False
-                    self._hotkey_assignment_cancelled = True
-                    if hasattr(button, 'keyboard_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_hook_temp')
-                    if hasattr(button, 'keyboard_release_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_release_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_release_hook_temp')
-                    if hasattr(button, 'mouse_hook_temp'):
-                        try:
-                            mouse.unhook(button.mouse_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'mouse_hook_temp')
-                    finish_hotkey_assignment()
-                    # Reset label text
-                    if hasattr(button, 'hotkey') and button.hotkey:
-                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
-                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
-                    else:
-                        button.config(text="Set Hotkey")
-                    show_thinkr_warning(self, "Stop Hotkey")
-                    return
-
-                # Prevent duplicates against Repeat Latest Scan hotkey
-                if getattr(self, 'repeat_latest_hotkey', None) == pending_key and not hasattr(button, 'is_repeat_latest_button'):
-                    # Unhook temp hooks and set flags BEFORE showing the warning
-                    preview_active['active'] = False  # Stop preview updates
-                    self.setting_hotkey = False
-                    self._hotkey_assignment_cancelled = True
-                    if hasattr(button, 'keyboard_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_hook_temp')
-                    if hasattr(button, 'keyboard_release_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_release_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_release_hook_temp')
-                    if hasattr(button, 'mouse_hook_temp'):
-                        try:
-                            mouse.unhook(button.mouse_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'mouse_hook_temp')
-                    finish_hotkey_assignment()
-                    show_thinkr_warning(self, "Repeat Last Scan Hotkey")
-                    # Reset label text
-                    if hasattr(button, 'hotkey') and button.hotkey:
-                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
-                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
-                    else:
-                        button.config(text="Set Hotkey")
-                    return
-
-                # Prevent duplicates against Pause/Play hotkey
-                if getattr(self, 'pause_hotkey', None) == pending_key and not hasattr(button, 'is_pause_button'):
-                    # Unhook temp hooks and set flags BEFORE showing the warning
-                    preview_active['active'] = False  # Stop preview updates
-                    self.setting_hotkey = False
-                    self._hotkey_assignment_cancelled = True
-                    if hasattr(button, 'keyboard_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_hook_temp')
-                    if hasattr(button, 'keyboard_release_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_release_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_release_hook_temp')
-                    if hasattr(button, 'mouse_hook_temp'):
-                        try:
-                            mouse.unhook(button.mouse_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'mouse_hook_temp')
-                    finish_hotkey_assignment()
-                    show_thinkr_warning(self, "Pause/Play Hotkey")
-                    # Reset label text
-                    if hasattr(button, 'hotkey') and button.hotkey:
-                        disp_prev = button.hotkey.replace('num_', 'num:') if button.hotkey.startswith('num_') else button.hotkey
-                        button.config(text=f"Set Hotkey: [ {disp_prev.upper()} ]")
-                    else:
-                        button.config(text="Set Hotkey")
-                    return
-
-                # Disallow duplicate hotkeys
-                duplicate_found = False
-                area_name = "Unknown Area"
-                for area in self.areas:
-                    if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == pending_key:
-                        duplicate_found = True
-                        area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
-                        break
-
-                if duplicate_found:
-                    # Unhook temp hooks and set flags BEFORE showing the warning
-                    preview_active['active'] = False  # Stop preview updates
-                    self.setting_hotkey = False
-                    self._hotkey_assignment_cancelled = True  # Block all further events
-                    if hasattr(button, 'keyboard_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_hook_temp')
-                    if hasattr(button, 'keyboard_release_hook_temp'):
-                        try:
-                            keyboard.unhook(button.keyboard_release_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'keyboard_release_hook_temp')
-                    if hasattr(button, 'mouse_hook_temp'):
-                        try:
-                            mouse.unhook(button.mouse_hook_temp)
-                        except Exception:
-                            pass
-                        delattr(button, 'mouse_hook_temp')
-                    finish_hotkey_assignment()
-                    # Now show the warning dialog (no hooks are active)
-                    if hasattr(button, 'hotkey'):
-                        display_name = self._get_display_hotkey(button)
-                        button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                    else:
-                        button.config(text="Set Hotkey")
-                    show_thinkr_warning(self, area_name)
-                    return
-                
-                # Final validation: Check if this is a mouse button (button1 or button2) and validate against checkbox
-                # Check if pending_key is exactly button1/button2, or contains them as part of a combination
-                is_mouse_button = pending_key in ['button1', 'button2'] or 'button1' in pending_key or 'button2' in pending_key
-                if is_mouse_button:
-                    # Get the current state of the allow_mouse_buttons checkbox
-                    allow_mouse_buttons = False
-                    if hasattr(self, 'allow_mouse_buttons_var'):
-                        try:
-                            allow_mouse_buttons = self.allow_mouse_buttons_var.get()
-                        except Exception as e:
-                            print(f"Error getting allow_mouse_buttons_var: {e}")
+                # CRITICAL: Wait for ALL keys to be released before finalizing
+                # This prevents immediate triggering of the newly set hotkey
+                def wait_for_all_release():
+                    if self._hotkey_assignment_cancelled: return
                     
-                    if not allow_mouse_buttons:
-                        # Unhook temp hooks and set flags BEFORE showing the warning
-                        preview_active['active'] = False  # Stop preview updates
-                        self.setting_hotkey = False
-                        self._hotkey_assignment_cancelled = True
-                        if hasattr(button, 'keyboard_hook_temp'):
-                            try:
-                                keyboard.unhook(button.keyboard_hook_temp)
-                            except Exception:
-                                pass
-                            delattr(button, 'keyboard_hook_temp')
-                        if hasattr(button, 'keyboard_release_hook_temp'):
-                            try:
-                                keyboard.unhook(button.keyboard_release_hook_temp)
-                            except Exception:
-                                pass
-                            delattr(button, 'keyboard_release_hook_temp')
-                        if hasattr(button, 'mouse_hook_temp'):
-                            try:
-                                mouse.unhook(button.mouse_hook_temp)
-                            except Exception:
-                                pass
-                            delattr(button, 'mouse_hook_temp')
-                        finish_hotkey_assignment()
-                        # Reset label text
-                        if hasattr(button, 'hotkey') and button.hotkey:
-                            display_name = self._get_display_hotkey(button)
-                            button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                        else:
-                            button.config(text="Set Hotkey")
-                        if not hasattr(self, '_mouse_button_error_shown'):
-                            messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
-                            self._mouse_button_error_shown = True
+                    try:
+                        # Check modifiers
+                        l_ctrl, r_ctrl = detect_ctrl_keys()
+                        any_mod = l_ctrl or r_ctrl or \
+                                 keyboard.is_pressed('shift') or \
+                                 keyboard.is_pressed('alt') or \
+                                 keyboard.is_pressed('windows')
+                        
+                        # Check all held non-modifiers
+                        any_non_mod = False
+                        if combo_state.get('held_non_modifiers'):
+                             for k in list(combo_state['held_non_modifiers']):
+                                 try:
+                                     if keyboard.is_pressed(k):
+                                         any_non_mod = True
+                                         break
+                                 except: pass
+                        
+                        if any_mod or any_non_mod:
+                            # Still holding something, wait
+                            self.root.after(50, wait_for_all_release)
+                            return
+                    except: pass
+                    
+                    # Everything released! Now proceed with finalization
+                    finish_finalization()
+
+                def finish_finalization():
+                    pending_key = combo_state['pending_hotkey']
+                    if not pending_key:
                         return
                     
-                # Only proceed with setting hotkey if no duplicate was found and mouse button validation passed
-                # Clear old hotkey first to prevent conflicts
-                old_hotkey = getattr(button, 'hotkey', None)
-                if old_hotkey:
-                    # Unregister old hotkey before setting new one
-                    try:
-                        if hasattr(button, 'keyboard_hook'):
-                            if hasattr(button.keyboard_hook, 'remove'):
-                                button.keyboard_hook.remove()
-                            else:
-                                keyboard.unhook(button.keyboard_hook)
-                            delattr(button, 'keyboard_hook')
-                        if hasattr(button, 'mouse_hook_id'):
-                            mouse.unhook(button.mouse_hook_id)
-                            delattr(button, 'mouse_hook_id')
-                    except Exception as e:
-                        print(f"Debug: Error clearing old hotkey: {e}")
-                
-                button.hotkey = pending_key
-                
-                # Determine which hotkey is being changed
-                hotkey_name = None
-                if hasattr(button, 'is_repeat_latest_button'):
-                    self.repeat_latest_hotkey = pending_key
-                    # Also ensure the persistent button has the hotkey
-                    if hasattr(self, 'repeat_latest_hotkey_button'):
-                        self.repeat_latest_hotkey_button.hotkey = pending_key
-                    # Save to settings
-                    self._save_repeat_latest_hotkey(pending_key)
-                    hotkey_name = 'Repeat Last Scan Hotkey'
-                elif hasattr(button, 'is_stop_button'):
-                    hotkey_name = 'Stop Hotkey'
-                elif hasattr(button, 'is_pause_button'):
-                    hotkey_name = 'Pause/Play Hotkey'
-                elif hasattr(button, 'is_edit_area_button'):
-                    hotkey_name = 'Editor Toggle Hotkey'
-                elif area_frame is not None:
-                    # This is an area hotkey - find the area name
+                    print(f"Debug: Finalizing hotkey: '{pending_key}'")
+                    
+                    # Prevent duplicates against Stop hotkey
+                    if getattr(self, 'stop_hotkey', None) == pending_key:
+                        self.setting_hotkey = False
+                        self._hotkey_assignment_cancelled = True
+                        finish_hotkey_assignment()
+                        show_thinkr_warning(self, "Stop Hotkey")
+                        return
+
+                    # Prevent duplicates against Repeat Latest Scan hotkey
+                    if getattr(self, 'repeat_latest_hotkey', None) == pending_key and not hasattr(button, 'is_repeat_latest_button'):
+                        self.setting_hotkey = False
+                        self._hotkey_assignment_cancelled = True
+                        finish_hotkey_assignment()
+                        show_thinkr_warning(self, "Repeat Last Scan Hotkey")
+                        return
+
+                    # Prevent duplicates against Pause/Play hotkey
+                    if getattr(self, 'pause_hotkey', None) == pending_key and not hasattr(button, 'is_pause_button'):
+                        self.setting_hotkey = False
+                        self._hotkey_assignment_cancelled = True
+                        finish_hotkey_assignment()
+                        show_thinkr_warning(self, "Pause/Play Hotkey")
+                        return
+
+                    # Disallow duplicate hotkeys against other areas
+                    duplicate_found = False
+                    dup_area_name = "Unknown Area"
                     for area in self.areas:
-                        if area[0] == area_frame:
-                            area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
-                            hotkey_name = f"Area: {area_name}"
+                        if area[1] is not button and hasattr(area[1], 'hotkey') and area[1].hotkey == pending_key:
+                            duplicate_found = True
+                            dup_area_name = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
                             break
-                
-                if hotkey_name:
-                    self._set_unsaved_changes('hotkey_changed', hotkey_name)  # Mark as unsaved when hotkey changes
-                else:
-                    self._set_unsaved_changes()  # Fallback if we can't determine the hotkey type
-                # Display: make NUMPAD look nice and uppercase
-                # Display nicer labels for sided modifiers
-                # Convert numpad keys to display format
-                if pending_key.startswith('num_'):
-                    display_name = self._convert_numpad_to_display(pending_key)
-                elif pending_key.startswith('controller_'):
-                    # Extract controller button name for display
-                    btn_name = pending_key.replace('controller_', '')
-                    # Handle D-Pad names specially
-                    if btn_name.startswith('dpad_'):
-                        dpad_name = btn_name.replace('dpad_', '')
-                        display_name = f"D-Pad {dpad_name.title()}"
+
+                    if duplicate_found:
+                        self.setting_hotkey = False
+                        self._hotkey_assignment_cancelled = True 
+                        finish_hotkey_assignment()
+                        show_thinkr_warning(self, dup_area_name)
+                        return
+                    
+                    # Final validation for mouse buttons
+                    is_mouse = pending_key in ['button1', 'button2'] or 'button1' in pending_key or 'button2' in pending_key
+                    if is_mouse:
+                        allow = False
+                        if hasattr(self, 'allow_mouse_buttons_var'):
+                            try: allow = self.allow_mouse_buttons_var.get()
+                            except: pass
+                        if not allow:
+                            self.setting_hotkey = False
+                            self._hotkey_assignment_cancelled = True
+                            finish_hotkey_assignment()
+                            if not hasattr(self, '_mouse_button_error_shown'):
+                                messagebox.showwarning("Warning", "Left and right mouse buttons cannot be used as hotkeys.\nCheck 'Allow mouse left/right:' to enable them.")
+                                self._mouse_button_error_shown = True
+                            return
+
+                    # Clear old hotkey if needed
+                    old_hotkey = getattr(button, 'hotkey', None)
+                    if old_hotkey:
+                        try:
+                            if hasattr(button, 'keyboard_hook'):
+                                if hasattr(button.keyboard_hook, 'remove'): button.keyboard_hook.remove()
+                                else: keyboard.unhook(button.keyboard_hook)
+                                delattr(button, 'keyboard_hook')
+                            if hasattr(button, 'mouse_hook_id'):
+                                mouse.unhook(button.mouse_hook_id)
+                                delattr(button, 'mouse_hook_id')
+                        except: pass
+                    
+                    button.hotkey = pending_key
+                    
+                    # Determine which hotkey is being changed for unsaved changes tracking
+                    hotkey_name = None
+                    if hasattr(button, 'is_repeat_latest_button'):
+                        self.repeat_latest_hotkey = pending_key
+                        if hasattr(self, 'repeat_latest_hotkey_button'):
+                            self.repeat_latest_hotkey_button.hotkey = pending_key
+                        self._save_repeat_latest_hotkey(pending_key)
+                        hotkey_name = 'Repeat Last Scan Hotkey'
+                    elif hasattr(button, 'is_stop_button'):
+                        hotkey_name = 'Stop Hotkey'
+                    elif hasattr(button, 'is_pause_button'):
+                        hotkey_name = 'Pause/Play Hotkey'
+                    elif hasattr(button, 'is_edit_area_button'):
+                        hotkey_name = 'Editor Toggle Hotkey'
+                    elif area_frame is not None:
+                        for area in self.areas:
+                            if area[0] == area_frame:
+                                nm = area[3].get() if hasattr(area[3], 'get') else "Unknown Area"
+                                hotkey_name = f"Area: {nm}"
+                                break
+                    
+                    if hotkey_name: self._set_unsaved_changes('hotkey_changed', hotkey_name)
+                    else: self._set_unsaved_changes()
+
+                    # Update display name
+                    if pending_key.startswith('num_'):
+                        display_name = self._convert_numpad_to_display(pending_key)
                     else:
-                        display_name = btn_name
-                else:
-                    display_name = pending_key.replace('numpad ', 'NUMPAD ') \
-                                                         .replace('ctrl','CTRL') \
-                    .replace('left alt','L-ALT').replace('right alt','R-ALT') \
-                    .replace('windows','WIN') \
-                    .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
-                button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                        display_name = pending_key.replace('numpad ', 'NUMPAD ') \
+                                                 .replace('ctrl','CTRL') \
+                                                 .replace('left alt','L-ALT').replace('right alt','R-ALT') \
+                                                 .replace('windows','WIN') \
+                                                 .replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                    
+                    button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                    self.setup_hotkey(button, area_frame)
+                    self.setting_hotkey = False
+                    print(f"Hotkey assignment completed for button: {button}")
+                    self._ensure_window_width()
 
-                self.setup_hotkey(button, area_frame)
-                self.setting_hotkey = False
-                print(f"Hotkey assignment completed for button: {button}")
-                
-                # Expand window width if needed for longer hotkey text
-                self._ensure_window_width()
+                    # Cleanup all temporary hooks
+                    for h_attr in ['keyboard_hook_temp', 'keyboard_release_hook_temp', 'keyboard_release_tracking_hook_temp', 'mouse_hook_temp']:
+                        if hasattr(button, h_attr):
+                            try:
+                                h = getattr(button, h_attr)
+                                if h_attr == 'mouse_hook_temp': mouse.unhook(h)
+                                else: keyboard.unhook(h)
+                            except: pass
+                            delattr(button, h_attr)
 
-                # Unhook both temp hooks if they exist
-                if hasattr(button, 'keyboard_hook_temp'):
-                    try:
-                        keyboard.unhook(button.keyboard_hook_temp)
-                    except Exception:
-                        pass
-                    delattr(button, 'keyboard_hook_temp')
-                if hasattr(button, 'keyboard_release_hook_temp'):
-                    try:
-                        keyboard.unhook(button.keyboard_release_hook_temp)
-                    except Exception:
-                        pass
-                    delattr(button, 'keyboard_release_hook_temp')
-                if hasattr(button, 'mouse_hook_temp'):
-                    try:
-                        mouse.unhook(button.mouse_hook_temp)
-                    except Exception:
-                        pass
-                    delattr(button, 'mouse_hook_temp')
+                    finish_hotkey_assignment()
 
-                # Don't call restore_all_hotkeys here - we just registered the hotkey above
-                # restore_all_hotkeys would unhook_all() and re-register everything, causing duplicates
-                # Just clean up the preview and stop speaking if needed
-                try:
-                    self.stop_speaking()  # Stop the speech
-                except Exception as e:
-                    print(f"Error during forced stop: {e}")
-                
-                # Cleanup preview
-                preview_active['active'] = False  # Stop preview updates
-                try:
-                    if hasattr(self, '_hotkey_preview_job') and self._hotkey_preview_job:
-                        self.root.after_cancel(self._hotkey_preview_job)
-                        self._hotkey_preview_job = None
-                except Exception:
-                    pass
-                # Guard: prevent any further hotkey assignment callbacks
-                self.setting_hotkey = False
+                # Start the wait process
+                wait_for_all_release()
+
+            # Timer-based finalization fallback
+            def start_finalization():
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey: return
+                _finalize_hotkey()
+
+            # Delay a bit before starting the release check to avoid instant finalization if keys were just tapped
+            combo_state['finalize_timer'] = self.root.after(250, start_finalization)
             
-            # Schedule finalization after 250ms delay (reduced from 800ms for better responsiveness)
-            combo_state['finalize_timer'] = self.root.after(250, _finalize_hotkey)
-            print(f"Debug: Scheduled finalization timer (250ms)")
-            
-            # Also set up key release handler for immediate finalization when non-modifier key is released
-            # This provides instant feedback when user releases the key combination
+            # Key release tracking for chord building
+            def on_key_release_tracking(event):
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey: return
+                try:
+                    raw_name = (event.name or '').lower()
+                    rel_name = normalize_key_name(raw_name)
+                    if event.scan_code == 29 or event.scan_code == 157: rel_name = 'ctrl'
+                    elif event.scan_code == 42 or event.scan_code == 54: rel_name = 'shift'
+                    elif event.scan_code == 56: rel_name = 'left alt'
+                    elif event.scan_code == 184: rel_name = 'right alt'
+                    elif event.scan_code in [91, 92]: rel_name = 'windows'
+                    
+                    if rel_name in combo_state['held_modifiers']: combo_state['held_modifiers'].remove(rel_name)
+                    if rel_name in combo_state['held_non_modifiers']: combo_state['held_non_modifiers'].remove(rel_name)
+                except: pass
+
+            button.keyboard_release_tracking_hook_temp = keyboard.on_release(on_key_release_tracking)
+
+            # Key release handler for immediate finalization
             def on_key_release(event):
-                if self._hotkey_assignment_cancelled or not self.setting_hotkey:
-                    return
+                if self._hotkey_assignment_cancelled or not self.setting_hotkey: return
+                if not (combo_state.get('pending_hotkey') and combo_state.get('non_modifier_pressed')): return
                 
-                # Only finalize if we have a pending hotkey with a non-modifier key
-                if not (combo_state.get('pending_hotkey') and combo_state.get('non_modifier_pressed')):
-                    return
-                
-                # Ignore modifier key releases - we only care about the base (non-modifier) key
                 raw_name = (event.name or '').lower()
                 scan_code = getattr(event, 'scan_code', None)
+                is_modifier = scan_code in [29, 157, 42, 54, 56, 184, 91, 92] or \
+                             raw_name in ('ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows')
                 
-                # Check if this is a modifier key
-                is_modifier = False
-                if scan_code in [29, 157, 42, 54, 56, 184, 91, 92]:  # Ctrl, Shift, Alt, Windows keys
-                    is_modifier = True
-                elif raw_name in ('ctrl', 'shift', 'alt', 'left alt', 'right alt', 'windows', 'left windows', 'right windows'):
-                    is_modifier = True
-                
-                # Only proceed if this is NOT a modifier (i.e., it's the base key being released)
                 if not is_modifier:
-                    # Cancel the timer since we're finalizing now
                     if combo_state.get('finalize_timer'):
-                        try:
-                            self.root.after_cancel(combo_state['finalize_timer'])
-                        except Exception:
-                            pass
+                        try: self.root.after_cancel(combo_state['finalize_timer'])
+                        except: pass
                         combo_state['finalize_timer'] = None
-                    
-                    # Finalize immediately when base key is released
-                    print(f"Debug: Base key released, finalizing hotkey immediately")
+                    print(f"Debug: Non-modifier key released, finalizing hotkey chord")
                     _finalize_hotkey()
             
-            # Register key release handler for immediate finalization (always register fresh)
-            try:
-                button.keyboard_release_hook_temp = keyboard.on_release(on_key_release)
-            except Exception as e:
-                print(f"Debug: Could not set up key release handler: {e}")
-
+            button.keyboard_release_hook_temp = keyboard.on_release(on_key_release)
             return
 
         def on_mouse_click(event):
@@ -18237,7 +18303,10 @@ class GameTextReader:
                 print(f"Hotkeys re-enabled after {window_name} window closed")
                 # Hide notification in main window
                 if hasattr(self, 'status_label'):
-                    self.status_label.config(text="")
+                    if hasattr(self, 'master_hotkeys_enabled') and not self.master_hotkeys_enabled:
+                         self.status_label.config(text="HOTKEYS DISABLED", fg="red", font=("Helvetica", 10, "bold"))
+                    else:
+                         self.status_label.config(text="")
             else:
                 # Update notification to show remaining windows
                 if hasattr(self, 'status_label'):
@@ -18740,7 +18809,7 @@ class GameTextReader:
         
         # Set timer to clear the text and reset font after delay
         def clear_feedback():
-            self.status_label.config(text="", font=("Helvetica", 10))
+            # self.status_label.config(text="", font=("Helvetica", 10))
             # After clearing, show monitoring status if active (updates top label)
             self._show_monitoring_status_if_active()
             
@@ -18751,6 +18820,10 @@ class GameTextReader:
                      self.status_label.config(text="Hotkeys disabled - Window open", fg="red", font=("Helvetica", 10, "bold"))
                  else:
                      self.status_label.config(text=f"Hotkeys disabled - {remaining_count} windows open", fg="red", font=("Helvetica", 10, "bold"))
+            elif hasattr(self, 'master_hotkeys_enabled') and not self.master_hotkeys_enabled:
+                 self.status_label.config(text="HOTKEYS DISABLED", fg="red", font=("Helvetica", 10, "bold"))
+            else:
+                 self.status_label.config(text="", font=("Helvetica", 10))
             
             # Reset counter after a delay to allow it to build up again
             self.root.after(5000, lambda: setattr(self, '_feedback_counter', 0))

@@ -68,6 +68,7 @@ class TextLogWindow:
             command=lambda: self.game_text_reader.set_hotkey(self.game_text_reader.repeat_latest_hotkey_button, None)
         )
         self.repeat_latest_hotkey_button.pack(side='left')
+        self.repeat_latest_hotkey_button.bind("<Button-3>", lambda e: self.game_text_reader._show_hotkey_context_menu(self.game_text_reader.repeat_latest_hotkey_button, None, e))
         
         # Sync the persistent button's hotkey
         self.game_text_reader.repeat_latest_hotkey_button.hotkey = self.game_text_reader.repeat_latest_hotkey

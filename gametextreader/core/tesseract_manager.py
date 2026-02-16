@@ -95,13 +95,19 @@ class TesseractManager:
             print(f"[ERROR] Failed to copy system English data: {e}")
 
     def setup_environment(self):
-        """No longer needed as we pass paths directly, but kept for future use."""
-        pass
+        """Set environment variables for Tesseract."""
+        # Also set TESSDATA_PREFIX as a fallback, although we primarily use --tessdata-dir flag
+        try:
+            os.environ['TESSDATA_PREFIX'] = os.path.normpath(self.custom_tessdata_dir)
+        except Exception as e:
+            print(f"[WARNING] OCR Manager: Failed to set TESSDATA_PREFIX: {e}")
 
     def get_tessdata_dir_param(self):
         """Return the argument string for --tessdata-dir."""
-        # Use a normalized path. On Windows, quotes around the path can cause issues when concatenated by Tesseract internally.
-        return f'--tessdata-dir {os.path.normpath(self.custom_tessdata_dir)}'
+        # Use forward slashes and quotes to handle spaces correctly on Windows when passed to Tesseract via pytesseract.
+        # pytesseract uses shlex.split(config) which requires quotes around paths with spaces.
+        path = os.path.normpath(self.custom_tessdata_dir).replace('\\', '/')
+        return f'--tessdata-dir "{path}"'
 
     def get_installed_languages(self, force_refresh=False):
         """
