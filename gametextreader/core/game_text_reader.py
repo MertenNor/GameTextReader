@@ -226,6 +226,9 @@ class GameTextReader:
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
         
+        # Loading state guard
+        self._loading_settings = True
+        
         # Master Hotkey State
         self.master_hotkeys_enabled = True
         self.master_hotkey = None
@@ -483,6 +486,9 @@ class GameTextReader:
         # Initialize Tesseract manager
         self.tesseract_manager = TesseractManager(APP_DOCUMENTS_DIR)
         self.tesseract_language_var = tk.StringVar(value="eng") # Default to English
+        
+        # Auto-save Tesseract language on change
+        self.tesseract_language_var.trace('w', lambda *args: self.save_global_settings())
 
         
         # Apply translation performance settings on startup
@@ -1021,6 +1027,9 @@ class GameTextReader:
         
         # Controller support disabled - pygame removed to reduce Windows security flags
         self.controller = None
+        
+        # End loading state
+        self._loading_settings = False
 
     def speak_text(self, text):
         """Speak text using win32com.client (SAPI.SpVoice)."""
@@ -1048,6 +1057,20 @@ class GameTextReader:
                             translated_text = self.translation_manager.translate(text, source_code, target_code)
                             if translated_text:
                                 text = translated_text
+                                # Post-translation gamer units pass: apply English-language replacements
+                                # on the translated text (e.g. "pupils" → "students")
+                                if (hasattr(self, 'read_game_units_var') and self.read_game_units_var.get()
+                                        and hasattr(self, 'game_units') and isinstance(self.game_units, dict)
+                                        and self.game_units):
+                                    import re as _re
+                                    _sorted = sorted(self.game_units.keys(), key=len, reverse=True)
+                                    _pat = _re.compile(
+                                        r'(?<!\w)(' + '|'.join(map(_re.escape, _sorted)) + r')(?!\w)',
+                                        _re.IGNORECASE
+                                    )
+                                    def _repl(m, _gu=self.game_units):
+                                        return _gu.get(m.group(1).lower(), m.group(1))
+                                    text = _pat.sub(_repl, text)
                 except Exception as e:
                     print(f"[ERROR] Translation: {e}")
 
@@ -1673,10 +1696,13 @@ class GameTextReader:
         try:
             import tempfile, os, json
             
-            # Create app subdirectory in Documents if it doesn't exist
             game_reader_dir = APP_DOCUMENTS_DIR
             os.makedirs(game_reader_dir, exist_ok=True)
             temp_path = APP_SETTINGS_PATH
+            
+            # Don't save if we are currently loading settings or layout
+            if getattr(self, '_loading_settings', False) or getattr(self, '_is_loading_layout', False):
+                return
             
             # Load existing settings or create new ones
             settings = {}
@@ -1733,6 +1759,10 @@ class GameTextReader:
             game_reader_dir = APP_DOCUMENTS_DIR
             os.makedirs(game_reader_dir, exist_ok=True)
             temp_path = APP_SETTINGS_PATH
+            
+            # Don't save if we are currently loading settings or layout
+            if getattr(self, '_loading_settings', False) or getattr(self, '_is_loading_layout', False):
+                return
             
             # Load existing settings or create new ones
             settings = {}
@@ -1792,6 +1822,10 @@ class GameTextReader:
             game_reader_dir = APP_DOCUMENTS_DIR
             os.makedirs(game_reader_dir, exist_ok=True)
             temp_path = APP_SETTINGS_PATH
+            
+            # Don't save if we are currently loading settings or layout
+            if getattr(self, '_loading_settings', False) or getattr(self, '_is_loading_layout', False):
+                return
             
             # Load existing settings or create new ones
             settings = {}
@@ -1908,6 +1942,10 @@ class GameTextReader:
             import os, json
             
             temp_path = APP_SETTINGS_PATH
+            
+            # Don't save if we are currently loading settings or layout
+            if getattr(self, '_loading_settings', False) or getattr(self, '_is_loading_layout', False):
+                return
             
             # Load existing settings or create new dict
             settings = {}
@@ -2613,11 +2651,19 @@ class GameTextReader:
             import tempfile, os, json
             
             temp_path = APP_SETTINGS_PATH
+            print(f"[DEBUG] Settings: Loading global settings from {temp_path}")
+            
+            # Set loading flag to prevent auto-saves during load
+            # Only set it if it's not already True (e.g. from __init__)
+            already_loading = getattr(self, '_loading_settings', False)
+            if not already_loading:
+                self._loading_settings = True
             
             if os.path.exists(temp_path):
                 try:
                     with open(temp_path, 'r', encoding='utf-8') as f:
                         settings = json.load(f)
+                    print(f"[DEBUG] Settings: File found. translation_enabled is {settings.get('translation_enabled')}")
                 except json.JSONDecodeError as e:
                     print(f"Error: Settings file is corrupted (JSON parse error): {e}")
                     print(f"  File: {temp_path}")
@@ -2643,7 +2689,6 @@ class GameTextReader:
                 saved_repeat_latest_hotkey = settings.get('repeat_latest_hotkey')
                 if saved_repeat_latest_hotkey:
                     self.repeat_latest_hotkey = saved_repeat_latest_hotkey
-                    # Set it on the persistent button
                     if hasattr(self, 'repeat_latest_hotkey_button'):
                         self.repeat_latest_hotkey_button.hotkey = saved_repeat_latest_hotkey
                 
@@ -2651,12 +2696,9 @@ class GameTextReader:
                 saved_pause_hotkey = settings.get('pause_hotkey')
                 if saved_pause_hotkey:
                     self.pause_hotkey = saved_pause_hotkey
-                    # Update button text
                     if hasattr(self, 'pause_hotkey_button'):
                         display_name = self._hotkey_to_display_name(saved_pause_hotkey)
                         self.pause_hotkey_button.config(text=f"Pause/Play Hotkey: [ {display_name} ]")
-                    # Register the hotkey
-                    if hasattr(self, 'pause_hotkey_button'):
                         mock_button = type('MockButton', (), {'hotkey': saved_pause_hotkey, 'is_pause_button': True})
                         self.pause_hotkey_button.mock_button = mock_button
                         self.setup_hotkey(self.pause_hotkey_button.mock_button, None)
@@ -2665,12 +2707,9 @@ class GameTextReader:
                 saved_stop_hotkey = settings.get('stop_hotkey')
                 if saved_stop_hotkey:
                     self.stop_hotkey = saved_stop_hotkey
-                    # Update button text
                     if hasattr(self, 'stop_hotkey_button'):
                         display_name = self._hotkey_to_display_name(saved_stop_hotkey)
                         self.stop_hotkey_button.config(text=f"Stop Hotkey: [ {display_name} ]")
-                    # Register the hotkey
-                    if hasattr(self, 'stop_hotkey_button'):
                         mock_button = type('MockButton', (), {'hotkey': saved_stop_hotkey, 'is_stop_button': True})
                         self.stop_hotkey_button.mock_button = mock_button
                         self.setup_hotkey(self.stop_hotkey_button.mock_button, None)
@@ -2679,14 +2718,12 @@ class GameTextReader:
                 saved_master_hotkey = settings.get('master_hotkey')
                 if saved_master_hotkey:
                     self.master_hotkey = saved_master_hotkey
-                    # Create or use existing master hotkey button
                     if hasattr(self, 'master_hotkey_button') and self.master_hotkey_button:
                         display_name = self._hotkey_to_display_name(saved_master_hotkey)
                         self.master_hotkey_button.config(text=f"Master Hotkey: [ {display_name} ]")
                         self.master_hotkey_button.hotkey = saved_master_hotkey
                         self.setup_hotkey(self.master_hotkey_button, None)
                     else:
-                        # Create a mock button if the UI button doesn't exist yet
                         mock_button = type('MockButton', (), {
                             'hotkey': saved_master_hotkey,
                             'is_master_hotkey_button': True
@@ -2705,42 +2742,49 @@ class GameTextReader:
                 saved_tesseract_lang = settings.get('tesseract_language')
                 if saved_tesseract_lang:
                     self.tesseract_language_var.set(saved_tesseract_lang)
+                
+                # Load Translation settings
+                if 'translation_enabled' in settings and hasattr(self, 'translation_enabled_var'):
+                    print(f"[DEBUG] Settings: Found translation_enabled={settings['translation_enabled']}")
+                    self.translation_enabled_var.set(settings['translation_enabled'])
+                
+                if 'translation_source' in settings and hasattr(self, 'translation_source_var'):
+                    self.translation_source_var.set(settings['translation_source'])
+                
+                if 'translation_target' in settings and hasattr(self, 'translation_target_var'):
+                    self.translation_target_var.set(settings['translation_target'])
+            else:
+                print(f"[DEBUG] Settings: File not found at {temp_path}")
                     
         except Exception as e:
             print(f"Error loading edit view settings: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Only clear it if we were the ones who set it
+            if not already_loading:
+                self._loading_settings = False
+            print("[DEBUG] Settings: Done loading global settings.")
 
-    def save_tesseract_settings(self):
-        """Save Tesseract-related settings to the global settings file."""
-        try:
-            import json
-            temp_path = APP_SETTINGS_PATH
-            
-            # Load existing settings
-            settings = {}
-            if os.path.exists(temp_path):
-                try:
-                    with open(temp_path, 'r', encoding='utf-8') as f:
-                        settings = json.load(f)
-                except:
-                    pass
-            
-            # Update Tesseract language
-            settings['tesseract_language'] = self.tesseract_language_var.get()
-            
-            # Save back
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, indent=4)
-                
-        except Exception as e:
-            print(f"Error saving Tesseract settings: {e}")
 
     def save_global_settings(self):
         """Save global settings (master hotkey, sound, banner, etc.) to JSON."""
+        # Don't save if we are currently loading settings or layout
+        if getattr(self, '_loading_settings', False) or getattr(self, '_is_loading_layout', False):
+            return
+            
         try:
-            import json, os
+            import json, os, inspect
             temp_path = APP_SETTINGS_PATH
+            
+            # Get current values
+            en = self.translation_enabled_var.get() if hasattr(self, 'translation_enabled_var') else "N/A"
+            src = self.translation_source_var.get() if hasattr(self, 'translation_source_var') else "N/A"
+            tar = self.translation_target_var.get() if hasattr(self, 'translation_target_var') else "N/A"
+            
+            # Log the call stack to see what triggered this
+            caller = inspect.currentframe().f_back
+            print(f"[DEBUG] Settings: Saving global settings. Caller: {caller.f_code.co_name}, translation_enabled={en}, source={src}, target={tar}")
             
             # Load existing settings to preserve other values
             settings = {}
@@ -2762,6 +2806,20 @@ class GameTextReader:
                 
             if hasattr(self, 'master_hotkey_banner_var'):
                 settings['master_hotkey_banner_enabled'] = self.master_hotkey_banner_var.get()
+                
+            # Update Translation settings
+            if hasattr(self, 'translation_enabled_var'):
+                settings['translation_enabled'] = self.translation_enabled_var.get()
+            
+            if hasattr(self, 'translation_source_var'):
+                settings['translation_source'] = self.translation_source_var.get()
+            
+            if hasattr(self, 'translation_target_var'):
+                settings['translation_target'] = self.translation_target_var.get()
+            
+            # Update Tesseract settings
+            if hasattr(self, 'tesseract_language_var'):
+                settings['tesseract_language'] = self.tesseract_language_var.get()
                 
             # Save back to file
             with open(temp_path, 'w', encoding='utf-8') as f:
@@ -3178,6 +3236,12 @@ class GameTextReader:
         self.translation_enabled_var.trace('w', update_translation_status)
         self.translation_source_var.trace('w', update_translation_status)
         self.translation_target_var.trace('w', update_translation_status)
+        
+        # Auto-save translation settings on change
+        self.translation_enabled_var.trace('w', lambda *args: self.save_global_settings())
+        self.translation_source_var.trace('w', lambda *args: self.save_global_settings())
+        self.translation_target_var.trace('w', lambda *args: self.save_global_settings())
+        
         update_translation_status()
 
         # Master Hotkey Button
@@ -3989,7 +4053,7 @@ class GameTextReader:
             },
             {
                 "var": self.read_game_units_var,
-                "label": "Read gamer units:",
+                "label": "Text Replacement:",
                 "description": "Enables reading of custom game-specific units. Use the Edit button to configure which units should be recognized and how they should be spoken."
             },
             {
@@ -14766,9 +14830,12 @@ class GameTextReader:
                 self.tesseract_language_var.set(saved_tesseract_lang)
 
             # Load Translation Settings
-            self.translation_enabled_var.set(layout.get("translation_enabled", False))
-            self.translation_source_var.set(layout.get("translation_source", ""))
-            self.translation_target_var.set(layout.get("translation_target", ""))
+            if "translation_enabled" in layout:
+                self.translation_enabled_var.set(layout.get("translation_enabled", False))
+            if "translation_source" in layout:
+                self.translation_source_var.set(layout.get("translation_source", ""))
+            if "translation_target" in layout:
+                self.translation_target_var.set(layout.get("translation_target", ""))
             
             # Clean up existing areas and unhook all hotkeys
             # Clean up images
@@ -17462,6 +17529,9 @@ class GameTextReader:
         lang_code = self.tesseract_language_var.get()
         if " " in lang_code:
              lang_code = lang_code.split(" ")[0]
+        
+        if not lang_code or not lang_code.strip():
+            lang_code = "eng"
              
         config_str = f'--psm {psm_value}'
         
@@ -17836,6 +17906,37 @@ class GameTextReader:
             except Exception as e:
                 print(f"[ERROR] Translation: {e}")
         # --- TRANSLATION INJECTION END ---
+
+        # --- GAMER UNITS POST-TRANSLATION PASS ---
+        # If translation is enabled, run a second gamer-units pass on the translated text.
+        # This ensures English-language replacements (e.g. "pupils" → "students") work
+        # after translation has already converted the source language to English.
+        if (hasattr(self, 'translation_enabled_var') and self.translation_enabled_var.get()
+                and read_game_units_enabled and filtered_text.strip()):
+            if hasattr(self, 'game_units') and isinstance(self.game_units, dict) and self.game_units:
+                game_unit_map_post = self.game_units
+                sorted_units_post = sorted(game_unit_map_post.keys(), key=len, reverse=True)
+                pattern_post = re.compile(
+                    r'(?<!\w)(\d+(?:\.\d+)?)(\s*)(' + '|'.join(map(re.escape, sorted_units_post)) + r')(?!\w)',
+                    re.IGNORECASE
+                )
+                def game_repl_post(match):
+                    value = match.group(1) or ''
+                    space = match.group(2) or ''
+                    unit = match.group(3).lower()
+                    full_name = game_unit_map_post.get(unit, unit)
+                    return f"{value}{space}{full_name}" if value else full_name
+                filtered_text = pattern_post.sub(game_repl_post, filtered_text)
+                # Also handle standalone (no-number) replacements via a separate pass
+                pattern_post_standalone = re.compile(
+                    r'(?<!\w)(' + '|'.join(map(re.escape, sorted_units_post)) + r')(?!\w)',
+                    re.IGNORECASE
+                )
+                def game_repl_post_standalone(match):
+                    unit = match.group(1).lower()
+                    return game_unit_map_post.get(unit, match.group(1))
+                filtered_text = pattern_post_standalone.sub(game_repl_post_standalone, filtered_text)
+        # --- GAMER UNITS POST-TRANSLATION PASS END ---
 
         # Apply letters-only filtering if enabled
         if self.letters_only_var.get():
@@ -18467,6 +18568,9 @@ class GameTextReader:
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
             "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
             "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
+            "translation_enabled": self.translation_enabled_var.get(),
+            "translation_source": self.translation_source_var.get(),
+            "translation_target": self.translation_target_var.get(),
             "stop_hotkey": self.stop_hotkey,
             "pause_hotkey": self.pause_hotkey,
             "auto_read_areas": {

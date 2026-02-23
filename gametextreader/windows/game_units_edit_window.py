@@ -15,7 +15,7 @@ class GameUnitsEditWindow:
         self.root = root
         self.game_text_reader = game_text_reader
         self.window = tk.Toplevel(root)
-        self.window.title("Edit Gamer Units")
+        self.window.title("Text Replacement Editor")
         self.window.geometry("500x600")
         self.window.resizable(True, True)
         
@@ -189,7 +189,7 @@ class GameUnitsEditWindow:
         # Headers
         header_frame = tk.Frame(self.scrollable_frame)
         header_frame.pack(fill='x', padx=0, pady=5)
-        tk.Label(header_frame, text="Detected phrase:", font=("Helvetica", 10, "bold"), width=15, anchor='w').pack(side='left', padx=5)
+        tk.Label(header_frame, text="Detected text:", font=("Helvetica", 10, "bold"), width=15, anchor='w').pack(side='left', padx=5)
         tk.Label(header_frame, text="Will be read as:", font=("Helvetica", 10, "bold"), width=20, anchor='w').pack(side='left', padx=5)
         tk.Label(header_frame, text="Actions", font=("Helvetica", 10, "bold"), width=15, anchor='w').pack(side='left', padx=5)
         

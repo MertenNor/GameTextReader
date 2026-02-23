@@ -104,10 +104,12 @@ class TesseractManager:
 
     def get_tessdata_dir_param(self):
         """Return the argument string for --tessdata-dir."""
-        # Use forward slashes and quotes to handle spaces correctly on Windows when passed to Tesseract via pytesseract.
-        # pytesseract uses shlex.split(config) which requires quotes around paths with spaces.
+        # Use forward slashes to handle cases correctly on Windows.
+        # Only use quotes if the path contains spaces to avoid Tesseract misinterpreting quotes.
         path = os.path.normpath(self.custom_tessdata_dir).replace('\\', '/')
-        return f'--tessdata-dir "{path}"'
+        if ' ' in path:
+            return f'--tessdata-dir "{path}"'
+        return f'--tessdata-dir {path}'
 
     def get_installed_languages(self, force_refresh=False):
         """
