@@ -34,8 +34,9 @@ APP_LAYOUTS_DIR = os.path.join(APP_DOCUMENTS_DIR, 'Layouts')
 GITHUB_REPO = "MertenNor/GameTextReader"  # Format: "username/repository-name"
 
 # Update server configuration (Google Apps Script)
-UPDATE_SERVER_URL = "REDACTED"
+UPDATE_SERVER_URL = ""
 
 # Testing: Set to True to always show update popup (for testing UI). Set to False for release (only shows when update is actually available)
 SHOW_UPDATE_POPUP_FOR_TESTING = False
+
 
