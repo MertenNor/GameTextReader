@@ -9,6 +9,20 @@ import win32gui
 import win32ui
 
 
+def get_dpi_scale():
+    """
+    Get the Windows DPI scale factor for the primary monitor.
+    Returns 1.0 at 100% scaling, 1.5 at 150%, 2.0 at 200%, etc.
+    This is needed to convert Tkinter logical pixel coordinates (mouse events)
+    to physical pixel coordinates for screen capture via BitBlt.
+    """
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        return dpi / 96.0
+    except Exception:
+        return 1.0
+
+
 def get_primary_monitor_info():
     """
     Get the primary monitor's position and dimensions using EnumDisplayMonitors.

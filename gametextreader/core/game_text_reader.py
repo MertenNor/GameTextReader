@@ -64,7 +64,7 @@ from ..utils import (
     get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
     is_special_character, suggest_alternative_key, InputManager
 )
-from ..screen_capture import capture_screen_area, get_primary_monitor_info
+from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
 from .tesseract_manager import TesseractManager
@@ -8317,12 +8317,12 @@ class GameTextReader:
                         self.stop_speaking()
                     
                     # Convert canvas coordinates to screen coordinates for the final area
-                    # Canvas coordinates are relative to the selection window, which is positioned at (window_x, window_y)
-                    # But we need to convert to actual screen coordinates using the original min_x, min_y
-                    x2 = event.x + min_x  # Convert canvas to screen coordinates
-                    y2 = event.y + min_y
-                    x1_screen = x1 + min_x
-                    y1_screen = y1 + min_y
+                    # Canvas coordinates are in the same space as GetSystemMetrics (logical or physical
+                    # depending on the process DPI awareness mode), so no scaling is needed.
+                    x2 = int(event.x) + min_x
+                    y2 = int(event.y) + min_y
+                    x1_screen = int(x1) + min_x
+                    y1_screen = int(y1) + min_y
                     
                     print(f"Debug: Mouse release - Canvas: ({event.x}, {event.y}), Screen: ({x2}, {y2}), Start: ({x1_screen}, {y1_screen})")
                     
@@ -9586,7 +9586,7 @@ class GameTextReader:
                     # Check if area has coordinates
                     if hasattr(area_frame, 'area_coords') and area_frame.area_coords and area_frame.area_coords != (0, 0, 0, 0):
                         x1, y1, x2, y2 = area_frame.area_coords
-                        # Convert screen coordinates to canvas coordinates
+                        # Convert screen coordinates to canvas coordinates (no DPI scaling needed)
                         x1_canvas = x1 - min_x
                         y1_canvas = y1 - min_y
                         x2_canvas = x2 - min_x
@@ -10265,11 +10265,11 @@ class GameTextReader:
                         save_state()  # Save the state before change
                         box_data['x1'], box_data['y1'], box_data['x2'], box_data['y2'] = temp_x1, temp_y1, temp_x2, temp_y2
                 
-                # Update area coordinates (convert canvas to screen coordinates)
-                x1_screen = box_data['x1'] + min_x
-                y1_screen = box_data['y1'] + min_y
-                x2_screen = box_data['x2'] + min_x
-                y2_screen = box_data['y2'] + min_y
+                # Update area coordinates (convert canvas to screen coordinates, no DPI scaling needed)
+                x1_screen = int(box_data['x1']) + min_x
+                y1_screen = int(box_data['y1']) + min_y
+                x2_screen = int(box_data['x2']) + min_x
+                y2_screen = int(box_data['y2']) + min_y
                 
                 # Ensure valid coordinates
                 if x1_screen < x2_screen and y1_screen < y2_screen:
@@ -10638,12 +10638,12 @@ class GameTextReader:
             self._restore_hotkeys_after_selection()
         
         def on_done():
-            # Save all coordinates
+            # Save all coordinates (no DPI scaling needed)
             for area_frame, box_data in area_boxes.items():
-                x1_screen = box_data['x1'] + min_x
-                y1_screen = box_data['y1'] + min_y
-                x2_screen = box_data['x2'] + min_x
-                y2_screen = box_data['y2'] + min_y
+                x1_screen = int(box_data['x1']) + min_x
+                y1_screen = int(box_data['y1']) + min_y
+                x2_screen = int(box_data['x2']) + min_x
+                y2_screen = int(box_data['y2']) + min_y
                 if x1_screen < x2_screen and y1_screen < y2_screen:
                     area_frame.area_coords = (x1_screen, y1_screen, x2_screen, y2_screen)
                     # Update button text if this was the area being edited
@@ -10754,12 +10754,7 @@ class GameTextReader:
             except Exception:
                 pass
             self._restore_hotkeys_after_selection()
-            # Area selection in edit view - track as area settings change for all affected areas
-            # Since this could affect multiple areas, we'll just mark as general change
-            # The actual area coordinates are saved, so this is an area setting change
-            # We can't easily determine which specific area, so use a generic approach
-            self._set_unsaved_changes()  # Generic change tracking for edit view area selection
-        
+
         # Store reference to on_close callback so hotkey can call it (toggle closes without saving)
         self._edit_area_done_callback = on_close
         
@@ -11767,8 +11762,6 @@ class GameTextReader:
             print(f"Error auto-saving layout after clearing hotkey: {e}")
 
         print(f"Successfully cleared {hotkey_type}")
-
-        self._set_unsaved_changes('hotkey_cleared', hotkey_type)
         self._ensure_window_width()
         print(f"Hotkey cleared successfully.")
 
@@ -14158,67 +14151,26 @@ class GameTextReader:
     def _create_default_game_units_file(self, file_path):
         """Create the default game units file and return the default units."""
         import json
-        
-        default_units = {
-            'xp': 'Experience Points',
-            'hp': 'Health Points',
-            'mp': 'Mana Points',
-            'gp': 'Gold Pieces',
-            'pp': 'Platinum Pieces',
-            'sp': 'Skill Points',
-            'ep': 'Energy Points',
-            'ap': 'Action Points',
-            'bp': 'Battle Points',
-            'lp': 'Loyalty Points',
-            'cp': 'Challenge Points',
-            'vp': 'Victory Points',
-            'rp': 'Reputation Points',
-            'tp': 'Talent Points',
-            'ar': 'Armor Rating',
-            'dmg': 'Damage',
-            'dps': 'Damage Per Second',
-            'def': 'Defense',
-            'mat': 'Materials',
-            'exp': 'Exploration Points',
-            '§': 'Simoliance',
-            'v-bucks': 'Virtual Bucks',
-            'r$': 'Robux',
-            'nmt': 'Nook Miles Tickets',
-            'be': 'Blue Essence',
-            'radianite': 'Radianite Points',
-            'ow coins': 'Overwatch Coins',
-            '₽': 'PokeDollars',
-            '€$': 'Eurodollars',
-            'z': 'Zenny',
-            'l': 'Lunas',
-            'e': 'Eve',
-            'i': 'Isk',
-            'j': 'Jewel',
-            'sc': 'Star Coins',
-            'o2': 'Oxygen',
-            'pu': 'Power Units',
-            'mc': 'Mana Crystals',
-            'es': 'Essence',
-            'sh': 'Shards',
-            'st': 'Stars',
-            'mu': 'Munny',
-            'b': 'Bolts',
-            'r': 'Rings',
-            'ca': 'Caps',
-            'rns': 'Runes',
-            'sl': 'Souls',
-            'fav': 'Favor',
-            'am': 'Amber',
-            'cc': 'Crystal Cores',
-            'fg': 'Fragments'
-        }
+
+        default_units = {}
         
         # Save default units to file
         with open(file_path, 'w', encoding='utf-8') as f:
-            header = '''//  Game Units Configuration
-//  Format: "short_name": "Full Name"
-//  Example: "xp" will be read as "Experience Points"
-//  Enable "Read gamer units" in the main window to use this feature
+            header = '''//  Text Replacement Configuration
+//  -------------------------------------------------------
+//  This file controls the "Text Replacement" feature in GameTextReader.
+//  When enabled, short words or abbreviations found in the OCR output
+//  will be replaced with the full text you define here before being read aloud.
+//
+//  Format:  "short text": "replacement text"
+//  Example: "hp": "Health Points"
+//           "atk": "Attack"
+//           "§": "Simoleons"
+//
+//  - Keys are case-insensitive by default (configurable in the editor)
+//  - Add your own entries using the Text Replacement editor in the program
+//  - This file is empty by default - add only what you need for your game
+//  -------------------------------------------------------
 
 '''
             f.write(header)
@@ -14236,10 +14188,21 @@ class GameTextReader:
         file_path = os.path.join(temp_path, 'game_units.json')
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
-                header = '''//  Game Units Configuration
-//  Format: "short_name": "Full Name"
-//  Example: "xp" will be read as "Experience Points"
-//  Enable "Read gamer units" in the main window to use this feature
+                header = '''//  Text Replacement Configuration
+//  -------------------------------------------------------
+//  This file controls the "Text Replacement" feature in GameTextReader.
+//  When enabled, short words or abbreviations found in the OCR output
+//  will be replaced with the full text you define here before being read aloud.
+//
+//  Format:  "short text": "replacement text"
+//  Example: "hp": "Health Points"
+//           "atk": "Attack"
+//           "§": "Simoleons"
+//
+//  - Keys are case-insensitive by default (configurable in the editor)
+//  - Add your own entries using the Text Replacement editor in the program
+//  - This file is empty by default - add only what you need for your game
+//  -------------------------------------------------------
 
 '''
                 f.write(header)
@@ -17569,9 +17532,27 @@ class GameTextReader:
             if not isinstance(self.game_units, dict):
                 print("[WARNING] Game Units: Invalid file or skipping.")
             else:
-                game_unit_map = self.game_units
-                
-                # Add default mappings for common game units
+                # Load case-sensitive settings
+                import json as _json, os as _os
+                _cs_path = _os.path.join(APP_DOCUMENTS_DIR, 'gamer_units_case_sensitive.json')
+                case_sensitive_settings = {}
+                try:
+                    if _os.path.exists(_cs_path):
+                        with open(_cs_path, 'r', encoding='utf-8') as _f:
+                            case_sensitive_settings = _json.load(_f)
+                except Exception:
+                    pass
+
+                # Split user units into case-sensitive and case-insensitive groups
+                cs_map = {}  # exact-case matching (original key casing)
+                ci_map = {}  # case-insensitive matching (lowercase keys)
+                for k, v in self.game_units.items():
+                    if case_sensitive_settings.get(k, False):
+                        cs_map[k] = v
+                    else:
+                        ci_map[k.lower()] = v
+
+                # Add default mappings for common game units (case-insensitive only)
                 default_mappings = {
                     'xp': 'Experience Points',
                     'hp': 'Health Points',
@@ -17625,30 +17606,31 @@ class GameTextReader:
                     'cc': 'Crystal Cores',
                     'fg': 'Fragments'
                 }
-                
-                # Update game units with default mappings if they don't exist
                 for key, value in default_mappings.items():
-                    if key not in game_unit_map:
-                        game_unit_map[key] = value
-                # Sort by length descending to match longer units first (e.g., 'gp' before 'g')
-                sorted_units = sorted(game_unit_map.keys(), key=len, reverse=True)
-                
-                # Build regex pattern for all units (word boundaries, case-insensitive)
-                # Pattern matches units with optional numbers: "100 xp" or just "xp"
-                pattern = re.compile(r'(?<!\w)(\d+(?:\.\d+)?)?(\s*)(' + '|'.join(map(re.escape, sorted_units)) + r')(?!\w)', re.IGNORECASE)
-                
-                def game_repl(match):
-                    value = match.group(1) or ''  # Number (optional)
-                    space = match.group(2) or ''   # Space (optional)
-                    unit = match.group(3).lower()
-                    full_name = game_unit_map.get(unit, unit)
-                    
-                    if value:
-                        return f"{value}{space}{full_name}"
-                    else:
-                        return full_name
-                
-                text = pattern.sub(game_repl, text)
+                    if key not in ci_map:
+                        ci_map[key] = value
+
+                # Apply case-sensitive replacements first (exact casing required)
+                if cs_map:
+                    sorted_cs = sorted(cs_map.keys(), key=len, reverse=True)
+                    cs_pattern = re.compile(r'(?<!\w)(\d+(?:\.\d+)?)?(\s*)(' + '|'.join(map(re.escape, sorted_cs)) + r')(?!\w)')
+                    def cs_repl(match, _m=cs_map):
+                        value = match.group(1) or ''
+                        space = match.group(2) or ''
+                        full_name = _m.get(match.group(3), match.group(3))
+                        return f"{value}{space}{full_name}" if value else full_name
+                    text = cs_pattern.sub(cs_repl, text)
+
+                # Apply case-insensitive replacements
+                if ci_map:
+                    sorted_units = sorted(ci_map.keys(), key=len, reverse=True)
+                    pattern = re.compile(r'(?<!\w)(\d+(?:\.\d+)?)?(\s*)(' + '|'.join(map(re.escape, sorted_units)) + r')(?!\w)', re.IGNORECASE)
+                    def game_repl(match, _m=ci_map):
+                        value = match.group(1) or ''
+                        space = match.group(2) or ''
+                        full_name = _m.get(match.group(3).lower(), match.group(3))
+                        return f"{value}{space}{full_name}" if value else full_name
+                    text = pattern.sub(game_repl, text)
 
         # --- Better measurement unit detection logic (run AFTER game units) ---
         if better_unit_detection_enabled:

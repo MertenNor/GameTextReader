@@ -5,7 +5,7 @@ import os
 
 # App information
 APP_NAME = "GameTextReader"
-APP_VERSION = "0.9.4.1"
+APP_VERSION = "0.9.4.3"
 APP_SLUG = APP_NAME.lower().replace(" ", "")
 
 # Determine the Documents directory path reliably on Windows (respecting redirection)
@@ -34,7 +34,7 @@ APP_LAYOUTS_DIR = os.path.join(APP_DOCUMENTS_DIR, 'Layouts')
 GITHUB_REPO = "MertenNor/GameTextReader"  # Format: "username/repository-name"
 
 # Update server configuration (Google Apps Script)
-UPDATE_SERVER_URL = ""
+UPDATE_SERVER_URL = "REDACTED"
 
 # Testing: Set to True to always show update popup (for testing UI). Set to False for release (only shows when update is actually available)
 SHOW_UPDATE_POPUP_FOR_TESTING = False

@@ -11,6 +11,22 @@ from tkinter import messagebox
 
 import sys
 import subprocess
+import ctypes
+
+# Set DPI awareness before any windows are created.
+# This ensures coordinate math works correctly for ALL Windows scale settings
+# (100%, 125%, 150%, custom %, etc.) on any monitor resolution.
+# Without this, the DPI awareness mode is unpredictable depending on Python
+# version and how the exe was packaged, causing the selection area to be offset.
+if sys.platform.startswith('win'):
+    try:
+        # PROCESS_SYSTEM_DPI_AWARE (1): Tkinter reports logical pixels,
+        # Win32 screen capture uses physical pixels, get_dpi_scale() bridges them.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        # Already set (e.g. via exe manifest) or not supported — proceed as-is.
+        pass
+
 import tkinter as tk
 
 # Monkey-patch subprocess.Popen to prevent console window flashing on Windows

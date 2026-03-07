@@ -16,9 +16,9 @@ class GameUnitsEditWindow:
         self.game_text_reader = game_text_reader
         self.window = tk.Toplevel(root)
         self.window.title("Text Replacement Editor")
-        self.window.geometry("500x600")
+        self.window.geometry("540x600")
         self.window.resizable(True, True)
-        
+
         # Register this window as one that disables hotkeys
         self.game_text_reader.register_hotkey_disabling_window("Gamer Units", self.window)
         
@@ -32,9 +32,9 @@ class GameUnitsEditWindow:
         
         # Center the window
         self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() // 2) - (500 // 2)
+        x = (self.window.winfo_screenwidth() // 2) - (540 // 2)
         y = (self.window.winfo_screenheight() // 2) - (600 // 2)
-        self.window.geometry(f"500x600+{x}+{y}")
+        self.window.geometry(f"540x600+{x}+{y}")
         
         # Load game units data
         self.game_units = self.game_text_reader.load_game_units()
@@ -298,7 +298,7 @@ class GameUnitsEditWindow:
         case_sensitive_var = tk.BooleanVar(value=case_sensitive)
         case_frame = tk.Frame(row_frame)
         case_frame.pack(side='left', padx=0)
-        case_checkbox = tk.Checkbutton(case_frame, variable=case_sensitive_var, text="Case\nSensitive")
+        case_checkbox = tk.Checkbutton(case_frame, variable=case_sensitive_var, text="Case Sensitive\non Scan")
         case_checkbox.pack(side='left')
         
         # Actions frame
@@ -362,60 +362,8 @@ class GameUnitsEditWindow:
         self.canvas.yview_moveto(1.0)
     
     def get_default_units(self):
-        """Get the default game units from the source code."""
-        return {
-            'xp': 'Experience Points',
-            'hp': 'Health Points',
-            'mp': 'Mana Points',
-            'gp': 'Gold Pieces',
-            'pp': 'Platinum Pieces',
-            'sp': 'Skill Points',
-            'ep': 'Energy Points',
-            'ap': 'Action Points',
-            'bp': 'Battle Points',
-            'lp': 'Loyalty Points',
-            'cp': 'Challenge Points',
-            'vp': 'Victory Points',
-            'rp': 'Reputation Points',
-            'tp': 'Talent Points',
-            'ar': 'Armor Rating',
-            'dmg': 'Damage',
-            'dps': 'Damage Per Second',
-            'def': 'Defense',
-            'mat': 'Materials',
-            'exp': 'Exploration Points',
-            '§': 'Simoliance',
-            'v-bucks': 'Virtual Bucks',
-            'r$': 'Robux',
-            'nmt': 'Nook Miles Tickets',
-            'be': 'Blue Essence',
-            'radianite': 'Radianite Points',
-            'ow coins': 'Overwatch Coins',
-            '₽': 'PokeDollars',
-            '€$': 'Eurodollars',
-            'z': 'Zenny',
-            'l': 'Lunas',
-            'e': 'Eve',
-            'i': 'Isk',
-            'j': 'Jewel',
-            'sc': 'Star Coins',
-            'o2': 'Oxygen',
-            'pu': 'Power Units',
-            'mc': 'Mana Crystals',
-            'es': 'Essence',
-            'sh': 'Shards',
-            'st': 'Stars',
-            'mu': 'Munny',
-            'b': 'Bolts',
-            'r': 'Rings',
-            'ca': 'Caps',
-            'rns': 'Runes',
-            'sl': 'Souls',
-            'fav': 'Favor',
-            'am': 'Amber',
-            'cc': 'Crystal Cores',
-            'fg': 'Fragments'
-        }
+        """Get the default game units (empty - users add their own)."""
+        return {}
     
     def restore_default(self, short_name_var, full_name_var, case_sensitive_var, row_frame):
         """Restore the default value for a game unit entry based on its position in the list."""
