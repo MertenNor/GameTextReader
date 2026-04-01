@@ -3264,15 +3264,6 @@ class AutomationsWindow:
                 automation['timer_active'] = False
                 automation['timer_start_time'] = None
                 automation['text_last_found_time'] = None
-            
-            automation['has_triggered'] = False
-            automation['timer_active'] = False
-            automation['timer_start_time'] = None
-            automation['text_last_found_time'] = None
-
-            # Cancel timer if active
-            if automation['timer_active']:
-                automation['timer_active'] = False
         except Exception as e:
             print(f"Error checking automation {automation['id']}: {e}")
     

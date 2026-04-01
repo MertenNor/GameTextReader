@@ -96,11 +96,21 @@ class TesseractManager:
 
     def setup_environment(self):
         """Set environment variables for Tesseract."""
-        # Also set TESSDATA_PREFIX as a fallback, although we primarily use --tessdata-dir flag
+        # Only set TESSDATA_PREFIX if the custom dir has traineddata files.
+        # Setting it to an empty directory on a fresh install would shadow the system
+        # Tesseract lookup and cause "Error opening data file" on the first run.
         try:
-            os.environ['TESSDATA_PREFIX'] = os.path.normpath(self.custom_tessdata_dir)
+            custom_dir = os.path.normpath(self.custom_tessdata_dir)
+            has_data = os.path.isdir(custom_dir) and any(
+                f.endswith('.traineddata') for f in os.listdir(custom_dir)
+            )
+            if has_data:
+                os.environ['TESSDATA_PREFIX'] = custom_dir
+            else:
+                # Remove any stale value so system Tesseract can find its own data
+                os.environ.pop('TESSDATA_PREFIX', None)
         except Exception as e:
-            print(f"[WARNING] OCR Manager: Failed to set TESSDATA_PREFIX: {e}")
+            print(f"[WARNING] OCR Manager: Failed to configure TESSDATA_PREFIX: {e}")
 
     def get_tessdata_dir_param(self):
         """Return the argument string for --tessdata-dir."""

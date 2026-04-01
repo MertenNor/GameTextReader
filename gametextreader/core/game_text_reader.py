@@ -17096,9 +17096,11 @@ class GameTextReader:
             self.cleanup_registered_images(area_name)
             
             # Close old image if it exists to free memory
+            # Guard against closing the same object we're about to store (can happen
+            # when preprocess_image returns the input unchanged, e.g. all settings at default)
             if area_name in self.latest_images:
                 old_image = self.latest_images[area_name]
-                if hasattr(old_image, 'close'):
+                if old_image is not image and hasattr(old_image, 'close'):
                     try:
                         old_image.close()
                     except Exception:
