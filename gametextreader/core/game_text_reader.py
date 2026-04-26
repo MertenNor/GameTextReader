@@ -4089,7 +4089,7 @@ class GameTextReader:
             {
                 "var": self.char_normalization_var,
                 "label": "Character normalization:",
-                "description": "Fixes common OCR character recognition errors. Examples: 5→S, 0→O, 2→Z, 8→B, |→i, I→l, 1→l, §→S, €→E. Makes misread text more readable."
+                "description": "Fixes common OCR character recognition errors. Examples: 5→S, 0→O, 2→Z, 8→B, |→I, I→l, 1→l, §→S, €→E. Makes misread text more readable."
             }
         ]
         
@@ -17860,6 +17860,10 @@ class GameTextReader:
         # Join lines with proper spacing
         filtered_text = ' '.join(filtered_lines)
 
+        # OCR frequently misreads capital "I" as "|" (pipe). TTS engines silently skip "|",
+        # causing the word "I" to disappear from speech. Replace unconditionally.
+        filtered_text = filtered_text.replace('|', 'I')
+
         # --- TRANSLATION INJECTION START ---
         if hasattr(self, 'translation_enabled_var') and self.translation_enabled_var.get() and filtered_text.strip():
             try:
@@ -17959,7 +17963,7 @@ class GameTextReader:
                             if self.char_normalization_var.get():
                                 # Character mappings for common OCR errors
                                 char_mappings = {
-                                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                    '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
                                     'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                                     '×': 'x', '♥': 'h', '★': '*'
@@ -17998,7 +18002,7 @@ class GameTextReader:
                             if self.char_normalization_var.get():
                                 # Character mappings for common OCR errors
                                 char_mappings = {
-                                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                    '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
                                     'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                                     '×': 'x', '♥': 'h', '★': '*'
@@ -18026,7 +18030,7 @@ class GameTextReader:
                     if self.char_normalization_var.get():
                         # Character mappings for common OCR errors
                         char_mappings = {
-                            '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                            '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
                             'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                             '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                             '×': 'x', '♥': 'h', '★': '*'
@@ -18061,7 +18065,7 @@ class GameTextReader:
                         if self.char_normalization_var.get():
                             # Character mappings for common OCR errors
                             char_mappings = {
-                                '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                                '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
                                 'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                                 '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                                 '×': 'x', '♥': 'h', '★': '*'
@@ -18076,7 +18080,7 @@ class GameTextReader:
                 # Only character normalization when standalone numbers is disabled
                 # Character mappings for common OCR errors
                 char_mappings = {
-                    '|': 'i', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
+                    '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
                     'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                     '×': 'x', '♥': 'h', '★': '*'

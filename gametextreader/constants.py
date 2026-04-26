@@ -5,7 +5,7 @@ import os
 
 # App information
 APP_NAME = "GameTextReader"
-APP_VERSION = "0.9.4.4"
+APP_VERSION = "0.9.4.5"
 APP_SLUG = APP_NAME.lower().replace(" ", "")
 
 # Determine the Documents directory path reliably on Windows (respecting redirection)
