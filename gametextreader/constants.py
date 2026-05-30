@@ -29,6 +29,14 @@ APP_SETTINGS_PATH = os.path.join(APP_DOCUMENTS_DIR, APP_SETTINGS_FILENAME)
 APP_SETTINGS_BACKUP_FILENAME = f".{APP_SETTINGS_FILENAME}.backup"
 APP_AUTO_READ_SETTINGS_PATH = os.path.join(APP_DOCUMENTS_DIR, 'auto_read_settings.json')
 APP_LAYOUTS_DIR = os.path.join(APP_DOCUMENTS_DIR, 'Layouts')
+APP_AI_VOICES_DIR     = os.path.join(APP_DOCUMENTS_DIR, 'ai_voices')
+APP_PIPER_DIR         = os.path.join(APP_AI_VOICES_DIR, 'piper')
+APP_PIPER_BIN_DIR     = os.path.join(APP_PIPER_DIR, 'piper_bin')
+APP_PIPER_PRESETS_DIR = os.path.join(APP_PIPER_DIR, 'piper_presets')
+APP_PIPER_VOICES_DIR  = os.path.join(APP_PIPER_DIR, 'piper_voices')
+APP_KOKORO_DIR        = os.path.join(APP_AI_VOICES_DIR, 'kokoro')
+APP_KOKORO_CUSTOM_DIR = os.path.join(APP_KOKORO_DIR, 'custom')
+APP_SAPI_PRESETS_DIR  = os.path.join(APP_DOCUMENTS_DIR, 'sapi_presets')
 
 # GitHub repository configuration
 GITHUB_REPO = "MertenNor/GameTextReader"  # Format: "username/repository-name"

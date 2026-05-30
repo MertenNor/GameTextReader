@@ -14,6 +14,7 @@ from ..image_processing import preprocess_image, apply_color_mask
 class ImageProcessingWindow:
     def __init__(self, root, area_name, latest_images, settings, game_text_reader):
         self.window = tk.Toplevel(root)
+        self.window.withdraw()
         self.window.title(f"Image Processing for: {area_name}")
         
         # Set the window icon
@@ -239,6 +240,7 @@ class ImageProcessingWindow:
             'color_mask_preserve_edges': self.color_mask_preserve_edges_var.get(),
             'color_mask_enhance_contrast': self.color_mask_enhance_contrast_var.get()
         }
+        self.window.deiconify()
 
     def create_scrollable_frame(self):
         """Create a layout with fixed image area and scrollable settings section"""

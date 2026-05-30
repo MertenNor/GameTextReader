@@ -56,9 +56,79 @@ except ImportError:
 from ..constants import (
     APP_NAME, APP_VERSION, APP_DOCUMENTS_DIR, APP_LAYOUTS_DIR,
     APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_BACKUP_FILENAME,
-    GITHUB_REPO
+    GITHUB_REPO, APP_AI_VOICES_DIR
 )
+from ..piper_catalog import PIPER_VOICE_CATALOG
+from ..kokoro_catalog import KOKORO_VOICES, load_voices_from_file as _kokoro_load_voices
+from ..constants import (APP_KOKORO_DIR, APP_KOKORO_CUSTOM_DIR,
+                         APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR, APP_PIPER_BIN_DIR,
+                         APP_SAPI_PRESETS_DIR)
 from ..image_processing import preprocess_image, filter_by_color
+
+# Maps lang_REGION codes to short readable labels for the voice dropdown
+_PIPER_REGION_LABELS = {
+    # English
+    'en_US': 'English US',      'en_GB': 'English UK',      'en_AU': 'English AU',
+    'en_NZ': 'English NZ',      'en_CA': 'English CA',      'en_IE': 'English IE',
+    'en_IN': 'English IN',      'en_SC': 'English SC',
+    # Germanic
+    'de_DE': 'German',          'de_AT': 'German AT',       'de_CH': 'German CH',
+    'nl_NL': 'Dutch',           'nl_BE': 'Dutch BE',        'af_ZA': 'Afrikaans',
+    'lb_LU': 'Luxembourgish',   'is_IS': 'Icelandic',
+    # Scandinavian
+    'sv_SE': 'Swedish',         'nb_NO': 'Norwegian',       'nn_NO': 'Norwegian NN',    'no_NO': 'Norwegian',    'da_DK': 'Danish',
+    'fi_FI': 'Finnish',
+    # Romance
+    'fr_FR': 'French',          'fr_BE': 'French BE',       'fr_CH': 'French CH',
+    'es_ES': 'Spanish',         'es_MX': 'Spanish MX',      'es_AR': 'Spanish AR',
+    'es_CU': 'Spanish CU',      'it_IT': 'Italian',         'pt_PT': 'Portuguese',
+    'pt_BR': 'Portuguese BR',   'ro_RO': 'Romanian',        'ca_ES': 'Catalan',
+    'gl_ES': 'Galician',        'oc_FR': 'Occitan',
+    # Slavic
+    'ru_RU': 'Russian',         'pl_PL': 'Polish',          'uk_UA': 'Ukrainian',
+    'cs_CZ': 'Czech',           'sk_SK': 'Slovak',          'bg_BG': 'Bulgarian',
+    'hr_HR': 'Croatian',        'sr_RS': 'Serbian',         'sl_SI': 'Slovenian',
+    'bs_BA': 'Bosnian',         'mk_MK': 'Macedonian',      'be_BY': 'Belarusian',
+    # Baltic
+    'lt_LT': 'Lithuanian',      'lv_LV': 'Latvian',         'et_EE': 'Estonian',
+    # Other European
+    'hu_HU': 'Hungarian',       'el_GR': 'Greek',           'tr_TR': 'Turkish',
+    'sq_AL': 'Albanian',        'mt_MT': 'Maltese',         'cy_GB': 'Welsh',
+    'ga_IE': 'Irish',           'gd_GB': 'Scottish Gaelic', 'br_FR': 'Breton',
+    'eu_ES': 'Basque',          'ka_GE': 'Georgian',        'hy_AM': 'Armenian',
+    # Middle East / North Africa
+    'ar_JO': 'Arabic JO',       'ar_EG': 'Arabic EG',       'ar_SA': 'Arabic SA',
+    'fa_IR': 'Persian',         'he_IL': 'Hebrew',          'ku_TR': 'Kurdish',
+    # South / Southeast Asia
+    'hi_IN': 'Hindi',           'bn_BD': 'Bengali BD',      'bn_IN': 'Bengali IN',
+    'ta_IN': 'Tamil IN',        'ta_LK': 'Tamil LK',        'te_IN': 'Telugu',
+    'kn_IN': 'Kannada',         'ml_IN': 'Malayalam',       'mr_IN': 'Marathi',
+    'gu_IN': 'Gujarati',        'pa_IN': 'Punjabi',         'ur_PK': 'Urdu',
+    'ne_NP': 'Nepali',          'si_LK': 'Sinhala',         'my_MM': 'Burmese',
+    'th_TH': 'Thai',            'id_ID': 'Indonesian',      'ms_MY': 'Malay',
+    'tl_PH': 'Filipino',        'vi_VN': 'Vietnamese',
+    # East Asia
+    'zh_CN': 'Chinese CN',      'zh_TW': 'Chinese TW',      'zh_HK': 'Chinese HK',
+    'ja_JP': 'Japanese',        'ko_KR': 'Korean',          'mn_MN': 'Mongolian',
+    # Africa
+    'sw_CD': 'Swahili CD',      'sw_KE': 'Swahili KE',      'yo_NG': 'Yoruba',
+    'ha_NE': 'Hausa',           'am_ET': 'Amharic',         'so_SO': 'Somali',
+    'zu_ZA': 'Zulu',            'xh_ZA': 'Xhosa',           'st_ZA': 'Sotho',
+}
+
+def _piper_key_to_display(key):
+    """Convert 'en_US-ryan-medium' → 'USA Ryan' for the voice dropdown."""
+    parts = key.split('-')
+    if len(parts) < 3:
+        return key
+    lang_region = parts[0]                          # e.g. 'en_US'
+    quality     = parts[-1]                         # e.g. 'medium'
+    name_parts  = parts[1:-1]                       # e.g. ['ryan']
+    name        = ' '.join(p.capitalize() for p in name_parts)
+    # Fall back to "LANG REGION" (e.g. "xx_YY" → "xx YY") if not in map
+    region      = _PIPER_REGION_LABELS.get(lang_region, lang_region.replace('_', ' '))
+    quality_str = f' [{quality}]' if quality != 'medium' else ''
+    return f"{region} {name}{quality_str}"
 from ..utils import (
     _ensure_uwp_available, UWP_TTS_AVAILABLE,
     get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
@@ -97,6 +167,7 @@ def show_thinkr_warning(game_reader, area_name):
         game_reader._close_editor_if_open()
 
     win = tk.Toplevel(game_reader.root)
+    win.withdraw()
     win.title("Hotkey Conflict Detected!")
     win.geometry("370x170")
     win.resizable(False, False)
@@ -152,9 +223,9 @@ def show_thinkr_warning(game_reader, area_name):
         win.destroy()
 
     win.protocol("WM_DELETE_WINDOW", on_close)
-    # Also patch the OK button and <Return> binding to use on_close
     btn.config(command=on_close)
     win.bind("<Return>", lambda e: on_close())
+    win.deiconify()
 
 
 def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
@@ -172,6 +243,7 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
         game_reader._close_editor_if_open()
 
     win = tk.Toplevel(game_reader.root)
+    win.withdraw()
     win.title("Hotkey Conflict Detected!")
     win.geometry("400x200")
     win.resizable(False, False)
@@ -216,9 +288,9 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
         win.destroy()
 
     win.protocol("WM_DELETE_WINDOW", on_close)
-    # Also patch the OK button and <Return> binding to use on_close
     btn.config(command=on_close)
     win.bind("<Return>", lambda e: on_close())
+    win.deiconify()
 
 
 class GameTextReader:
@@ -298,6 +370,21 @@ class GameTextReader:
         self.ignore_gibberish_var = tk.BooleanVar(value=False)
         self.pause_at_punctuation_var = tk.BooleanVar(value=False)
         self.fullscreen_mode_var = tk.BooleanVar(value=False)
+
+        # Per-area WAV cache: {area_id: {'key': str, 'files': [path, ...]}}
+        self._piper_wav_cache  = {}
+        self._kokoro_wav_cache = {}
+
+        # AI Voice synthesis settings (used by _speak_with_piper / _speak_with_kokoro)
+        self.piper_noise_scale_var = tk.DoubleVar(value=0.667)
+        self.piper_noise_w_var = tk.DoubleVar(value=0.8)
+        self.piper_sentence_silence_var = tk.DoubleVar(value=0.2)
+        self.kokoro_num_threads_var = tk.IntVar(value=0)    # 0 = let ONNX decide
+        self.kokoro_streaming_var  = tk.IntVar(value=1)   # 0=standard, 1=streaming
+        self.kokoro_provider_var   = tk.StringVar(value="CPU")
+        self.piper_streaming_var      = tk.IntVar(value=0)  # 0=standard, 1=sentence-by-sentence
+        self.kokoro_split_mode_var    = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
+        self.piper_split_mode_var     = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
 
         # Hotkey management
         self.hotkey_scancodes = {}  # Dictionary to store scan codes for hotkeys
@@ -473,7 +560,7 @@ class GameTextReader:
         # Add variable for reading standalone numbers only (bypasses character normalization)
         self.standalone_numbers_var = tk.BooleanVar(value=False)
         # Add variable for character normalization (bundles all common mappings including | to i)
-        self.char_normalization_var = tk.BooleanVar(value=False)
+        self.char_normalization_var = tk.BooleanVar(value=True)
 
         # Translation variables
         self.translation_enabled_var = tk.BooleanVar(value=False)
@@ -1031,6 +1118,24 @@ class GameTextReader:
         # End loading state
         self._loading_settings = False
 
+        # Clean up any leftover Piper temp WAV files from a previous crash
+        self._piper_playing = False
+        self._piper_stop_requested = False
+        self._pause_requested = False
+        self._mci_command = None
+        self._piper_wav_path = None
+        self._status_anim_running = False
+        self._status_anim_id = None
+        if os.path.isdir(APP_AI_VOICES_DIR):
+            for _f in os.listdir(APP_AI_VOICES_DIR):
+                if (_f.startswith(('_temp_speech_', '_temp_kokoro_', '_temp_piper_',
+                                   '_cache_piper_', '_cache_kokoro_'))
+                        and _f.endswith('.wav')):
+                    try:
+                        os.remove(os.path.join(APP_AI_VOICES_DIR, _f))
+                    except Exception:
+                        pass
+
     def speak_text(self, text):
         """Speak text using win32com.client (SAPI.SpVoice)."""
         # Apply translation if enabled
@@ -1203,9 +1308,35 @@ class GameTextReader:
     def pause_speaking(self):
         """Pause the ongoing speech by stopping and saving position for resume."""
         try:
-            if not hasattr(self, 'speaker') or not self.speaker or not self.is_speaking:
+            if not self.is_speaking:
                 return
-            
+
+            # AI voice (Piper / Kokoro / custom SAPI) — pause immediately
+            if getattr(self, '_piper_playing', False):
+                if getattr(self, '_mci_alias', None):
+                    # MCI device is open: signal the background thread to pause it
+                    self._mci_command = 'pause'
+                    self.is_speaking = False
+                else:
+                    # Between chunks: block the streaming loop from starting the next chunk
+                    self._pause_requested = True
+                self.is_paused = True
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text="AI Voice: Paused", fg="orange")
+                return
+
+            # AI/custom voice is still synthesising — don't corrupt state, just wait
+            if getattr(self, '_ai_voice_active', False):
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text="Synthesizing... pause available once playback starts", fg="orange")
+                return
+
+            # Regular SAPI is synthesising — abort it
+            self._piper_stop_requested = True
+
+            if not hasattr(self, 'speaker') or not self.speaker:
+                return
+
             # Stop speech immediately (this is fast)
             try:
                 self.speaker.Speak("", 2)  # 2 = SVSFPurgeBeforeSpeak - immediate stop
@@ -1260,7 +1391,21 @@ class GameTextReader:
         try:
             if not self.is_paused:
                 return
-            
+
+            # AI voice resume — signal the background thread or release the inter-chunk flag
+            if getattr(self, '_piper_playing', False) or getattr(self, '_pause_requested', False):
+                if getattr(self, '_mci_alias', None):
+                    # MCI device still open: signal background thread to resume
+                    self._mci_command = 'resume'
+                else:
+                    # Between chunks: release the flag so streaming loop continues
+                    self._pause_requested = False
+                self.is_paused = False
+                self.is_speaking = True
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text="", fg="black")
+                return
+
             if not self.paused_text:
                 # No saved text, can't resume
                 print("[ERROR] TTS: Cannot resume (no saved text).")
@@ -1313,6 +1458,892 @@ class GameTextReader:
             self.pause_speaking()
         # If not speaking and not paused, do nothing
     
+    def _ai_cache_key(self, *parts):
+        import hashlib
+        return hashlib.md5("|".join(str(p) for p in parts).encode('utf-8')).hexdigest()[:16]
+
+    def _clear_ai_cache_for_area(self, area_id):
+        for cache in (self._piper_wav_cache, self._kokoro_wav_cache):
+            entry = cache.pop(area_id, None)
+            if entry:
+                for f in entry.get('files', []):
+                    try:
+                        if os.path.exists(f):
+                            os.remove(f)
+                    except Exception:
+                        pass
+
+    def _speak_with_kokoro(self, text, voice_id, speed_var=None, _on_synth_done=None, area_id=None):
+        """Speak text using Kokoro TTS."""
+        if self.is_speaking:
+            return
+        import sys, wave
+
+        model_path  = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
+        voices_path = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+
+        if not os.path.exists(model_path):
+            msg = "Kokoro model not found.\nOpen the Voice Manager → Kokoro tab to download."
+            print(f"[ERROR] Kokoro: {msg}")
+            self.root.after(0, lambda: messagebox.showerror("Kokoro", msg))
+            return
+
+        speed = 1.0
+        if speed_var:
+            try:
+                spd = max(1, min(int(speed_var.get()), 500))
+                speed = spd / 100.0
+            except (ValueError, TypeError):
+                pass
+
+        # --- WAV cache check (before import so hits skip synthesis entirely) ---
+        if area_id is not None:
+            _ck = self._ai_cache_key(text, voice_id, speed)
+            _cached = self._kokoro_wav_cache.get(area_id)
+            if (_cached and _cached['key'] == _ck
+                    and all(os.path.exists(f) for f in _cached['files'])):
+                print(f"[Kokoro] Cache hit for area {area_id}, replaying {len(_cached['files'])} file(s)")
+                import wave as _wv
+                try:
+                    self.is_speaking = True
+                    self._ai_voice_active = True
+                    self.current_speech_text = text
+                    self._piper_stop_requested = False
+                    self.root.after(0, self._stop_status_animation)
+                    if _on_synth_done:
+                        self.root.after(0, _on_synth_done)
+                    for _cf in _cached['files']:
+                        if self._piper_stop_requested or not self.is_speaking:
+                            break
+                        with _wv.open(_cf, 'rb') as _wf:
+                            _dur = _wf.getnframes() / float(_wf.getframerate())
+                        self.root.after(0, lambda: self.status_label.config(
+                            text="Kokoro: Playing...", fg="#7700aa"))
+                        self._piper_playing = True
+                        self._piper_wav_path = _cf
+                        self._mci_play(_cf, _dur)
+                        while self._pause_requested and not self._piper_stop_requested:
+                            time.sleep(0.05)
+                finally:
+                    self._piper_playing = False
+                    self._pause_requested = False
+                    self._ai_voice_active = False
+                    self._piper_wav_path = None
+                    self.is_speaking = False
+                    self.current_speech_text = None
+                    self.root.after(0, self._stop_status_animation)
+                    self.root.after(0, lambda: self.status_label.config(text="", fg="black"))
+                return
+
+        print(f"[Kokoro] Thread started — voice={voice_id}")
+        sys.stdout.flush()
+        print(f"[Kokoro] Model path: {model_path} exists={os.path.exists(model_path)}")
+        sys.stdout.flush()
+
+        try:
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                misaki_data = os.path.join(sys._MEIPASS, 'misaki')
+                if os.path.isdir(misaki_data):
+                    os.environ.setdefault('MISAKI_HOME', misaki_data)
+                    print(f"[Kokoro] Set MISAKI_HOME={misaki_data}")
+                _esp_data = os.path.join(sys._MEIPASS, 'espeakng_loader', 'espeak-ng-data')
+                if os.path.isdir(_esp_data):
+                    os.environ['ESPEAK_DATA_PATH'] = _esp_data
+                    print(f"[Kokoro] Set ESPEAK_DATA_PATH={_esp_data}")
+                else:
+                    print(f"[Kokoro] WARNING: espeak data not found at {_esp_data}")
+                try:
+                    from phonemizer.backend.espeak.wrapper import EspeakWrapper as _EW
+                    if not hasattr(_EW, 'set_data_path'):
+                        @classmethod
+                        def _sdp(cls, path):
+                            os.environ['ESPEAK_DATA_PATH'] = str(path)
+                        _EW.set_data_path = _sdp
+                        print("[Kokoro] Patched EspeakWrapper.set_data_path")
+                except Exception as _pe:
+                    print(f"[Kokoro] EspeakWrapper patch warning: {_pe}")
+
+            print("[Kokoro] Importing kokoro_onnx...")
+            sys.stdout.flush()
+            from kokoro_onnx import Kokoro as KokoroTTS
+            print("[Kokoro] Import OK")
+            sys.stdout.flush()
+        except Exception as ie:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[ERROR] Kokoro import failed:\n{tb}")
+            sys.stdout.flush()
+            self.root.after(0, lambda m=str(ie): messagebox.showerror("Kokoro Error",
+                f"kokoro_onnx import failed:\n{m}\n\nSee console for full details."))
+            return
+
+        # Custom voices stored as .npy files
+        custom_vec = None
+        custom_pitch = 0.0
+        if voice_id.startswith('custom:'):
+            custom_name = voice_id[7:]
+            custom_path = os.path.join(APP_KOKORO_CUSTOM_DIR, f"{custom_name}.npy")
+            try:
+                import numpy as np
+                custom_vec = np.load(custom_path)
+            except Exception as e:
+                print(f"[ERROR] Kokoro: Could not load custom voice '{custom_name}': {e}")
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Kokoro", f"Custom voice file not found:\n{custom_name}.npy"))
+                return
+            lang = 'en-us'
+            sidecar_path = os.path.join(APP_KOKORO_CUSTOM_DIR, f"{custom_name}.json")
+            if os.path.exists(sidecar_path):
+                try:
+                    import json as _json
+                    with open(sidecar_path, 'r', encoding='utf-8') as _sf:
+                        _meta = _json.load(_sf)
+                    if _meta.get('type') == 'pitched':
+                        custom_pitch = float(_meta.get('pitch', 0))
+                except Exception as _pe:
+                    print(f"[Kokoro] Could not read sidecar for '{custom_name}': {_pe}")
+        else:
+            _kv_bin = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+            _kv = _kokoro_load_voices(_kv_bin) if os.path.exists(_kv_bin) else KOKORO_VOICES
+            lang = _kv.get(voice_id, ('', 'en-us'))[1]
+
+        wav_path = os.path.join(APP_AI_VOICES_DIR, f"_temp_kokoro_{os.getpid()}.wav")
+        try:
+            self.is_speaking = True
+            self._ai_voice_active = True
+            self.current_speech_text = text
+            self.root.after(0, lambda: self._start_status_animation("Kokoro: Generating", "#7700aa"))
+
+            n_threads = getattr(self, 'kokoro_num_threads_var', None)
+            n_threads = n_threads.get() if n_threads else 0
+
+            provider_var = getattr(self, 'kokoro_provider_var', None)
+            provider_sel = provider_var.get() if provider_var else "CPU"
+
+            # Reload model when thread count or provider changes
+            if (not hasattr(self, '_kokoro_instance') or self._kokoro_instance is None or
+                    getattr(self, '_kokoro_threads', -1) != n_threads or
+                    getattr(self, '_kokoro_provider', None) != provider_sel):
+                if n_threads > 0:
+                    os.environ['OMP_NUM_THREADS'] = str(n_threads)
+                    os.environ['ONNXRUNTIME_NUM_THREADS'] = str(n_threads)
+                else:
+                    os.environ.pop('OMP_NUM_THREADS', None)
+                    os.environ.pop('ONNXRUNTIME_NUM_THREADS', None)
+                if provider_sel == "DirectML":
+                    providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
+                    print("[Kokoro] Loading model with DirectML + CPU fallback...")
+                elif provider_sel == "CUDA":
+                    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                    print("[Kokoro] Loading model with CUDA + CPU fallback...")
+                else:
+                    providers = ['CPUExecutionProvider']
+                    print(f"[Kokoro] Loading model (threads={'auto' if n_threads == 0 else n_threads})...")
+                try:
+                    self._kokoro_instance = KokoroTTS(model_path, voices_path,
+                                                      providers=providers)
+                except TypeError:
+                    # Older kokoro-onnx versions don't accept providers kwarg
+                    self._kokoro_instance = KokoroTTS(model_path, voices_path)
+                self._kokoro_threads = n_threads
+                self._kokoro_provider = provider_sel
+                print("[Kokoro] Model loaded")
+
+            voice_arg = custom_vec if custom_vec is not None else voice_id
+            streaming = getattr(self, 'kokoro_streaming_var', None)
+            streaming = streaming.get() == 1 if streaming else False
+
+            if streaming:
+                print(f"[Kokoro] Streaming voice={voice_id}: {text[:60]!r}")
+                import numpy as np, queue as _queue, threading as _threading
+
+                if not self.is_speaking:
+                    return
+                self._piper_stop_requested = False
+
+                _kmode = getattr(self, 'kokoro_split_mode_var', None)
+                sentences = self._split_sentences(
+                    text, mode=_kmode.get() if _kmode else 1) or [text]
+                _DONE = object()
+                chunk_q = _queue.Queue(maxsize=1)
+
+                def _producer():
+                    try:
+                        for idx, sentence in enumerate(sentences):
+                            if not self.is_speaking or self._piper_stop_requested:
+                                break
+                            print(f"[Kokoro] Synthesising {idx+1}/{len(sentences)}: {sentence[:50]!r}")
+                            s, sr = self._kokoro_instance.create(
+                                sentence, voice=voice_arg, speed=speed, lang=lang)
+                            if s is not None and len(s) > 0:
+                                if custom_pitch:
+                                    try:
+                                        from pedalboard import PitchShift as _PitchShift
+                                        s = _PitchShift(semitones=float(custom_pitch))(s, sample_rate=int(sr))
+                                    except Exception as _pe:
+                                        print(f"[Kokoro] Pitch shift failed: {_pe}")
+                                chunk_q.put((s, sr))
+                    except Exception as _e:
+                        print(f"[Kokoro] Producer error: {_e}")
+                    finally:
+                        chunk_q.put(_DONE)
+
+                _threading.Thread(target=_producer, daemon=True).start()
+
+                first_chunk = True
+                _current_chunk = None
+                play_idx = 0
+                _played_chunks = []   # collected for caching
+                _was_stopped = False
+                while True:
+                    try:
+                        item = chunk_q.get_nowait()
+                    except _queue.Empty:
+                        self.root.after(0, lambda: self._start_status_animation(
+                            "Kokoro: Generating", "#7700aa"))
+                        item = chunk_q.get()
+                        self.root.after(0, self._stop_status_animation)
+
+                    if item is _DONE:
+                        break
+                    if not self.is_speaking or self._piper_stop_requested:
+                        _was_stopped = True
+                        break
+                    samples, sample_rate = item
+                    _current_chunk = os.path.join(APP_AI_VOICES_DIR,
+                                                  f"_temp_kokoro_{os.getpid()}_{play_idx}.wav")
+                    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                    with wave.open(_current_chunk, 'wb') as f:
+                        f.setnchannels(1); f.setsampwidth(2)
+                        f.setframerate(sample_rate); f.writeframes(pcm.tobytes())
+                    if first_chunk:
+                        self.root.after(0, self._stop_status_animation)
+                        if _on_synth_done:
+                            self.root.after(0, _on_synth_done)
+                        first_chunk = False
+                    self.root.after(0, lambda: self.status_label.config(
+                        text="Kokoro: Playing...", fg="#7700aa"))
+                    self._piper_playing = True
+                    self._piper_wav_path = _current_chunk
+                    print(f"[Kokoro] Playing chunk {play_idx+1}")
+                    self._mci_play(_current_chunk, len(samples) / float(sample_rate))
+                    _played_chunks.append(_current_chunk)
+                    _current_chunk = None
+                    while self._pause_requested and not self._piper_stop_requested:
+                        time.sleep(0.05)
+                    play_idx += 1
+
+                if first_chunk:
+                    self.root.after(0, self._stop_status_animation)
+                    if _on_synth_done:
+                        self.root.after(0, _on_synth_done)
+                if _current_chunk:
+                    try: os.remove(_current_chunk)
+                    except Exception: pass
+
+                # Store cache or clean up chunks
+                if area_id is not None and not _was_stopped and _played_chunks:
+                    _ck = self._ai_cache_key(text, voice_id, speed)
+                    _old = self._kokoro_wav_cache.pop(area_id, None)
+                    if _old:
+                        for _of in _old.get('files', []):
+                            if _of not in _played_chunks:
+                                try: os.remove(_of)
+                                except Exception: pass
+                    _cache_files = []
+                    for _i, _chunk in enumerate(_played_chunks):
+                        _cf = os.path.join(APP_AI_VOICES_DIR, f"_cache_kokoro_{area_id}_{_i}.wav")
+                        try:
+                            if os.path.exists(_cf):
+                                os.remove(_cf)
+                            os.rename(_chunk, _cf)
+                            _cache_files.append(_cf)
+                        except Exception as _re:
+                            print(f"[Kokoro] Cache rename failed for chunk {_i}: {_re}")
+                            _cache_files.append(_chunk)
+                    self._kokoro_wav_cache[area_id] = {'key': _ck, 'files': _cache_files}
+                    print(f"[Kokoro] Cached {len(_cache_files)} chunk(s) for area {area_id}")
+                else:
+                    for _chunk in _played_chunks:
+                        try:
+                            if os.path.exists(_chunk):
+                                os.remove(_chunk)
+                        except Exception:
+                            pass
+                print("[Kokoro] Streaming complete")
+            else:
+                # Standard mode — synthesise everything then play once
+                self._piper_stop_requested = False
+                print(f"[Kokoro] Synthesizing voice={voice_id}: {text[:60]!r}")
+                samples, sample_rate = self._kokoro_instance.create(
+                    text, voice=voice_arg, speed=speed, lang=lang)
+
+                if custom_pitch:
+                    try:
+                        from pedalboard import PitchShift as _PitchShift
+                        samples = _PitchShift(semitones=float(custom_pitch))(samples, sample_rate=int(sample_rate))
+                    except Exception as _pe:
+                        print(f"[Kokoro] Pitch shift failed: {_pe}")
+
+                import numpy as np
+                pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                with wave.open(wav_path, 'wb') as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(sample_rate)
+                    f.writeframes(pcm.tobytes())
+
+                self.root.after(0, self._stop_status_animation)
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Kokoro: Playing...", fg="#7700aa"))
+                if _on_synth_done:
+                    self.root.after(0, _on_synth_done)
+                print("[Kokoro] Playing audio...")
+                if self._piper_stop_requested or not self.is_speaking:
+                    return
+                self._piper_playing = True
+                self._piper_wav_path = wav_path
+                _dur = len(samples) / float(sample_rate)
+                self._mci_play(wav_path, _dur)
+                print("[Kokoro] Playback complete")
+
+                # Store in cache if not stopped
+                if area_id is not None and not self._piper_stop_requested:
+                    _ck = self._ai_cache_key(text, voice_id, speed)
+                    _cf = os.path.join(APP_AI_VOICES_DIR, f"_cache_kokoro_{area_id}.wav")
+                    _old = self._kokoro_wav_cache.pop(area_id, None)
+                    if _old:
+                        for _of in _old.get('files', []):
+                            if _of != _cf:
+                                try: os.remove(_of)
+                                except Exception: pass
+                    try:
+                        if os.path.exists(_cf):
+                            os.remove(_cf)
+                        os.rename(wav_path, _cf)
+                        self._kokoro_wav_cache[area_id] = {'key': _ck, 'files': [_cf]}
+                        wav_path = _cf   # don't delete in finally
+                        print(f"[Kokoro] Cached standard WAV for area {area_id}")
+                    except Exception as _re:
+                        print(f"[Kokoro] Cache store failed: {_re}")
+
+        except Exception as e:
+            import traceback, sys
+            tb = traceback.format_exc()
+            print(f"[ERROR] Kokoro:\n{tb}")
+            sys.stdout.flush()
+            self.root.after(0, lambda m=str(e), t=type(e).__name__: messagebox.showerror(
+                "Kokoro Error", f"{t}: {m}\n\nSee console for full details."))
+        finally:
+            self._piper_playing = False
+            self._pause_requested = False
+            self._ai_voice_active = False
+            self._piper_wav_path = None
+            self.is_speaking = False
+            self.current_speech_text = None
+            self.root.after(0, self._stop_status_animation)
+            self.root.after(0, lambda: self.status_label.config(text="", fg="black"))
+            # Don't delete cache files (wav_path was renamed to _cache_kokoro_* on success)
+            _is_cache = os.path.basename(wav_path).startswith('_cache_kokoro_') if wav_path else False
+            try:
+                if not _is_cache and wav_path and os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+
+
+    def _split_sentences(self, text, max_words=15, mode=None):
+        """Split text into speakable chunks for streaming TTS.
+
+        Mode 0 (simple)   — sentence boundaries only.
+        Mode 1 (advanced) — sentence + clause boundaries + word-count safety net.
+
+        Both modes handle closing/opening quotes around sentence endings.
+        """
+        import re
+
+        if mode is None:
+            mode = 1
+
+        # Normalise smart/curly quotes to ASCII so the regex works regardless of source
+        for _l, _r in (('“', '"'), ('”', '"'), ('‘', "'"), ('’', "'")):
+            text = text.replace(_l, _r)
+
+        # Sentence split — fixed-width lookbehinds (Python 3.10 compatible).
+        # Handles plain endings and ASCII closing/opening quotes around boundaries.
+        _sent_pat = re.compile(
+            r'(?<=[!?])\s+(?=["\']?[A-Z])'        # plain !?      → Capital
+            r'|(?<=[!?]")\s+(?=["\']?[A-Z])'      # !"            → "Capital
+            r"|(?<=[!?]')\s+(?=[\"']?[A-Z])"      # !'            → 'Capital
+            r'|(?<=[a-z]{2}\.)\s+(?=[A-Z])'       # word.         → Capital
+            r'|(?<=[a-z]{2}\.)\s+(?="[A-Z])'      # word.   space → "Capital
+            r"|(?<=[a-z]{2}\.)\s+(?='[A-Z])"      # word.   space → 'Capital
+            r'|(?<=[a-z]{2}.")\s+(?=["\']?[A-Z])' # word."  space → "Capital
+            r"|(?<=[a-z]{2}.')\s+(?=[\"']?[A-Z])" # word.'  space → 'Capital
+        )
+        sentences = [s.strip() for s in _sent_pat.split(text) if s.strip()]
+        if not sentences:
+            sentences = [text]
+
+        if mode == 0:
+            # Simple — return sentences as-is (no clause split, no word limit)
+            return sentences
+
+        # Advanced — clause split with minimum-words guard + word-count safety net
+        MIN_CLAUSE_WORDS = 6  # don't break at a comma unless preceding text is this long
+        chunks = []
+        for sentence in sentences:
+            raw_clauses = re.split(r'(?<=[,;:—–])\s+', sentence)
+
+            # Merge short clauses forward until the accumulated chunk is long enough
+            merged = []
+            current = ""
+            for clause in raw_clauses:
+                clause = clause.strip()
+                if not clause:
+                    continue
+                if current:
+                    if len(current.split()) < MIN_CLAUSE_WORDS:
+                        current += " " + clause   # too short — absorb next clause
+                    else:
+                        merged.append(current)
+                        current = clause
+                else:
+                    current = clause
+            if current:
+                merged.append(current)
+
+            # Word-count safety net on whatever survived
+            for chunk in merged:
+                words = chunk.split()
+                if len(words) <= max_words:
+                    chunks.append(chunk)
+                else:
+                    while words:
+                        chunks.append(' '.join(words[:max_words]))
+                        words = words[max_words:]
+
+        return chunks
+
+    def _speak_with_piper(self, text, model_key, speed_var=None, _on_synth_done=None, pitch_override=None, area_id=None):
+        """Speak text using the bundled piper-tts Python package."""
+        if self.is_speaking:
+            return
+        # Resolve custom preset → base voice + override settings
+        preset_overrides = None
+        if model_key.startswith('preset:'):
+            preset_name = model_key[7:]
+            preset_path = os.path.join(APP_PIPER_PRESETS_DIR, f"{preset_name}.json")
+            try:
+                with open(preset_path, 'r', encoding='utf-8') as _f:
+                    preset_overrides = json.load(_f)
+                model_key = preset_overrides['base_voice']
+            except Exception as _e:
+                print(f"[ERROR] Piper preset '{preset_name}': {_e}")
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Piper Preset", f"Could not load preset '{preset_name}':\n{_e}"))
+                return
+
+        onnx_path = os.path.join(APP_PIPER_VOICES_DIR, f"{model_key}.onnx")
+
+        if not os.path.exists(onnx_path):
+            print(f"[ERROR] AI Voice: Model not found: {onnx_path}")
+            _display = _piper_key_to_display(model_key)
+            _mk = model_key
+            self.root.after(0, lambda: messagebox.showerror(
+                "AI Voice Error",
+                f"Voice model not found:\n  {_display}  ({_mk})\n\nOpen the Voice Manager to download it."))
+            return
+
+        # length_scale: 1.0 = normal, 0.5 = 2x faster, 2.0 = 2x slower
+        length_scale = 1.0
+        if speed_var:
+            try:
+                spd = max(1, min(int(speed_var.get()), 500))
+                length_scale = 100.0 / spd
+            except (ValueError, TypeError):
+                pass
+
+        # Resolve synthesis params for cache key (after preset resolution)
+        _ns = getattr(self, 'piper_noise_scale_var', None)
+        _nw = getattr(self, 'piper_noise_w_var', None)
+        _noise_scale = float(preset_overrides.get('noise_scale', 0.667)) if preset_overrides else (_ns.get() if _ns else 0.667)
+        _noise_w     = float(preset_overrides.get('noise_w', 0.8))      if preset_overrides else (_nw.get() if _nw else 0.8)
+        _pitch       = float(preset_overrides.get('pitch', 0.0))         if preset_overrides else (float(pitch_override) if pitch_override is not None else 0.0)
+
+        # --- WAV cache check ---
+        if area_id is not None:
+            _ck = self._ai_cache_key(text, model_key, length_scale, _noise_scale, _noise_w, _pitch)
+            _cached = self._piper_wav_cache.get(area_id)
+            if (_cached and _cached['key'] == _ck
+                    and all(os.path.exists(f) for f in _cached['files'])):
+                print(f"[Piper] Cache hit for area {area_id}, replaying {len(_cached['files'])} file(s)")
+                import wave as _wv
+                try:
+                    self.is_speaking = True
+                    self._ai_voice_active = True
+                    self.current_speech_text = text
+                    self._piper_stop_requested = False
+                    self.root.after(0, self._stop_status_animation)
+                    if _on_synth_done:
+                        self.root.after(0, _on_synth_done)
+                    for _cf in _cached['files']:
+                        if self._piper_stop_requested or not self.is_speaking:
+                            break
+                        with _wv.open(_cf, 'rb') as _wf:
+                            _dur = _wf.getnframes() / float(_wf.getframerate())
+                        self.root.after(0, lambda: self.status_label.config(
+                            text="Piper: Playing...", fg="#0055aa"))
+                        self._piper_playing = True
+                        self._piper_wav_path = _cf
+                        self._mci_play(_cf, _dur)
+                        while self._pause_requested and not self._piper_stop_requested:
+                            time.sleep(0.05)
+                finally:
+                    self._piper_playing = False
+                    self._pause_requested = False
+                    self._ai_voice_active = False
+                    self._piper_wav_path = None
+                    self.is_speaking = False
+                    self.current_speech_text = None
+                    self.root.after(0, self._stop_status_animation)
+                    self.root.after(0, lambda: self.status_label.config(text="", fg="black"))
+                return
+
+        wav_path = os.path.join(APP_AI_VOICES_DIR, f"_temp_speech_{os.getpid()}.wav")
+        self._piper_stop_requested = False
+        try:
+            self.is_speaking = True
+            self._ai_voice_active = True
+            self.current_speech_text = text
+            self.root.after(0, lambda: self._start_status_animation("Piper: Generating", "#0055aa"))
+
+            if pitch_override is not None:
+                pitch_semitones = float(pitch_override)
+            elif preset_overrides:
+                pitch_semitones = float(preset_overrides.get('pitch', 0.0))
+            else:
+                pitch_semitones = 0.0
+
+            noise_scale_val = _noise_scale
+            noise_w_val     = _noise_w
+
+            from piper import PiperVoice, SynthesisConfig
+            voice = PiperVoice.load(onnx_path)
+            syn_config = SynthesisConfig(
+                length_scale=length_scale,
+                noise_scale=noise_scale_val,
+                noise_w_scale=noise_w_val,
+            )
+
+            streaming = getattr(self, 'piper_streaming_var', None)
+            streaming = streaming.get() == 1 if streaming else False
+
+            if streaming:
+                import wave as _wave, queue as _queue, threading as _threading
+
+                _pmode = getattr(self, 'piper_split_mode_var', None)
+                sentences = self._split_sentences(
+                    text, mode=_pmode.get() if _pmode else 1) or [text]
+                _DONE = object()
+                chunk_q = _queue.Queue(maxsize=1)
+
+                def _producer():
+                    try:
+                        for i, sentence in enumerate(sentences):
+                            if self._piper_stop_requested or not self.is_speaking:
+                                break
+                            cpath = os.path.join(APP_AI_VOICES_DIR,
+                                                 f"_temp_piper_{os.getpid()}_{i}.wav")
+                            print(f"[AI Voice] Synthesising {i+1}/{len(sentences)}: {sentence[:50]!r}")
+                            with _wave.open(cpath, 'wb') as _wf:
+                                voice.synthesize_wav(sentence, _wf, syn_config=syn_config)
+                            if os.path.exists(cpath):
+                                if pitch_semitones != 0.0:
+                                    self._piper_apply_pitch_to_wav(cpath, pitch_semitones)
+                                chunk_q.put(cpath)
+                            else:
+                                try: os.remove(cpath)
+                                except Exception: pass
+                    except Exception as _e:
+                        print(f"[AI Voice] Producer error: {_e}")
+                    finally:
+                        chunk_q.put(_DONE)
+
+                _threading.Thread(target=_producer, daemon=True).start()
+
+                first = True
+                _current_chunk = None
+                _played_chunks = []
+                _was_stopped = False
+                while True:
+                    try:
+                        item = chunk_q.get_nowait()
+                    except _queue.Empty:
+                        self.root.after(0, lambda: self._start_status_animation(
+                            "Piper: Generating", "#0055aa"))
+                        item = chunk_q.get()
+                        self.root.after(0, self._stop_status_animation)
+
+                    if item is _DONE:
+                        break
+                    if self._piper_stop_requested or not self.is_speaking:
+                        _was_stopped = True
+                        break
+                    _current_chunk = item
+                    with _wave.open(_current_chunk, 'rb') as _wf:
+                        _dur = _wf.getnframes() / float(_wf.getframerate())
+                    if first:
+                        self.root.after(0, self._stop_status_animation)
+                        if self._piper_stop_requested or not self.is_speaking:
+                            _was_stopped = True
+                            break
+                        if _on_synth_done:
+                            self.root.after(0, _on_synth_done)
+                        first = False
+                    self.root.after(0, lambda: self.status_label.config(
+                        text="Piper: Playing...", fg="#0055aa"))
+                    self._piper_playing = True
+                    self._piper_wav_path = _current_chunk
+                    print(f"[AI Voice] Playing chunk {_current_chunk}")
+                    self._mci_play(_current_chunk, _dur)
+                    _played_chunks.append(_current_chunk)
+                    _current_chunk = None
+                    while self._pause_requested and not self._piper_stop_requested:
+                        time.sleep(0.05)
+
+                if first:
+                    self.root.after(0, self._stop_status_animation)
+                    if _on_synth_done:
+                        self.root.after(0, _on_synth_done)
+                if _current_chunk:
+                    try: os.remove(_current_chunk)
+                    except Exception: pass
+
+                # Store cache or clean up
+                if area_id is not None and not _was_stopped and _played_chunks:
+                    _ck = self._ai_cache_key(text, model_key, length_scale, _noise_scale, _noise_w, _pitch)
+                    _old = self._piper_wav_cache.pop(area_id, None)
+                    if _old:
+                        for _of in _old.get('files', []):
+                            if _of not in _played_chunks:
+                                try: os.remove(_of)
+                                except Exception: pass
+                    _cache_files = []
+                    for _i, _chunk in enumerate(_played_chunks):
+                        _cf = os.path.join(APP_AI_VOICES_DIR, f"_cache_piper_{area_id}_{_i}.wav")
+                        try:
+                            if os.path.exists(_cf):
+                                os.remove(_cf)
+                            os.rename(_chunk, _cf)
+                            _cache_files.append(_cf)
+                        except Exception:
+                            _cache_files.append(_chunk)
+                    self._piper_wav_cache[area_id] = {'key': _ck, 'files': _cache_files}
+                    print(f"[Piper] Cached {len(_cache_files)} chunk(s) for area {area_id}")
+                else:
+                    for _chunk in _played_chunks:
+                        try:
+                            if os.path.exists(_chunk):
+                                os.remove(_chunk)
+                        except Exception:
+                            pass
+                print("[AI Voice] Sentence-by-sentence playback complete")
+            else:
+                # Standard mode — full text at once
+                print(f"[AI Voice] Synthesizing with piper-tts: {text[:60]!r}")
+                print(f"[AI Voice] flags: noise_scale={noise_scale_val:.3f}  noise_w_scale={noise_w_val:.3f}  length={length_scale:.2f}")
+                import wave as _wave
+                with _wave.open(wav_path, 'wb') as _wf:
+                    voice.synthesize_wav(text, _wf, syn_config=syn_config)
+
+                if pitch_semitones != 0.0:
+                    self._piper_apply_pitch_to_wav(wav_path, pitch_semitones)
+
+                with _wave.open(wav_path, 'rb') as _wf:
+                    _dur = _wf.getnframes() / float(_wf.getframerate())
+                self.root.after(0, self._stop_status_animation)
+                if self._piper_stop_requested or not self.is_speaking:
+                    return
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Piper: Playing...", fg="#0055aa"))
+                if _on_synth_done:
+                    self.root.after(0, _on_synth_done)
+                print(f"[AI Voice] WAV written, playing...")
+                self._piper_playing = True
+                self._piper_wav_path = wav_path
+                self._mci_play(wav_path, _dur)
+                print(f"[AI Voice] Playback complete")
+
+                # Store in cache if not stopped
+                if area_id is not None and not self._piper_stop_requested:
+                    _ck = self._ai_cache_key(text, model_key, length_scale, _noise_scale, _noise_w, _pitch)
+                    _cf = os.path.join(APP_AI_VOICES_DIR, f"_cache_piper_{area_id}.wav")
+                    _old = self._piper_wav_cache.pop(area_id, None)
+                    if _old:
+                        for _of in _old.get('files', []):
+                            if _of != _cf:
+                                try: os.remove(_of)
+                                except Exception: pass
+                    try:
+                        if os.path.exists(_cf):
+                            os.remove(_cf)
+                        os.rename(wav_path, _cf)
+                        self._piper_wav_cache[area_id] = {'key': _ck, 'files': [_cf]}
+                        wav_path = _cf
+                        print(f"[Piper] Cached standard WAV for area {area_id}")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] AI Voice: {e}")
+            traceback.print_exc()
+        finally:
+            self._piper_playing = False
+            self._pause_requested = False
+            self._ai_voice_active = False
+            self._piper_wav_path = None
+            self.is_speaking = False
+            self.current_speech_text = None
+            self.root.after(0, self._stop_status_animation)
+            self.root.after(0, lambda: self.status_label.config(text="", fg="black"))
+            _is_cache = os.path.basename(wav_path).startswith('_cache_piper_') if wav_path else False
+            try:
+                if not _is_cache and wav_path and os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+
+    def _piper_apply_pitch_to_wav(self, wav_path, semitones):
+        """Read wav_path, pitch-shift by semitones, write back in place."""
+        try:
+            import wave, numpy as np
+            from pedalboard import PitchShift as _PitchShift
+            with wave.open(wav_path, 'rb') as wf:
+                sr    = wf.getframerate()
+                raw   = wf.readframes(wf.getnframes())
+                samps = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+            samps = _PitchShift(semitones=float(semitones))(samps, sample_rate=int(sr))
+            pcm = (np.clip(samps, -1.0, 1.0) * 32767).astype(np.int16)
+            with wave.open(wav_path, 'wb') as wf:
+                wf.setnchannels(1); wf.setsampwidth(2)
+                wf.setframerate(sr); wf.writeframes(pcm.tobytes())
+        except Exception as e:
+            print(f"[AI Voice] Pitch shift failed: {e}")
+
+    def _speak_with_sapi_pitched(self, text, voice_name, pitch, speed_var=None, _on_synth_done=None):
+        """Speak via SAPI using the voice's native pitch control (SSML markup).
+        Works for both online and offline SAPI voices — no WAV file needed."""
+        import win32com.client
+
+        voice_obj = None
+        if hasattr(self, 'voices'):
+            for v in self.voices:
+                if hasattr(v, 'GetDescription') and v.GetDescription() == voice_name:
+                    voice_obj = v
+                    break
+        if voice_obj is None:
+            try:
+                for v in win32com.client.Dispatch("SAPI.SpVoice").GetVoices():
+                    if v.GetDescription() == voice_name:
+                        voice_obj = v
+                        break
+            except Exception:
+                pass
+        if voice_obj is None:
+            print(f"[SAPI Preset] Voice not found: {voice_name}")
+            return
+
+        try:
+            self.is_speaking = True
+            self.current_speech_text = text
+            import time as _time
+            self.speech_start_time = _time.time()
+
+            self.speaker.Voice = voice_obj
+            if speed_var:
+                try:
+                    spd = max(1, min(int(speed_var.get()), 500))
+                    self.speaker.Rate = (spd - 100) // 10
+                except Exception:
+                    pass
+
+            # Convert semitones to SAPI's Middle pitch scale (-10 to +10)
+            speak_flags = 1  # SVSFlagsAsync
+            speak_text  = text
+            if pitch:
+                sapi_pitch = max(-10, min(10, int(round(pitch * 10 / 12))))
+                if sapi_pitch != 0:
+                    speak_text  = f'<Pitch Middle="{sapi_pitch:+d}"/>{text}'
+                    speak_flags = 1 | 8   # SVSFlagsAsync | SVSFIsXML
+
+            if _on_synth_done:
+                self.root.after(0, _on_synth_done)
+            self.root.after(0, lambda: self.status_label.config(
+                text="SAPI: Playing...", fg="#226600"))
+
+            self.speaker.Speak(speak_text, speak_flags)
+            self._start_speech_monitor()
+
+        except Exception as e:
+            print(f"[SAPI Preset] Error: {e}")
+            self.root.after(0, lambda: self.status_label.config(
+                text="SAPI Preset error — see console", fg="red"))
+            self.is_speaking = False
+
+    def _speak_with_sapi_preset(self, text, preset_name, speed_var=None, _on_synth_done=None):
+        """Load a saved SAPI preset JSON and speak with its pitch setting."""
+        preset_path = os.path.join(APP_SAPI_PRESETS_DIR, f"{preset_name}.json")
+        try:
+            with open(preset_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[SAPI Preset] Load failed for '{preset_name}': {e}")
+            return
+        voice_name = data.get('base_voice', '')
+        pitch = float(data.get('pitch', 0.0))
+        self._speak_with_sapi_pitched(text, voice_name, pitch, speed_var, _on_synth_done)
+
+    def _mci_play(self, wav_path, duration_sec):
+        """Play a WAV via Windows MCI — stoppable and pauseable from any thread."""
+        import ctypes
+        _winmm = ctypes.windll.winmm
+        _alias = 'gtrsnd'
+
+        _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+
+        ret = _winmm.mciSendStringW(f'open "{wav_path}" type waveaudio alias {_alias}',
+                                     None, 0, None)
+        if ret != 0:
+            print(f"[WARN] MCI open failed (code {ret}), falling back to winsound — pause/resume will not work")
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+            return
+
+        self._mci_alias = _alias
+        _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
+
+        # Poll loop — runs on the same thread that owns the MCI device.
+        # Pause/resume commands are issued here (cross-thread MCI calls fail on Windows).
+        buf = ctypes.create_unicode_buffer(256)
+        while self._piper_playing:
+            # Execute any pending pause/resume command from the main thread
+            cmd = getattr(self, '_mci_command', None)
+            if cmd:
+                self._mci_command = None
+                _winmm.mciSendStringW(f'{cmd} {_alias}', None, 0, None)
+
+            _winmm.mciSendStringW(f'status {_alias} mode', buf, 256, None)
+            mode = buf.value
+            if mode == 'stopped' or mode not in ('playing', 'paused'):
+                break
+            time.sleep(0.05)
+
+        _winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+        _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+        self._mci_alias = None
+        self._mci_command = None
+
     def stop_speaking(self):
         """Stop the ongoing speech immediately."""
         # Stop both SAPI and UWP playback
@@ -1322,6 +2353,23 @@ class GameTextReader:
                     self.speaker.Speak("", 2)
                 except Exception:
                     pass
+            # Stop any in-progress Piper/Kokoro playback immediately
+            self._piper_playing = False
+            self._piper_stop_requested = True
+            self._pause_requested = False
+            self._mci_command = None
+            try:
+                import ctypes
+                _alias = getattr(self, '_mci_alias', None) or 'gtrsnd'
+                ctypes.windll.winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+                ctypes.windll.winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+            except Exception:
+                pass
+            try:
+                import winsound as _ws
+                _ws.PlaySound(None, _ws.SND_PURGE)
+            except Exception:
+                pass
             self.is_speaking = False
             self.is_paused = False  # Reset pause state when stopping
             # Clear pause/resume tracking
@@ -1344,6 +2392,7 @@ class GameTextReader:
             # print("Speech stopped.") # Internal log removed for cleanliness
             # Stop speech monitor
             self._stop_speech_monitor()
+            self._stop_status_animation()
             # Update status label if it exists
             if hasattr(self, 'status_label'):
                 self.status_label.config(text="", fg="black")
@@ -1352,6 +2401,37 @@ class GameTextReader:
             self.is_speaking = False
             self.is_paused = False
             self._stop_speech_monitor()
+
+    def _start_status_animation(self, prefix, color):
+        """Start an animated 'prefix. / prefix. . / prefix. . .' in the main status label."""
+        self._stop_status_animation()
+        self._status_anim_running = True
+        self._status_anim_prefix = prefix
+        self._status_anim_color  = color
+        self._status_anim_id     = None
+        self._animate_status(0)
+
+    def _animate_status(self, step):
+        if not getattr(self, '_status_anim_running', False):
+            return
+        dots = [".", ". .", ". . ."]
+        try:
+            self.status_label.config(
+                text=f"{self._status_anim_prefix}{dots[step % 3]}",
+                fg=self._status_anim_color)
+        except Exception:
+            return
+        self._status_anim_id = self.root.after(400, self._animate_status, step + 1)
+
+    def _stop_status_animation(self):
+        self._status_anim_running = False
+        _id = getattr(self, '_status_anim_id', None)
+        if _id:
+            try:
+                self.root.after_cancel(_id)
+            except Exception:
+                pass
+            self._status_anim_id = None
 
     def _start_speech_monitor(self):
         """Start a background thread to monitor when speech finishes"""
@@ -2738,6 +3818,25 @@ class GameTextReader:
                 if 'master_hotkey_banner_enabled' in settings and hasattr(self, 'master_hotkey_banner_var'):
                     self.master_hotkey_banner_var.set(settings['master_hotkey_banner_enabled'])
 
+                # Load Kokoro CPU thread setting
+                saved_kokoro_threads = settings.get('kokoro_num_threads')
+                if saved_kokoro_threads is not None and hasattr(self, 'kokoro_num_threads_var'):
+                    self.kokoro_num_threads_var.set(int(saved_kokoro_threads))
+
+                # Load streaming / GPU mode settings
+                if settings.get('kokoro_streaming') and hasattr(self, 'kokoro_streaming_var'):
+                    self.kokoro_streaming_var.set(1)
+                if 'kokoro_provider' in settings and hasattr(self, 'kokoro_provider_var'):
+                    self.kokoro_provider_var.set(settings['kokoro_provider'])
+                elif settings.get('kokoro_use_gpu') and hasattr(self, 'kokoro_provider_var'):
+                    self.kokoro_provider_var.set("DirectML")
+                if 'kokoro_split_mode' in settings and hasattr(self, 'kokoro_split_mode_var'):
+                    self.kokoro_split_mode_var.set(int(settings['kokoro_split_mode']))
+                if 'piper_split_mode' in settings and hasattr(self, 'piper_split_mode_var'):
+                    self.piper_split_mode_var.set(int(settings['piper_split_mode']))
+                if settings.get('piper_streaming') and hasattr(self, 'piper_streaming_var'):
+                    self.piper_streaming_var.set(1)
+
                 # Load Tesseract language setting
                 saved_tesseract_lang = settings.get('tesseract_language')
                 if saved_tesseract_lang:
@@ -2766,6 +3865,105 @@ class GameTextReader:
                 self._loading_settings = False
             print("[DEBUG] Settings: Done loading global settings.")
 
+
+    def check_ai_voice_updates_on_startup(self):
+        """Background thread: check GitHub for newer Kokoro model and new Piper voices once at startup."""
+        import threading
+        def _run():
+            try:
+                import requests, os, json
+                from ..kokoro_catalog import KOKORO_GITHUB_API
+                from ..constants import APP_PIPER_DIR
+
+                # Kokoro model
+                try:
+                    kokoro_ver_path = os.path.join(APP_KOKORO_DIR, 'kokoro_version.txt')
+                    if os.path.exists(kokoro_ver_path):
+                        with open(kokoro_ver_path) as f:
+                            installed = f.read().strip()
+                        if installed:
+                            r = requests.get(KOKORO_GITHUB_API, timeout=10)
+                            if r.status_code == 200:
+                                latest = r.json().get('tag_name', '')
+                                if latest and latest != installed:
+                                    self._kokoro_update_available = (installed, latest)
+                except Exception:
+                    pass
+
+                # New Piper voices notification
+                try:
+                    cache_path = os.path.join(APP_PIPER_DIR, '_voices_catalog_cache.json')
+                    seen_path  = os.path.join(APP_PIPER_DIR, '_seen_voices.json')
+
+                    # Fetch fresh catalog and refresh the cache
+                    catalog = None
+                    try:
+                        r = requests.get(
+                            "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json",
+                            timeout=20)
+                        r.raise_for_status()
+                        catalog = r.json()
+                        os.makedirs(APP_PIPER_DIR, exist_ok=True)
+                        with open(cache_path, 'w', encoding='utf-8') as f:
+                            json.dump(catalog, f)
+                    except Exception:
+                        if os.path.exists(cache_path):
+                            try:
+                                with open(cache_path, 'r', encoding='utf-8') as f:
+                                    catalog = json.load(f)
+                            except Exception:
+                                pass
+
+                    if catalog:
+                        current_keys = set(catalog.keys())
+                        new_keys = set()
+
+                        if os.path.exists(seen_path):
+                            try:
+                                with open(seen_path, 'r', encoding='utf-8') as f:
+                                    seen_keys = set(json.load(f))
+                                new_keys = current_keys - seen_keys
+                            except Exception:
+                                pass
+
+                        # Save current keys so next boot knows what was already seen
+                        try:
+                            os.makedirs(APP_PIPER_DIR, exist_ok=True)
+                            with open(seen_path, 'w', encoding='utf-8') as f:
+                                json.dump(sorted(current_keys), f)
+                        except Exception:
+                            pass
+
+                        if new_keys:
+                            def _fmt(key):
+                                parts = key.split('-')
+                                return ' – '.join(p.capitalize() for p in parts[1:]) if len(parts) >= 2 else key
+
+                            names = sorted(_fmt(k) for k in new_keys)
+                            count = len(names)
+                            if count > 8:
+                                listing = '\n'.join(f"  • {n}" for n in names[:8])
+                                listing += f"\n  ... and {count - 8} more"
+                            else:
+                                listing = '\n'.join(f"  • {n}" for n in names)
+                            msg = (
+                                f"{count} new Piper "
+                                f"{'voice is' if count == 1 else 'voices are'} available:\n\n"
+                                f"{listing}\n\n"
+                                f"Open 'Voice Manager' to browse and download them."
+                            )
+                            def _show(m=msg):
+                                from tkinter import messagebox
+                                messagebox.showinfo("New Piper Voices Available", m)
+                            self.root.after(500, _show)
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+        self._kokoro_update_available = None
+        threading.Thread(target=_run, daemon=True).start()
 
     def save_global_settings(self):
         """Save global settings (master hotkey, sound, banner, etc.) to JSON."""
@@ -2926,13 +4124,13 @@ class GameTextReader:
         try:
             # Create a Toplevel window
             banner = tk.Toplevel(self.root)
-            self._current_status_banner = banner # Store reference
-            
-            banner.withdraw() # Hide initially to prevent flashing
-            
-            banner.overrideredirect(True) # No decorations
-            banner.attributes('-topmost', True) # Always on top
-            banner.attributes('-alpha', 0.85) # Slight transparency
+            self._current_status_banner = banner
+            banner.attributes('-alpha', 0.0)  # invisible before event loop can render it
+            banner.withdraw()
+
+            banner.overrideredirect(True)
+            banner.attributes('-topmost', True)
+            banner.attributes('-alpha', 0.85)
             
             # Style configuration
             bg_color = "#404040" # Gray background
@@ -3207,6 +4405,11 @@ class GameTextReader:
         # Add Set Volume button
         set_volume_button = tk.Button(volume_frame, text="Set", command=lambda: self.set_volume())
         set_volume_button.pack(side='left', padx=5)
+
+        # AI Voice Manager button
+        tk.Button(volume_frame, text="Voice Manager",
+                  command=self.open_ai_voice_manager_window,
+                  font=("Helvetica", 9)).pack(side='left', padx=(10, 0))
 
         # Hotkey status/Area notification label (moved here from left side, right of volume)
         self.hotkey_status_label = tk.Label(volume_frame, text="", font=("Helvetica", 10, "bold"), fg="red")
@@ -3585,13 +4788,218 @@ class GameTextReader:
         try:
              # Lazy import to avoid circular dependencies if any
              from ..windows.tesseract_download_window import TesseractDownloadWindow
-             
+
              # Create and show window
              TesseractDownloadWindow(self.root, self.tesseract_manager)
         except Exception as e:
             print(f"Error opening Tesseract Manager: {e}")
             import traceback
             traceback.print_exc()
+
+    def open_ai_voice_manager_window(self):
+        """Open the window to download and manage Piper AI voices — only one instance."""
+        if hasattr(self, '_ai_voice_window') and self._ai_voice_window is not None:
+            try:
+                if self._ai_voice_window.window.winfo_exists():
+                    self._ai_voice_window.window.lift()
+                    self._ai_voice_window.window.focus_force()
+                    return
+            except Exception:
+                pass
+        try:
+            from ..windows.ai_voice_download_window import AIVoiceDownloadWindow
+            self._ai_voice_window = AIVoiceDownloadWindow(self.root, self)
+        except Exception as e:
+            print(f"Error opening AI Voice Manager: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def refresh_voice_dropdowns(self):
+        """Rebuild the voice option in every read area to reflect newly installed/deleted AI voices."""
+        try:
+            for area in self.areas:
+                area_frame = area[0]
+                voice_var = area[5]
+                voice_menu = getattr(area_frame, 'voice_menu', None)
+                if voice_menu is None:
+                    continue
+
+                # Rebuild the full list (SAPI + AI)
+                display_names, full_names = self._build_voice_lists()
+
+                # Patch the existing OptionMenu in place
+                menu = voice_menu["menu"]
+                menu.delete(0, "end")
+                for name in display_names:
+                    def _cmd(n=name, vv=voice_var, fn=full_names):
+                        vv.set(n)
+                        vv._full_name = fn.get(n, n)
+                        area_name = area[3].get()
+                        self._set_unsaved_changes('area_settings', area_name)
+                    menu.add_command(label=name, command=_cmd)
+
+                # Update the stored full_names map on the frame
+                area_frame.voice_full_names = full_names
+
+                # Keep current selection valid and update display name (e.g. if numbering shifted)
+                current_full = getattr(voice_var, '_full_name', voice_var.get())
+                current_display = voice_var.get()
+                if current_full and current_full in full_names.values():
+                    # Find and apply the new display name for the same full voice
+                    for new_display, new_full in full_names.items():
+                        if new_full == current_full:
+                            voice_var.set(new_display)
+                            break
+                elif current_display not in display_names:
+                    if display_names:
+                        voice_var.set(display_names[0])
+                        voice_var._full_name = full_names.get(display_names[0], display_names[0])
+        except Exception as e:
+            print(f"[WARNING] Could not refresh voice dropdowns: {e}")
+
+    def _load_voice_filter(self):
+        """Load the saved voice_filter.
+        Returns an ordered list of (engine, key, num) tuples matching the Voice Manager
+        Selected Voices order, or None if no filter is saved."""
+        try:
+            if os.path.exists(APP_SETTINGS_PATH):
+                with open(APP_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                raw = settings.get('voice_filter')
+                if isinstance(raw, list) and len(raw) > 0:
+                    return [(item['engine'], item['key'], item.get('num'))
+                            for item in raw]
+        except Exception:
+            pass
+        return None
+
+    def _build_voice_lists(self):
+        """Return (display_names, full_names_map) combining SAPI and installed AI voices."""
+        display_names = []
+        full_names = {}
+
+        voice_filter = self._load_voice_filter()  # ordered [(engine,key,num)] or None
+
+        if voice_filter is not None:
+            # ── Filtered path: iterate in the exact order saved by the Voice Manager ──
+            # Pre-load lookup tables so each per-voice call is fast.
+            _kvoices = {}
+            kokoro_voices_bin = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+            if os.path.exists(kokoro_voices_bin):
+                try:
+                    _kvoices = _kokoro_load_voices(kokoro_voices_bin)
+                except Exception:
+                    _kvoices = KOKORO_VOICES
+
+            _fallback_counter = 0
+            for engine, key, num in voice_filter:
+                _fallback_counter += 1
+                n = num if num is not None else _fallback_counter
+                display = full = None
+                if engine == "sapi":
+                    full_name = key
+                    if "Microsoft" in full_name and " - " in full_name:
+                        parts = full_name.split(" - ")
+                        display = f"{n}. {parts[0].replace('Microsoft ', '')} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
+                    elif " - " in full_name:
+                        parts = full_name.split(" - ")
+                        display = f"{n}. {parts[0]} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
+                    else:
+                        display = f"{n}. {full_name}"
+                    full = full_name
+                elif engine == "sapi_preset":
+                    display = f"{n}. {key} (custom)"
+                    full    = f"[SAPI]:preset:{key}"
+                elif engine == "piper":
+                    display = f"{n}. [Piper] {_piper_key_to_display(key)}"
+                    full    = f"[Piper]:{key}"
+                elif engine == "piper_preset":
+                    display = f"{n}. [Piper] {key} (custom)"
+                    full    = f"[Piper]:preset:{key}"
+                elif engine == "kokoro":
+                    voice_display = _kvoices.get(key, (key, ""))[0]
+                    display = f"{n}. [Kokoro] {voice_display}"
+                    full    = f"[Kokoro]:{key}"
+                elif engine == "kokoro_custom":
+                    display = f"{n}. [Kokoro] {key}"
+                    full    = f"[Kokoro]:custom:{key}"
+                if display and full:
+                    display_names.append(display)
+                    full_names[display] = full
+            return display_names, full_names
+
+        # ── No filter: show all voices grouped by type with sequential counter ──
+        counter = 0
+
+        def _seq():
+            nonlocal counter
+            counter += 1
+            return counter
+
+        if hasattr(self, 'voices') and self.voices:
+            try:
+                for voice in self.voices:
+                    full_name = voice.GetDescription()
+                    n = _seq()
+                    if "Microsoft" in full_name and " - " in full_name:
+                        parts = full_name.split(" - ")
+                        display = f"{n}. {parts[0].replace('Microsoft ', '')} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
+                    elif " - " in full_name:
+                        parts = full_name.split(" - ")
+                        display = f"{n}. {parts[0]} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
+                    else:
+                        display = f"{n}. {full_name}"
+                    display_names.append(display)
+                    full_names[display] = full_name
+            except Exception as e:
+                print(f"[WARNING] Could not enumerate SAPI voices: {e}")
+
+        if os.path.isdir(APP_SAPI_PRESETS_DIR):
+            for fname in sorted(os.listdir(APP_SAPI_PRESETS_DIR)):
+                if fname.endswith('.json'):
+                    name = fname[:-5]
+                    n = _seq()
+                    display = f"{n}. {name} (custom)"
+                    display_names.append(display)
+                    full_names[display] = f"[SAPI]:preset:{name}"
+
+        if os.path.isdir(APP_PIPER_VOICES_DIR):
+            for fname in sorted(os.listdir(APP_PIPER_VOICES_DIR)):
+                if fname.endswith('.onnx') and not fname.startswith('_'):
+                    key = fname[:-5]
+                    n = _seq()
+                    display = f"{n}. [Piper] {_piper_key_to_display(key)}"
+                    display_names.append(display)
+                    full_names[display] = f"[Piper]:{key}"
+
+        if os.path.isdir(APP_PIPER_PRESETS_DIR):
+            for fname in sorted(os.listdir(APP_PIPER_PRESETS_DIR)):
+                if fname.endswith('.json'):
+                    name = fname[:-5]
+                    n = _seq()
+                    display = f"{n}. [Piper] {name} (custom)"
+                    display_names.append(display)
+                    full_names[display] = f"[Piper]:preset:{name}"
+
+        kokoro_model      = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
+        kokoro_voices_bin = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+        if os.path.exists(kokoro_model):
+            _kvoices = _kokoro_load_voices(kokoro_voices_bin) if os.path.exists(kokoro_voices_bin) else KOKORO_VOICES
+            for voice_id, (voice_display, _lang) in _kvoices.items():
+                n = _seq()
+                display = f"{n}. [Kokoro] {voice_display}"
+                display_names.append(display)
+                full_names[display] = f"[Kokoro]:{voice_id}"
+            if os.path.isdir(APP_KOKORO_CUSTOM_DIR):
+                for fname in sorted(os.listdir(APP_KOKORO_CUSTOM_DIR)):
+                    if fname.endswith('.npy'):
+                        name = fname[:-4]
+                        n = _seq()
+                        display = f"{n}. [Kokoro] {name}"
+                        display_names.append(display)
+                        full_names[display] = f"[Kokoro]:custom:{name}"
+
+        return display_names, full_names
 
     def open_additional_options(self):
         """Open a window with additional checkbox options and descriptions"""
@@ -3610,8 +5018,9 @@ class GameTextReader:
         
         # Create new window
         options_window = tk.Toplevel(self.root)
+        options_window.withdraw()
         options_window.title("Additional Options")
-        options_window.geometry("580x700")
+        options_window.geometry("1165x700")
         options_window.resizable(True, True)
         
         # Store reference to the window
@@ -3634,13 +5043,23 @@ class GameTextReader:
         # Create main frame for the options
         main_frame = tk.Frame(options_window)
         main_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        
 
-        
+        # Two-column layout
+        columns = tk.Frame(main_frame)
+        columns.pack(fill='both', expand=True)
+
+        left_col = tk.Frame(columns, width=510)
+        left_col.pack(side='left', fill='y', padx=(0, 12))
+        left_col.pack_propagate(False)
+
+        ttk.Separator(columns, orient='vertical').pack(side='left', fill='y', padx=4)
+
+        right_col = tk.Frame(columns)
+        right_col.pack(side='left', fill='both', expand=True)
+
         # --- Tesseract Settings Section ---
-        tesseract_frame = tk.Frame(main_frame)
+        tesseract_frame = tk.Frame(left_col)
         tesseract_frame.pack(fill='x', pady=(10, 0))
-        
         tk.Label(tesseract_frame, text="Tesseract OCR Settings:", font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(0, 2))
         
         # Plain english description for Tesseract
@@ -3711,10 +5130,10 @@ class GameTextReader:
         tk.Button(tess_controls_frame, text="Manage Languages", command=self.open_tesseract_manager_window, font=("Helvetica", 9)).pack(side='left')
 
         # Separator
-        ttk.Separator(main_frame, orient='horizontal').pack(fill='x', pady=5)
+        ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=5)
 
         # Translation Section
-        translation_section_frame = tk.Frame(main_frame)
+        translation_section_frame = tk.Frame(left_col)
         translation_section_frame.pack(fill='x', pady=(5, 0))
         
         translation_label = tk.Label(
@@ -3827,11 +5246,11 @@ class GameTextReader:
 
 
         # Separator (line between translation and ignored words)
-        ttk.Separator(main_frame, orient='horizontal').pack(fill='x', pady=15)
+        ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=15)
 
-        # Ignored Word List section (moved to bottom)
+        # Ignored Word List section
         ignored_words_label = tk.Label(
-            main_frame,
+            left_col,
             text="Ignored Word List:",
             font=("Helvetica", 10, "bold")
         )
@@ -3839,9 +5258,9 @@ class GameTextReader:
         
         # Description for ignored words
         ignored_words_desc = tk.Label(
-            main_frame,
+            left_col,
             text="Enter words or phrases to ignore (comma-separated). These will be filtered out from the text before reading.",
-            wraplength=500,
+            wraplength=400,
             justify='left',
             font=("Helvetica", 9),
             fg="#555555"
@@ -3849,7 +5268,7 @@ class GameTextReader:
         ignored_words_desc.pack(anchor='w', padx=(0, 0), pady=(0, 5))
         
         # Text widget for ignored words (multi-line field)
-        ignored_words_frame = tk.Frame(main_frame)
+        ignored_words_frame = tk.Frame(left_col)
         ignored_words_frame.pack(fill='both', expand=False, pady=(0, 10))
         
         # Add scrollbar for the text widget
@@ -3923,8 +5342,26 @@ class GameTextReader:
         ignored_words_text.bind('<FocusOut>', on_focus_out)
         ignored_words_text.bind('<KeyRelease>', on_key_release)
 
-        # Separator (line between ignored words and checklist)
-        ttk.Separator(main_frame, orient='horizontal').pack(fill='x', pady=15)
+        # Text Replacement section (left column, below ignored words)
+        ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=(12, 8))
+
+        tr_frame = tk.Frame(left_col)
+        tr_frame.pack(fill='x')
+
+        tr_row = tk.Frame(tr_frame)
+        tr_row.pack(fill='x', anchor='w')
+        tk.Checkbutton(tr_row, variable=self.read_game_units_var,
+                       text="Text Replacement:", font=("Helvetica", 10)).pack(side='left')
+        tk.Button(tr_row, text="Edit", command=self.open_game_units_editor,
+                  width=6).pack(side='left', padx=(10, 0))
+
+        tk.Label(tr_frame,
+                 text="Replace specific words or abbreviations before reading. Use Edit to configure.",
+                 font=("Helvetica", 8), fg="#555555", wraplength=460, justify="left").pack(anchor='w', pady=(2, 0))
+
+        # Save button at bottom of left column
+        tk.Button(left_col, text="Save & Close", command=lambda: on_close(),
+                  width=15).pack(side='bottom', pady=(10, 0))
 
         # Initialize trace_callbacks list early so on_close can reference it
         trace_callbacks = []
@@ -3952,19 +5389,12 @@ class GameTextReader:
         # Set up protocol handler to clear reference when window is closed
         options_window.protocol("WM_DELETE_WINDOW", on_close)
 
-        # Save button packed to the BOTTOM, before the scroll container takes up remaining space
-        close_button = tk.Button(
-            main_frame,
-            text="Save",
-            command=on_close,
-            width=15
-        )
-        close_button.pack(side="bottom", pady=(10, 0))
+        # Right column: checkboxes header + scrollable list
+        tk.Label(right_col, text="Options & Filters:",
+                 font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(10, 6))
 
-
-        # Create scrollable frame for checkboxes only
-        # Create a container frame for the scrollable area
-        scroll_container = tk.Frame(main_frame)
+        # Create scrollable frame for checkboxes
+        scroll_container = tk.Frame(right_col)
         scroll_container.pack(fill='both', expand=True, pady=(10, 0))
         
         # Create canvas and scrollbar
@@ -4032,6 +5462,26 @@ class GameTextReader:
         # Define checkbox options with descriptions
         checkbox_options = [
             {
+                "var": self.char_normalization_var,
+                "label": "Character normalization:",
+                "description": "Fixes common OCR character recognition errors. Examples: |→I, 5→S, 0→O, 2→Z, 8→B, 1→l, §→S, €→E. Makes misread text more readable. On by default."
+            },
+            {
+                "var": self.letters_only_var,
+                "label": "Letters only OCR mode:",
+                "description": "Filters OCR output to only include letters (a-z, A-Z). All numbers, symbols, and special characters will be removed from the recognized text."
+            },
+            {
+                "var": self.letters_only_numbers_var,
+                "label": "  Also read numbers:",
+                "description": "When enabled with 'Letters only OCR mode', also includes numbers (0-9) along with letters. Only letters and numbers will be kept, all other symbols will be removed."
+            },
+            {
+                "var": self.standalone_numbers_var,
+                "label": "  Read standalone numbers only:",
+                "description": "Reads numbers only when they appear alone (not mixed with letters). Bypasses character normalization for pure numbers. Works independently of 'Letters only OCR mode'."
+            },
+            {
                 "var": self.ignore_usernames_var,
                 "label": "Ignore usernames *EXPERIMENTAL*:",
                 "description": "This option filters out usernames from the text before reading. It looks for patterns like \"Username:\" at the start of lines."
@@ -4052,11 +5502,6 @@ class GameTextReader:
                 "description": "Enhances the detection and recognition of measurement units (like kg, m, km, etc.) in the text. Improves accuracy for technical or game-related content."
             },
             {
-                "var": self.read_game_units_var,
-                "label": "Text Replacement:",
-                "description": "Enables reading of custom game-specific units. Use the Edit button to configure which units should be recognized and how they should be spoken."
-            },
-            {
                 "var": self.fullscreen_mode_var,
                 "label": "Fullscreen mode *EXPERIMENTAL*:",
                 "description": "NOTE: Might work better with Freeze Screen enabled.\n Feature for capturing text from fullscreen applications. May cause brief screen flicker during capture for the program to take an updated screenshot."
@@ -4071,26 +5516,6 @@ class GameTextReader:
                 "label": "Allow mouse left/right as a hotkey:",
                 "description": "Enables the use of left and right mouse buttons as hotkeys for triggering read actions. Provides additional input options beyond keyboard shortcuts."
             },
-            {
-                "var": self.letters_only_var,
-                "label": "Letters only OCR mode:",
-                "description": "Filters OCR output to only include letters (a-z, A-Z). All numbers, symbols, and special characters will be removed from the recognized text."
-            },
-            {
-                "var": self.letters_only_numbers_var,
-                "label": "  Also read numbers:",
-                "description": "When enabled with 'Letters only OCR mode', also includes numbers (0-9) along with letters. Only letters and numbers will be kept, all other symbols will be removed."
-            },
-            {
-                "var": self.standalone_numbers_var,
-                "label": "  Read standalone numbers only:",
-                "description": "Reads numbers only when they appear alone (not mixed with letters). Bypasses character normalization for pure numbers. Works independently of 'Letters only OCR mode'."
-            },
-            {
-                "var": self.char_normalization_var,
-                "label": "Character normalization:",
-                "description": "Fixes common OCR character recognition errors. Examples: 5→S, 0→O, 2→Z, 8→B, |→I, I→l, 1→l, §→S, €→E. Makes misread text more readable."
-            }
         ]
         
         # Store original checkbox values in each option dictionary
@@ -4138,9 +5563,9 @@ class GameTextReader:
             desc_label = tk.Label(
                 option_frame,
                 text=option["description"],
-                wraplength=500,
+                wraplength=560,
                 justify='left',
-                font=("Helvetica", 10),
+                font=("Helvetica", 9),
                 fg="#555555"
             )
             desc_label.pack(anchor='w', padx=(20, 0), pady=(1, 0))
@@ -4164,6 +5589,7 @@ class GameTextReader:
         # Update canvas scroll region after all widgets are added
         canvas.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox("all"))
+        options_window.deiconify()
 
     def open_text_log(self):
         """Open the Scan History window showing last 20 converted texts"""
@@ -4209,6 +5635,7 @@ class GameTextReader:
     def show_credits(self):
         """Show a window with credits and used libraries"""
         credits_window = tk.Toplevel(self.root)
+        credits_window.withdraw()
         credits_window.title(f"{APP_NAME} - Credits")
         
         # Apply transient and focus after a short delay to ensure window is ready
@@ -4221,6 +5648,7 @@ class GameTextReader:
                 else:
                     credits_window.transient(self.root)
                 
+                credits_window.deiconify()
                 credits_window.lift()
                 credits_window.focus_set()
                 # Force to be on top briefly to solve Windows focus stealing issues
@@ -4228,7 +5656,7 @@ class GameTextReader:
                 self.root.after(200, lambda: credits_window.attributes("-topmost", False) if credits_window.winfo_exists() else None)
         
         self.root.after(100, set_window_props)
-        credits_window.geometry("600x600")
+        credits_window.geometry("600x700")
         credits_window.resizable(False, False)
         
         # Set icon
@@ -4291,7 +5719,10 @@ class GameTextReader:
             ("TkinterDnD2", "https://github.com/pmgagne/tkinterdnd2", "Drag and drop support"),
             ("SSIM (Scikit-Image)", "https://scikit-image.org/", "Image comparison algorithms"),
             ("Tkinter", "https://docs.python.org/3/library/tkinter.html", "Standard Python GUI library"),
-            ("winsound", "https://docs.python.org/3/library/winsound.html", "Windows sound playing interface")
+            ("winsound", "https://docs.python.org/3/library/winsound.html", "Windows sound playing interface"),
+            ("Piper TTS", "https://github.com/rhasspy/piper", "AI neural text-to-speech engine with multilingual voice models"),
+            ("Kokoro-82M", "https://huggingface.co/hexgrad/Kokoro-82M", "High-quality AI speech synthesis model (Apache 2.0)"),
+            ("kokoro-onnx", "https://github.com/thewh1teagle/kokoro-onnx", "ONNX runtime wrapper for Kokoro TTS"),
         ]
         
         for i, (name, url, desc) in enumerate(libraries):
@@ -4352,7 +5783,7 @@ class GameTextReader:
         title_label.pack(anchor='w', pady=(0, 2))
         
         # Author Label
-        tk.Label(main_frame, text="Developed by: MertenNor", font=("Helvetica", 9), fg="#555555").pack(anchor='w', pady=(0, 10))
+        tk.Label(main_frame, text="Developed by: MertenNor", font=("Helvetica", 9, "bold"), fg="#555555").pack(anchor='w', pady=(0, 10))
         
         # Icon will be added near the banners (not within the title)
         
@@ -5266,6 +6697,7 @@ class GameTextReader:
     def show_how_to_use(self):
         # Create Tkinter window for How to Use content
         how_to_use_window = tk.Toplevel(self.root)
+        how_to_use_window.withdraw()
         how_to_use_window.title(f"{APP_NAME} - How to Use")
         how_to_use_window.geometry("900x700")
         
@@ -5518,7 +6950,8 @@ class GameTextReader:
         x = (how_to_use_window.winfo_screenwidth() // 2) - (width // 2)
         y = (how_to_use_window.winfo_screenheight() // 2) - (height // 2)
         how_to_use_window.geometry(f'{width}x{height}+{x}+{y}')
-        
+        how_to_use_window.deiconify()
+
         # Make window modal
         how_to_use_window.transient(self.root)
         # how_to_use_window.grab_set() - Removed to allow interacting with other windows
@@ -7519,51 +8952,15 @@ class GameTextReader:
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
-        # Get voice descriptions for the dropdown menu and create display names
-        voice_names = []
-        voice_display_names = []
-        voice_full_names = {}  # Map display names to full names
-        
-        if hasattr(self, 'voices') and self.voices:
-            try:
-                for i, voice in enumerate(self.voices, 1):
-                    full_name = voice.GetDescription()
-                    voice_names.append(full_name)
-                    
-                    # Create abbreviated display name with numbering
-                    if "Microsoft" in full_name and " - " in full_name:
-                        # Format: "Microsoft David - en-US" -> "1. David (en-US)"
-                        parts = full_name.split(" - ")
-                        if len(parts) == 2:
-                            voice_part = parts[0].replace("Microsoft ", "")
-                            lang_part = parts[1]
-                            display_name = f"{i}. {voice_part} ({lang_part})"
-                        else:
-                            display_name = f"{i}. {full_name}"
-                    elif " - " in full_name:
-                        # Format: "David - en-US" -> "1. David (en-US)"
-                        parts = full_name.split(" - ")
-                        if len(parts) == 2:
-                            display_name = f"{i}. {parts[0]} ({parts[1]})"
-                        else:
-                            display_name = f"{i}. {full_name}"
-                    else:
-                        display_name = f"{i}. {full_name}"
-                    
-                    
-                    voice_display_names.append(display_name)
-                    voice_full_names[display_name] = full_name
-            except Exception as e:
-                print(f"Warning: Could not get voice descriptions: {e}")
-                voice_names = []
-                voice_display_names = []
-        
+        # Build numbered voice list (SAPI + Piper + Kokoro all in one consistent sequence)
+        voice_display_names, voice_full_names = self._build_voice_lists()
+
         # Set default voice to the first voice in the list, or fallback if none available
         default_voice = voice_display_names[0] if voice_display_names else "No voices available"
         voice_var = tk.StringVar(value=default_voice)
-        
+
         # Voice selection setup
-        
+
         # Function to update the actual voice when display name is selected
         def on_voice_selection(*args):
             selected_display = voice_var.get()
@@ -7575,14 +8972,14 @@ class GameTextReader:
             # Mark as unsaved when voice changes
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
-        
+
         # Set the full name for the default voice
         if default_voice in voice_full_names:
             voice_var._full_name = voice_full_names[default_voice]
-        
+
         # Create the OptionMenu with display names and command
         voice_menu = tk.OptionMenu(
-            area_frame, 
+            area_frame,
             voice_var,
             *voice_display_names if voice_display_names else ["No voices available"],
             command=on_voice_selection
@@ -7590,10 +8987,14 @@ class GameTextReader:
         # Set a fixed width to prevent layout issues when voice names change
         # This ensures the dropdown doesn't change size and push other elements around
         voice_menu.config(width=40)  # Fixed width that can accommodate most voice names
-        
+
         # Configure the OptionMenu to display text left-aligned instead of centered
         # This prevents long names from being cut off on the sides
         voice_menu.config(anchor="w")  # "w" = west (left-aligned)
+
+        # Store references so refresh_voice_dropdowns() can update this menu later
+        area_frame.voice_menu = voice_menu
+        area_frame.voice_full_names = voice_full_names
         
         voice_menu.pack(side="left")
         
@@ -7697,6 +9098,8 @@ class GameTextReader:
 
         
     def remove_area(self, area_frame, area_name):
+        # Clean up any cached WAV files for this area
+        self._clear_ai_cache_for_area(id(area_frame))
         # Find and clean up the hotkey for this area
         for area in self.areas:
             if area[0] == area_frame:  # Found matching frame
@@ -8216,22 +9619,26 @@ class GameTextReader:
         # This will be used to restore focus to the game after selection completes
         try:
             game_window_handle = win32gui.GetForegroundWindow()
-            # Verify the window is not our own root window
             root_hwnd = self.root.winfo_id()
             if game_window_handle == root_hwnd:
-                # If GameReader is in focus, try to find the game window differently
-                # For now, we'll just store None and skip restoration
                 game_window_handle = None
+            else:
+                # Also skip if the foreground window is any of our tkinter Toplevel windows.
+                # Calling win32gui.SetForegroundWindow on a tkinter Toplevel disrupts tkinter's
+                # internal focus routing and causes text boxes to stop accepting input.
+                try:
+                    for child in self.root.winfo_children():
+                        try:
+                            if child.winfo_id() == game_window_handle:
+                                game_window_handle = None
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception as e:
             print(f"Warning: Could not capture game window handle: {e}")
             game_window_handle = None
-        
-        # Ensure root window stays in background and doesn't flash
-        # Store current root window state
-        root_was_visible = self.root.winfo_viewable()
-        if root_was_visible:
-            # Lower root window to keep it in background
-            self.root.lower()
         
         x1, y1, x2, y2 = 0, 0, 0, 0
         selection_cancelled = False
@@ -8356,9 +9763,15 @@ class GameTextReader:
                         canvas.unbind("<Escape>")
                     except Exception:
                         pass
-                    # Destroy the selection window to restore normal mouse handling
+                    # Redirect Tkinter focus to root BEFORE destroying the overlay.
+                    # Destroying a window that owns Tk focus corrupts Tkinter's
+                    # internal focus routing, making Entry widgets unresponsive afterward.
+                    try:
+                        self.root.focus_set()
+                    except Exception:
+                        pass
                     select_area_window.destroy()
-                    
+
                     # Restore focus to the game window if we captured it
                     if game_window_handle is not None:
                         try:
@@ -8393,7 +9806,7 @@ class GameTextReader:
                     
                     if not hasattr(frame, '_is_automation') or not frame._is_automation:
                         print("GAME_TEXT_READER: Not an automation, calling read_area()...")
-                        self.root.after(100, lambda: self.read_area(frame))
+                        threading.Thread(target=self.read_area, args=(frame,), daemon=True).start()
                         
                         # If this was called from a combo, trigger the combo callback after read_area starts
                         # This allows the combo to start monitoring speech after area selection completes
@@ -8459,9 +9872,13 @@ class GameTextReader:
                 canvas.unbind("<Escape>")
             except Exception:
                 pass
-            # Destroy the selection window to restore normal mouse handling
+            # Redirect Tkinter focus to root BEFORE destroying the overlay
+            try:
+                self.root.focus_set()
+            except Exception:
+                pass
             select_area_window.destroy()
-            
+
             # Restore focus to the game window if we captured it
             if game_window_handle is not None:
                 try:
@@ -9222,11 +10639,6 @@ class GameTextReader:
         
         # Mark that area selection is now in progress
         self.area_selection_in_progress = True
-        
-        # Ensure root window stays in background and doesn't flash
-        root_was_visible = self.root.winfo_viewable()
-        if root_was_visible:
-            self.root.lower()
         
         # Store the current mouse hooks to restore them later
         self.saved_mouse_hooks = []
@@ -11128,6 +12540,7 @@ class GameTextReader:
             # Force focus back to the main window only if requested
             # (For auto-read with freeze, we restore focus to the game window instead)
             if restore_focus and hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.lift()
                 self.root.focus_force()
                 
         except Exception as e:
@@ -11141,14 +12554,15 @@ class GameTextReader:
         """Create a custom dialog for naming areas that stays on top and auto-focuses"""
         # Create the dialog window
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         dialog.title("Area Name")
         dialog.geometry("250x120")
         dialog.resizable(False, False)
-        
+
         # Make dialog stay on top of main window
         dialog.transient(self.root)
         dialog.grab_set()  # Make it modal
-        
+
         # Center the dialog on the main window
         dialog.geometry("+%d+%d" % (
             self.root.winfo_rootx() + self.root.winfo_width()//2 - 150,
@@ -11230,7 +12644,8 @@ class GameTextReader:
         entry.focus_force()
         entry.select_range(0, tk.END)
         entry.icursor(tk.END)  # Position cursor at end
-        
+
+        dialog.deiconify()
         # Wait for the dialog to close
         dialog.wait_window()
         
@@ -11240,15 +12655,16 @@ class GameTextReader:
         """Create a custom dialog for editing area names with adjustable size"""
         # Create the dialog window
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         dialog.title("Edit Area Name")
         dialog.geometry("80x100")  # Set window size here (width x height) - CHANGE THIS TO ADJUST SIZE
         dialog.resizable(True, True)  # Allow resizing if desired
         dialog.minsize(150, 120)  # Set minimum size
-        
+
         # Make dialog stay on top of main window
         dialog.transient(self.root)
         dialog.grab_set()  # Make it modal
-        
+
         # Center the dialog on the main window
         dialog.update_idletasks()
         width = dialog.winfo_width()
@@ -11336,10 +12752,11 @@ class GameTextReader:
         dialog.update_idletasks()
         dialog.update()
         entry.focus_force()
-        
+
+        dialog.deiconify()
         # Wait for the dialog to close
         dialog.wait_window()
-        
+
         return result[0]
 
     def disable_all_hotkeys(self, block_input_manager=True):
@@ -13018,22 +14435,28 @@ class GameTextReader:
                 
                 self.setting_hotkey = False
                 self._hotkey_assignment_cancelled = True
-                if not hasattr(button, 'hotkey') or not button.hotkey:
-                    button.config(text="Set Hotkey")
-                else:
-                    # Restore the previous hotkey display
-                    display_name = self._hotkey_to_display_name(button.hotkey)
-                    button.config(text=f"Set Hotkey: [ {display_name} ]")
+                try:
+                    if button.winfo_exists():
+                        if not hasattr(button, 'hotkey') or not button.hotkey:
+                            button.config(text="Set Hotkey")
+                        else:
+                            display_name = self._hotkey_to_display_name(button.hotkey)
+                            button.config(text=f"Set Hotkey: [ {display_name} ]")
+                except Exception:
+                    pass
                 # Restore all hotkeys when timer expires
                 finish_hotkey_assignment()
             except Exception as e:
                 print(f"Warning: Error during hook cleanup: {e}")
-                if not hasattr(button, 'hotkey') or not button.hotkey:
-                    button.config(text="Set Hotkey")
-                else:
-                    # Restore the previous hotkey display
-                    display_name = self._hotkey_to_display_name(button.hotkey)
-                    button.config(text=f"Set Hotkey: [ {display_name} ]")
+                try:
+                    if button.winfo_exists():
+                        if not hasattr(button, 'hotkey') or not button.hotkey:
+                            button.config(text="Set Hotkey")
+                        else:
+                            display_name = self._hotkey_to_display_name(button.hotkey)
+                            button.config(text=f"Set Hotkey: [ {display_name} ]")
+                except Exception:
+                    pass
                 # Restore all hotkeys even if there was an error
                 try:
                     finish_hotkey_assignment()
@@ -13415,8 +14838,6 @@ class GameTextReader:
             # Create automations window instance (but don't show it) so we can load automations and register hotkeys
             from gametextreader.windows.automations_window import AutomationsWindow
             self._automations_window = AutomationsWindow(self.root, self)
-            # Hide the window immediately so it's not visible
-            self._automations_window.window.withdraw()
         
         automation_window = self._automations_window
         
@@ -13762,8 +15183,24 @@ class GameTextReader:
                     pass
 
             # Reset file path
-            self.layout_file.set("") 
-            
+            self.layout_file.set("")
+
+            # Reset all additional options to their defaults
+            if hasattr(self, 'char_normalization_var'):    self.char_normalization_var.set(True)
+            if hasattr(self, 'ignore_usernames_var'):      self.ignore_usernames_var.set(False)
+            if hasattr(self, 'ignore_previous_var'):       self.ignore_previous_var.set(False)
+            if hasattr(self, 'ignore_gibberish_var'):      self.ignore_gibberish_var.set(False)
+            if hasattr(self, 'better_unit_detection_var'): self.better_unit_detection_var.set(False)
+            if hasattr(self, 'read_game_units_var'):       self.read_game_units_var.set(False)
+            if hasattr(self, 'fullscreen_mode_var'):       self.fullscreen_mode_var.set(False)
+            if hasattr(self, 'process_freeze_screen_var'): self.process_freeze_screen_var.set(False)
+            if hasattr(self, 'allow_mouse_buttons_var'):   self.allow_mouse_buttons_var.set(False)
+            if hasattr(self, 'letters_only_var'):          self.letters_only_var.set(False)
+            if hasattr(self, 'letters_only_numbers_var'):  self.letters_only_numbers_var.set(False)
+            if hasattr(self, 'standalone_numbers_var'):    self.standalone_numbers_var.set(False)
+            if hasattr(self, 'interrupt_on_new_scan_var'): self.interrupt_on_new_scan_var.set(True)
+            if hasattr(self, 'pause_at_punctuation_var'):  self.pause_at_punctuation_var.set(False)
+
             # Reset Unsaved Changes
             self._has_unsaved_changes = False
             self._unsaved_changes = {
@@ -13840,7 +15277,7 @@ class GameTextReader:
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
             "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
-            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=True)).get(),
             "translation_enabled": self.translation_enabled_var.get(),
             "translation_source": self.translation_source_var.get(),
             "translation_target": self.translation_target_var.get(),
@@ -13856,6 +15293,14 @@ class GameTextReader:
             "repeat_latest_hotkey": self.repeat_latest_hotkey,  # 4d. Repeat Latest Hotkey
             "edit_area_screenshot_bg": self.edit_area_screenshot_bg,  # 4e. Freeze screen when editor opens
             "edit_area_alpha": self.edit_area_alpha,  # 4f. Editor alpha level
+            "piper_settings": {
+                "noise_scale": getattr(self, 'piper_noise_scale_var', tk.DoubleVar(value=0.667)).get(),
+                "noise_w": getattr(self, 'piper_noise_w_var', tk.DoubleVar(value=0.8)).get(),
+                "sentence_silence": getattr(self, 'piper_sentence_silence_var', tk.DoubleVar(value=0.2)).get(),
+            },
+            "kokoro_settings": {
+                "num_threads": getattr(self, 'kokoro_num_threads_var', tk.IntVar(value=0)).get(),
+            },
             # 5. Auto Read areas including Stop Read on new select
             "auto_read_areas": {
                 "stop_read_on_select": getattr(self, 'interrupt_on_new_scan_var', tk.BooleanVar(value=True)).get(),
@@ -13863,7 +15308,7 @@ class GameTextReader:
             },
             "areas": []  # 6. Read Areas
         }
-        
+
         # Collect Auto Read areas
         for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var in self.areas:
             area_name = area_name_var.get()
@@ -14006,7 +15451,7 @@ class GameTextReader:
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
             "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
-            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=True)).get(),
             "translation_enabled": self.translation_enabled_var.get(),
             "translation_source": self.translation_source_var.get(),
             "translation_target": self.translation_target_var.get(),
@@ -14022,13 +15467,21 @@ class GameTextReader:
             "repeat_latest_hotkey": self.repeat_latest_hotkey,  # 4d. Repeat Latest Hotkey
             "edit_area_screenshot_bg": self.edit_area_screenshot_bg,  # 4e. Freeze screen when editor opens
             "edit_area_alpha": self.edit_area_alpha,  # 4f. Editor alpha level
+            "piper_settings": {
+                "noise_scale": getattr(self, 'piper_noise_scale_var', tk.DoubleVar(value=0.667)).get(),
+                "noise_w": getattr(self, 'piper_noise_w_var', tk.DoubleVar(value=0.8)).get(),
+                "sentence_silence": getattr(self, 'piper_sentence_silence_var', tk.DoubleVar(value=0.2)).get(),
+            },
+            "kokoro_settings": {
+                "num_threads": getattr(self, 'kokoro_num_threads_var', tk.IntVar(value=0)).get(),
+            },
             "auto_read_areas": {
                 "stop_read_on_select": getattr(self, 'interrupt_on_new_scan_var', tk.BooleanVar(value=True)).get(),
                 "areas": []
             },
             "areas": []
         }
-        
+
         # Collect Auto Read areas
         for area_frame, hotkey_button, _, area_name_var, preprocess_var, voice_var, speed_var, psm_var, freeze_screen_var in self.areas:
             area_name = area_name_var.get()
@@ -14263,7 +15716,8 @@ class GameTextReader:
         
         # Create new automations window
         self._automations_window = AutomationsWindow(self.root, self)
-        
+        self._automations_window.window.deiconify()
+
         # Clean up old instance reference after new instance is created
         if hasattr(self, '_old_automations_window'):
             delattr(self, '_old_automations_window')
@@ -14781,7 +16235,7 @@ class GameTextReader:
             if hasattr(self, 'letters_only_var'):
                 self.letters_only_var.set(layout.get("letters_only", False))
             if hasattr(self, 'char_normalization_var'):
-                self.char_normalization_var.set(layout.get("char_normalization", False))
+                self.char_normalization_var.set(layout.get("char_normalization", True))
             if hasattr(self, 'standalone_numbers_var'):
                 self.standalone_numbers_var.set(layout.get("standalone_numbers", False))
             if hasattr(self, 'letters_only_numbers_var'):
@@ -14877,7 +16331,22 @@ class GameTextReader:
             
             if 'master_hotkey_banner_enabled' in layout and hasattr(self, 'master_hotkey_banner_var'):
                 self.master_hotkey_banner_var.set(layout['master_hotkey_banner_enabled'])
-            
+
+            # Load AI Voice synthesis settings
+            if 'piper_settings' in layout:
+                ps = layout['piper_settings']
+                if hasattr(self, 'piper_noise_scale_var') and 'noise_scale' in ps:
+                    self.piper_noise_scale_var.set(float(ps['noise_scale']))
+                if hasattr(self, 'piper_noise_w_var') and 'noise_w' in ps:
+                    self.piper_noise_w_var.set(float(ps['noise_w']))
+                if hasattr(self, 'piper_sentence_silence_var') and 'sentence_silence' in ps:
+                    self.piper_sentence_silence_var.set(float(ps['sentence_silence']))
+            if 'kokoro_settings' in layout:
+                ks = layout['kokoro_settings']
+                if hasattr(self, 'kokoro_num_threads_var') and 'num_threads' in ks:
+                    self.kokoro_num_threads_var.set(int(ks['num_threads']))
+                    self._kokoro_instance = None  # Force model reload with new thread count
+
             # Set up pause hotkey
             saved_pause_hotkey = layout.get("pause_hotkey")
             if saved_pause_hotkey:
@@ -15119,7 +16588,17 @@ class GameTextReader:
                                 if full_voice_name is None and saved_voice in voice_full_names:
                                     full_voice_name = voice_full_names[saved_voice]
                                     display_name = saved_voice
-                                
+
+                                # If still not found, check for AI / Kokoro voices
+                                if full_voice_name is None and saved_voice:
+                                    if saved_voice.startswith('[Piper]:') or saved_voice.startswith('[Kokoro]:'):
+                                        ai_display_names, ai_full_names = self._build_voice_lists()
+                                        for disp, full in ai_full_names.items():
+                                            if full == saved_voice:
+                                                display_name = disp
+                                                full_voice_name = saved_voice
+                                                break
+
                                 if full_voice_name:
                                     voice_var.set(display_name)
                                     voice_var._full_name = full_voice_name
@@ -15262,9 +16741,18 @@ class GameTextReader:
                                 full_voice_name = voice_full_names[saved_voice]
                                 display_name = saved_voice
                             
+                            # If not found in SAPI, check for AI voices
+                            if full_voice_name is None and saved_voice:
+                                if saved_voice.startswith('[Piper]:') or saved_voice.startswith('[Kokoro]:'):
+                                    ai_display_names, ai_full_names = self._build_voice_lists()
+                                    for disp, full in ai_full_names.items():
+                                        if full == saved_voice:
+                                            display_name = disp
+                                            full_voice_name = saved_voice
+                                            break
+
                             if full_voice_name:
                                 voice_var.set(display_name)
-                                # Set the full name for the voice variable
                                 voice_var._full_name = full_voice_name
                             # else: keep the default first voice set by add_read_area
                         # else: keep the default first voice set by add_read_area
@@ -15657,13 +17145,13 @@ class GameTextReader:
                     # Handle stop button
                     if hasattr(button, 'is_stop_button'):
                         print(f"[DEBUG] Stop hotkey pressed!")
-                        self.stop_speaking()
+                        self.root.after(0, self.stop_speaking)
                         return
-                    
+
                     # Handle pause button
                     if hasattr(button, 'is_pause_button'):
                         print(f"[DEBUG] Pause hotkey pressed!")
-                        self.toggle_pause_resume()
+                        self.root.after(0, self.toggle_pause_resume)
                         return
                     
                     # Handle edit area button
@@ -15759,9 +17247,12 @@ class GameTextReader:
                                 break
                         
                         if is_auto_read_area and area_name_var:
-                            # For Auto Read areas, trigger area selection instead of reading
-                            pass
-                            self.set_auto_read_area(button.area_frame, area_name_var, None)
+                            # For Auto Read areas, trigger area selection instead of reading.
+                            # Marshal to main thread — hotkey callbacks run in a background thread
+                            # and Tkinter is not thread-safe; calling it directly corrupts focus state.
+                            _frame_ref = button.area_frame
+                            _name_ref = area_name_var
+                            self.root.after(0, lambda: self.set_auto_read_area(_frame_ref, _name_ref, None))
                         else:
                             # For regular areas, read the existing area
                             self.stop_speaking()
@@ -16143,8 +17634,9 @@ class GameTextReader:
         """Set up a custom scan code-based handler for numpad hotkeys"""
         if not hotkey.startswith('num_'):
             return None
-            
-        numpad_key = hotkey[4:]  # Remove 'num_' prefix
+
+        hotkey_parts = hotkey.split('+')
+        numpad_key = hotkey_parts[-1][4:]  # Remove 'num_' prefix from the base key
         
         # Get the scan code for this numpad key
         target_scan_code = None
@@ -17964,13 +19456,12 @@ class GameTextReader:
                                 # Character mappings for common OCR errors
                                 char_mappings = {
                                     '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
-                                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                                    '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                                     '×': 'x', '♥': 'h', '★': '*'
                                 }
-                                # Apply character mappings to this word
-                                for old_char, new_char in char_mappings.items():
-                                    word = word.replace(old_char, new_char)
+                                # Apply all mappings simultaneously (no double-conversion)
+                                word = word.translate(str.maketrans(char_mappings))
                             
                             # Then apply letters-only filtering (with optional numbers)
                             if self.letters_only_numbers_var.get():
@@ -18003,13 +19494,12 @@ class GameTextReader:
                                 # Character mappings for common OCR errors
                                 char_mappings = {
                                     '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
-                                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                                    '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                                     '×': 'x', '♥': 'h', '★': '*'
                                 }
-                                # Apply character mappings to this word
-                                for old_char, new_char in char_mappings.items():
-                                    word = word.replace(old_char, new_char)
+                                # Apply all mappings simultaneously (no double-conversion)
+                                word = word.translate(str.maketrans(char_mappings))
                             
                             # Then apply letters-only filtering (with optional numbers)
                             if self.letters_only_numbers_var.get():
@@ -18031,13 +19521,12 @@ class GameTextReader:
                         # Character mappings for common OCR errors
                         char_mappings = {
                             '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
-                            'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                            '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                             '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                             '×': 'x', '♥': 'h', '★': '*'
                         }
-                        # Apply character mappings
-                        for old_char, new_char in char_mappings.items():
-                            filtered_text = filtered_text.replace(old_char, new_char)
+                        # Apply all mappings simultaneously (no double-conversion)
+                        filtered_text = filtered_text.translate(str.maketrans(char_mappings))
                     
                     # Then apply letters-only filtering (with optional numbers)
                     if self.letters_only_numbers_var.get():
@@ -18081,13 +19570,12 @@ class GameTextReader:
                 # Character mappings for common OCR errors
                 char_mappings = {
                     '|': 'I', '5': 'S', '0': 'O', '2': 'Z', '8': 'B',
-                    'I': 'l', '1': 'l', '§': 'S', '€': 'E', '£': 'E',
+                    '1': 'l', '§': 'S', '€': 'E', '£': 'E',
                     '¥': 'Y', '@': 'a', '&': 'B', '°': '0', 'µ': 'u',
                     '×': 'x', '♥': 'h', '★': '*'
                 }
-                # Apply character mappings
-                for old_char, new_char in char_mappings.items():
-                    filtered_text = filtered_text.replace(old_char, new_char)
+                # Apply all mappings simultaneously (no double-conversion)
+                filtered_text = filtered_text.translate(str.maketrans(char_mappings))
 
         if self.pause_at_punctuation_var.get():
             # Replace punctuation with itself plus a pause marker
@@ -18171,12 +19659,43 @@ class GameTextReader:
 
         # Set the voice and speed for SAPI
         if voice_var:
+            # Route AI voices before SAPI lookup
+            _actual_voice_check = getattr(voice_var, '_full_name', voice_var.get())
+            if _actual_voice_check.startswith('[Piper]:'):
+                _piper_key = _actual_voice_check.split(':', 1)[1]
+                _aid = id(area_frame)
+                threading.Thread(
+                    target=self._speak_with_piper,
+                    args=(filtered_text, _piper_key, speed_var),
+                    kwargs={'area_id': _aid},
+                    daemon=True
+                ).start()
+                return
+            if _actual_voice_check.startswith('[Kokoro]:'):
+                _kokoro_id = _actual_voice_check[9:]
+                _aid = id(area_frame)
+                threading.Thread(
+                    target=self._speak_with_kokoro,
+                    args=(filtered_text, _kokoro_id, speed_var),
+                    kwargs={'area_id': _aid},
+                    daemon=True
+                ).start()
+                return
+            if _actual_voice_check.startswith('[SAPI]:preset:'):
+                _sapi_preset = _actual_voice_check[14:]
+                threading.Thread(
+                    target=self._speak_with_sapi_preset,
+                    args=(filtered_text, _sapi_preset, speed_var),
+                    daemon=True
+                ).start()
+                return
+
             # Check both SAPI voices and our combined voice list (includes mock voices)
             selected_voice = None
-            
+
             # Get the actual voice name (full name, not display name)
             actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
-            
+
             # First try to find in SAPI voices
             try:
                 voices = self.speaker.GetVoices()
@@ -18555,7 +20074,7 @@ class GameTextReader:
             "process_freeze_screen": getattr(self, 'process_freeze_screen_var', tk.BooleanVar(value=False)).get(),
             "allow_mouse_buttons": getattr(self, 'allow_mouse_buttons_var', tk.BooleanVar(value=False)).get(),
             "letters_only": getattr(self, 'letters_only_var', tk.BooleanVar(value=False)).get(),
-            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=False)).get(),
+            "char_normalization": getattr(self, 'char_normalization_var', tk.BooleanVar(value=True)).get(),
             "translation_enabled": self.translation_enabled_var.get(),
             "translation_source": self.translation_source_var.get(),
             "translation_target": self.translation_target_var.get(),
@@ -18688,26 +20207,65 @@ class GameTextReader:
         # Find the area and get its voice/speed settings (for fallback only)
         voice_var = None
         speed_var = None
-        
+        _log_area_frame = None
+
         for area in self.areas:
-            # Handle both 8 and 9 element tuples (for backward compatibility)
             if len(area) >= 9:
-                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var_item, speed_var_item, psm_var, freeze_screen_var = area[:9]
+                _af, _, _, _anv, _, _vvi, _svi, _, _ = area[:9]
             else:
-                area_frame, hotkey_button, set_area_button, area_name_var, preprocess_var, voice_var_item, speed_var_item, psm_var = area[:8]
-            if area_name_var.get() == area_name:
-                voice_var = voice_var_item
-                speed_var = speed_var_item
+                _af, _, _, _anv, _, _vvi, _svi, _ = area[:8]
+            if _anv.get() == area_name:
+                voice_var = _vvi
+                speed_var = _svi
+                _log_area_frame = _af
                 break
         
         # Prioritize voice from entry (what's shown in dropdown) over area's voice
         # First try to use the stored voice name from the entry
         selected_voice = None
         actual_voice_name = None
-        
+
         if voice_name:
-            # Use the voice from the entry (what's shown in the dropdown)
             actual_voice_name = voice_name
+        elif voice_var:
+            actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
+
+        # Route AI voices before any SAPI lookup
+        if actual_voice_name:
+            if actual_voice_name.startswith('[Piper]:'):
+                _piper_key = actual_voice_name.split(':', 1)[1]
+                _aid = id(_log_area_frame) if _log_area_frame is not None else None
+                import threading
+                threading.Thread(
+                    target=self._speak_with_piper,
+                    args=(text, _piper_key, speed_var),
+                    kwargs={'area_id': _aid},
+                    daemon=True
+                ).start()
+                return
+            if actual_voice_name.startswith('[Kokoro]:'):
+                _kokoro_id = actual_voice_name[9:]
+                _aid = id(_log_area_frame) if _log_area_frame is not None else None
+                import threading
+                threading.Thread(
+                    target=self._speak_with_kokoro,
+                    args=(text, _kokoro_id, speed_var),
+                    kwargs={'area_id': _aid},
+                    daemon=True
+                ).start()
+                return
+            if actual_voice_name.startswith('[SAPI]:preset:'):
+                _sapi_preset = actual_voice_name[14:]
+                import threading
+                threading.Thread(
+                    target=self._speak_with_sapi_preset,
+                    args=(text, _sapi_preset, speed_var),
+                    daemon=True
+                ).start()
+                return
+
+        # SAPI lookup
+        if voice_name:
             try:
                 voices = self.speaker.GetVoices()
                 for voice in voices:
@@ -18716,7 +20274,7 @@ class GameTextReader:
                         break
             except Exception:
                 pass
-            
+
             if not selected_voice and hasattr(self, 'voices'):
                 for voice in self.voices:
                     if hasattr(voice, 'GetDescription') and voice.GetDescription() == voice_name:
@@ -18724,10 +20282,6 @@ class GameTextReader:
                             selected_voice = voice
                             break
         elif voice_var:
-            # Fallback to area's voice if entry doesn't have one
-            actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
-            
-            # Find the voice object
             try:
                 voices = self.speaker.GetVoices()
                 for voice in voices:
@@ -18736,14 +20290,13 @@ class GameTextReader:
                         break
             except Exception:
                 pass
-            
             if not selected_voice and hasattr(self, 'voices'):
                 for voice in self.voices:
                     if hasattr(voice, 'GetDescription') and voice.GetDescription() == actual_voice_name:
                         if hasattr(voice, 'GetId'):
                             selected_voice = voice
                             break
-        
+
         # Set the selected voice
         if selected_voice and selected_voice != "mock_voice":
             try:

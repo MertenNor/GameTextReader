@@ -10,6 +10,7 @@ class PerformanceSettingsWindow:
     def __init__(self, game_reader):
         self.game_reader = game_reader
         self.window = tk.Toplevel(game_reader.root)
+        self.window.withdraw()
         self.window.title("Argos-Translate Performance Settings")
         self.window.geometry("450x550")
         self.window.resizable(False, False)
@@ -40,6 +41,7 @@ class PerformanceSettingsWindow:
         self.current_settings = self.load_settings()
         
         self.setup_ui()
+        self.window.deiconify()
 
     def on_close(self):
         if hasattr(self.game_reader, 'unregister_hotkey_disabling_window'):

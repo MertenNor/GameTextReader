@@ -15,6 +15,7 @@ class GameUnitsEditWindow:
         self.root = root
         self.game_text_reader = game_text_reader
         self.window = tk.Toplevel(root)
+        self.window.withdraw()
         self.window.title("Text Replacement Editor")
         self.window.geometry("540x600")
         self.window.resizable(True, True)
@@ -59,7 +60,8 @@ class GameUnitsEditWindow:
         
         # Populate with existing data
         self.populate_entries()
-    
+        self.window.deiconify()
+
     def on_close(self):
         """Handle window closing."""
         self.cancel_edit()

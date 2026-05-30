@@ -16,6 +16,7 @@ class TextLogWindow:
         self.root = root
         self.game_text_reader = game_text_reader
         self.window = tk.Toplevel(root)
+        self.window.withdraw()
         self.window.title("Scan History")
         self.window.geometry("700x300")
         self.window.resizable(True, True)
@@ -96,16 +97,19 @@ class TextLogWindow:
         
         self.game_text_reader.repeat_latest_hotkey_button.config = update_display_button
         
-        # Restore hotkey if it was previously set
-        if self.game_text_reader.repeat_latest_hotkey:
-            # Update button text to match main window format: "Hotkey: [ {display_name.upper()} ]"
-            display_name = self.game_text_reader._hotkey_to_display_name(self.game_text_reader.repeat_latest_hotkey)
-            self.repeat_latest_hotkey_button.config(text=f"Hotkey: [ {display_name.upper()} ]")
-            # Only set up the hotkey if it's not already registered
-            # This prevents removing and re-registering an already working hotkey
-            if not hasattr(self.game_text_reader.repeat_latest_hotkey_button, 'keyboard_hook') and not hasattr(self.game_text_reader.repeat_latest_hotkey_button, 'mouse_hook_id'):
-                # Set up the hotkey using the persistent button
+        # Register the hotkey if not already active
+        if not hasattr(self.game_text_reader.repeat_latest_hotkey_button, 'keyboard_hook') and \
+           not hasattr(self.game_text_reader.repeat_latest_hotkey_button, 'mouse_hook_id'):
+            if self.game_text_reader.repeat_latest_hotkey:
                 self.game_text_reader.setup_hotkey(self.game_text_reader.repeat_latest_hotkey_button, None)
+
+        # Restore button label — check both the string var and the button's own .hotkey attr
+        _hotkey_val = (self.game_text_reader.repeat_latest_hotkey or
+                       getattr(self.game_text_reader.repeat_latest_hotkey_button, 'hotkey', None))
+        if _hotkey_val:
+            self.game_text_reader.repeat_latest_hotkey = _hotkey_val  # keep in sync
+            display_name = self.game_text_reader._hotkey_to_display_name(_hotkey_val)
+            self.repeat_latest_hotkey_button.config(text=f"Hotkey: [ {display_name.upper()} ]")
         
         # Add separator line under hotkey button
         separator = ttk.Separator(main_frame, orient='horizontal')
@@ -164,7 +168,8 @@ class TextLogWindow:
         
         # Start auto-refresh
         self.auto_refresh()
-    
+        self.window.deiconify()
+
     def on_close(self):
         """Handle window closing."""
         # Stop auto-refresh
@@ -255,46 +260,22 @@ class TextLogWindow:
         voice_full_names = {}
         voice_display_names = []
         
-        # Get available voices
-        if hasattr(self.game_text_reader, 'voices') and self.game_text_reader.voices:
-            try:
-                for i, voice in enumerate(self.game_text_reader.voices, 1):
-                    full_name = voice.GetDescription()
-                    
-                    # Create abbreviated display name
-                    if "Microsoft" in full_name and " - " in full_name:
-                        parts = full_name.split(" - ")
-                        if len(parts) == 2:
-                            voice_part = parts[0].replace("Microsoft ", "")
-                            lang_part = parts[1]
-                            display_name = f"{i}. {voice_part} ({lang_part})"
-                        else:
-                            display_name = f"{i}. {full_name}"
-                    elif " - " in full_name:
-                        parts = full_name.split(" - ")
-                        if len(parts) == 2:
-                            display_name = f"{i}. {parts[0]} ({parts[1]})"
-                        else:
-                            display_name = f"{i}. {full_name}"
-                    else:
-                        display_name = f"{i}. {full_name}"
-                    
-                    voice_display_names.append(display_name)
-                    voice_full_names[display_name] = full_name
-            except Exception as e:
-                print(f"[ERROR] Scan History: Voice lookup failed: {e}")
-        
-        # Find current voice in list
+        # Get all available voices (SAPI + AI) via the same builder the main window uses
+        try:
+            voice_display_names, voice_full_names = self.game_text_reader._build_voice_lists()
+        except Exception as e:
+            print(f"[ERROR] Scan History: Voice list build failed: {e}")
+            voice_display_names, voice_full_names = [], {}
+
+        # Find current voice in list (match by internal full name / key)
         current_voice = entry.get('voice', None)
         selected_display = "Select Voice"
         if current_voice:
-            # Try to find matching voice
             for display_name, full_name in voice_full_names.items():
                 if full_name == current_voice:
                     selected_display = display_name
                     break
-            # If not found, show the full name
-            if selected_display == "Select Voice" and current_voice:
+            if selected_display == "Select Voice":
                 selected_display = current_voice
         
         voice_var.set(selected_display)
@@ -462,10 +443,31 @@ class TextLogWindow:
             if not voice_to_use or not voice_to_use.strip() or voice_to_use in invalid_voices:
                 voice_to_use = None
         
-        # Set the voice if we have one
+        # Route AI voices before SAPI lookup
+        if voice_to_use:
+            if voice_to_use.startswith('[Piper]:'):
+                _piper_key = voice_to_use.split(':', 1)[1]
+                import threading
+                threading.Thread(
+                    target=self.game_text_reader._speak_with_piper,
+                    args=(text, _piper_key, speed_var),
+                    daemon=True
+                ).start()
+                return
+            if voice_to_use.startswith('[Kokoro]:'):
+                _kokoro_id = voice_to_use[9:]
+                import threading
+                threading.Thread(
+                    target=self.game_text_reader._speak_with_kokoro,
+                    args=(text, _kokoro_id, speed_var),
+                    daemon=True
+                ).start()
+                return
+
+        # Set the voice if we have one (SAPI path)
         if voice_to_use:
             selected_voice = None
-            
+
             # Try to find voice in available voices
             try:
                 voices = self.game_text_reader.speaker.GetVoices()

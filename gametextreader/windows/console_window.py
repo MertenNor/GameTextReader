@@ -17,7 +17,7 @@ class ConsoleWindow:
     def __init__(self, root, log_buffer, layout_file_var, latest_images, latest_area_name_var, game_reader=None):
         self.game_reader = game_reader
         self.window = tk.Toplevel(root)
-        self.window.title("Debug Console")
+        self.window.title("Debug Window")
         
         # Flag to prevent infinite recursion in update_image_display
         self._updating_image = False

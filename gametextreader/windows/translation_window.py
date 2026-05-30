@@ -10,6 +10,7 @@ class TranslationWindow:
     def __init__(self, parent):
         self.parent = parent
         self.window = tk.Toplevel(parent)
+        self.window.withdraw()
         self.window.title("Language Manager")
         self.window.geometry("700x500")
         self.window.resizable(False, False)
@@ -38,6 +39,7 @@ class TranslationWindow:
         # Start loading available languages (from local cache first)
         self.status_label.config(text="Checking local package index...", fg="blue")
         threading.Thread(target=lambda: self.load_available_languages(update_index=False), daemon=True).start()
+        self.window.deiconify()
 
     def setup_ui(self):
         # Main container

@@ -26,6 +26,12 @@ if sys.platform.startswith('win'):
     except Exception:
         # Already set (e.g. via exe manifest) or not supported — proceed as-is.
         pass
+    try:
+        # Give this process its own AppUserModelID so Windows shows the app name
+        # and icon in the taskbar instead of "Python".
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GameTextReader.App")
+    except Exception:
+        pass
 
 import tkinter as tk
 
@@ -301,11 +307,11 @@ def migrate_legacy_settings_file(root=None, app=None):
         if root is not None and options_for_prompt:
             # Ask the user which legacy file or asset folder to import
             win = tk.Toplevel(root)
+            win.withdraw()
             win.title("Import Previous Settings")
             win.resizable(False, False)
             win.transient(root)
             win.grab_set()
-            win.lift()
             try:
                 icon_path = os.path.join(os.path.dirname(__file__), 'Assets', 'icon.ico')
                 if os.path.exists(icon_path):
@@ -438,6 +444,8 @@ def migrate_legacy_settings_file(root=None, app=None):
             tk.Button(button_frame, text="Skip", command=skip_copy, width=10).pack(side="right")
 
             win.protocol("WM_DELETE_WINDOW", skip_copy)
+            win.deiconify()
+            win.lift()
             root.wait_window(win)
             selected_path = decision["path"]
             best_dir = decision.get("dir")
@@ -680,43 +688,35 @@ def main():
     # Hide the main window during setup to prevent the "stretching" effect
     root.withdraw()
     
-    # Create loading window as a Toplevel of the main root
-    # This happens BEFORE any heavy imports to show the window as fast as possible
+    # Create loading window — withdraw immediately so it never flashes at wrong size
     loading_window = tk.Toplevel(root)
-    loading_window.title("Loading")
-    loading_window.geometry("200x100")
+    loading_window.withdraw()
+    loading_window.overrideredirect(True)
+    loading_window.configure(bg='black')
     loading_window.resizable(False, False)
-    # Center the loading window
-    loading_window.update_idletasks()
+    # Center at correct size before ever showing
     x = (loading_window.winfo_screenwidth() // 2) - (300 // 2)
     y = (loading_window.winfo_screenheight() // 2) - (100 // 2)
     loading_window.geometry(f"300x100+{x}+{y}")
-    # Remove window decorations for a cleaner look
-    loading_window.overrideredirect(True)
-    loading_window.configure(bg='black')
-    
+
     # Load and display splash image
     try:
         splash_path = os.path.join(os.path.dirname(__file__), 'Assets', 'splash.png')
         if os.path.exists(splash_path):
-            # Load splash image
             splash_img = Image.open(splash_path)
-            # Ensure it matches window size exactly
             splash_img = splash_img.resize((300, 100), Image.Resampling.LANCZOS)
             splash_photo = ImageTk.PhotoImage(splash_img)
-            
             splash_label = tk.Label(loading_window, image=splash_photo, borderwidth=0, highlightthickness=0)
-            splash_label.image = splash_photo  # Keep a reference
+            splash_label.image = splash_photo
             splash_label.pack(fill="both", expand=True)
         else:
-            # Fallback if splash image is missing
             tk.Label(loading_window, text=f"Loading {APP_NAME}...", fg="white", bg="black", font=("Helvetica", 12)).pack(expand=True)
     except Exception as e:
         print(f"Error loading splash image for loading window: {e}")
-        # Fallback
         tk.Label(loading_window, text=f"Loading {APP_NAME}...", fg="white", bg="black", font=("Helvetica", 12)).pack(expand=True)
-    
-    # Force the loading window to appear NOW before any heavy imports
+
+    # Show fully-built loading window, then force it to paint before heavy imports
+    loading_window.deiconify()
     loading_window.update()
     loading_window.lift()
     loading_window.focus_force()
@@ -741,6 +741,19 @@ def main():
         if os.path.exists(icon_path):
             root.iconbitmap(icon_path)
             print(f"Set window icon to: {icon_path}")
+            # Register the AUMID in the registry so Windows shows the correct
+            # display name and icon in the taskbar jump list instead of "Python".
+            if sys.platform.startswith('win'):
+                try:
+                    import winreg
+                    key_path = r"Software\Classes\AppUserModelId\GameTextReader.App"
+                    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path,
+                                             0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "GameTextReader")
+                    winreg.SetValueEx(key, "IconUri",     0, winreg.REG_SZ, icon_path)
+                    winreg.CloseKey(key)
+                except Exception:
+                    pass
         else:
             print(f"Icon file not found at: {icon_path}")
     except Exception as e:
@@ -797,7 +810,8 @@ def main():
     # Check for updates on startup if auto-check is enabled
     def check_updates_on_startup():
         app.check_for_updates_on_startup()
-    
+        app.check_ai_voice_updates_on_startup()
+
     # Schedule update check after a delay to ensure window is fully displayed
     app.root.after(1000, check_updates_on_startup)
     

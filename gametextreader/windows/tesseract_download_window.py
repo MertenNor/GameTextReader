@@ -10,6 +10,7 @@ class TesseractDownloadWindow:
         self.parent = parent
         self.tesseract_manager = tesseract_manager
         self.window = tk.Toplevel(parent)
+        self.window.withdraw()
         self.window.title("Tesseract Language Manager")
         self.window.geometry("700x500")
         self.window.resizable(False, False)
@@ -38,10 +39,11 @@ class TesseractDownloadWindow:
         
         self.setup_ui()
         self.refresh_installed_languages()
-        
+
         # Start loading available languages
         self.status_label.config(text="Loading available languages...", fg="blue")
         threading.Thread(target=self.load_available_languages, daemon=True).start()
+        self.window.deiconify()
 
     def setup_ui(self):
         # Main container

@@ -82,6 +82,7 @@ class AutomationsWindow:
         self.game_text_reader = game_text_reader
         
         self.window = tk.Toplevel(self.root)
+        self.window.withdraw()
         self.window.title("Automations")
         self.window.geometry("800x600")
         self.window.resizable(True, True)
@@ -180,7 +181,7 @@ class AutomationsWindow:
         
         # Create UI
         self.create_ui()
-    
+
     def _update_polling_button_state(self):
         """Update the polling button state to match the actual polling state"""
         try:
@@ -340,7 +341,7 @@ class AutomationsWindow:
         # Left side of line 1
         add_automation_button = tk.Button(
             line1_frame, 
-            text="🖼 Add Detection Area", 
+            text="+ Add Detection Area",
             command=self.add_automation,
             font=("Helvetica", 10)
         )
@@ -431,9 +432,14 @@ class AutomationsWindow:
         
         # Enable mouse wheel scrolling anywhere in the window
         def _on_mousewheel(event):
-            # Check if the canvas is scrollable
-            if canvas.bbox("all") and canvas.winfo_height() < (canvas.bbox("all")[3] - canvas.bbox("all")[1]):
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            try:
+                if not canvas.winfo_exists():
+                    return
+                bbox = canvas.bbox("all")
+                if bbox and canvas.winfo_height() < (bbox[3] - bbox[1]):
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
         
         # Bind mouse wheel to the entire window so it works anywhere
         def bind_mousewheel(event):
@@ -840,7 +846,7 @@ class AutomationsWindow:
         
         if not self.automations:
             pass
-            messagebox.showinfo("No Automations", "Please add an automation first.")
+            messagebox.showinfo("No Detection Area", "Please add a Detection Area first.")
             return
         
         # Check if area selection is already in progress
