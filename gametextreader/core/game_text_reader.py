@@ -2718,7 +2718,7 @@ class GameTextReader:
             if os.path.exists(default_path):
                 return False, "Tesseract found but not working properly"
             else:
-                return False, "Tesseract Not found or not installed in default path: C:\Program Files\Tesseract-OCR"
+                return False, r"Tesseract Not found or not installed in default path: C:\Program Files\Tesseract-OCR"
     
     def locate_tesseract_executable(self):
         """Open file dialog to locate Tesseract executable and save the path."""
@@ -4898,10 +4898,7 @@ class GameTextReader:
                 display = full = None
                 if engine == "sapi":
                     full_name = key
-                    if "Microsoft" in full_name and " - " in full_name:
-                        parts = full_name.split(" - ")
-                        display = f"{n}. {parts[0].replace('Microsoft ', '')} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
-                    elif " - " in full_name:
+                    if " - " in full_name:
                         parts = full_name.split(" - ")
                         display = f"{n}. {parts[0]} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
                     else:
@@ -4941,10 +4938,7 @@ class GameTextReader:
                 for voice in self.voices:
                     full_name = voice.GetDescription()
                     n = _seq()
-                    if "Microsoft" in full_name and " - " in full_name:
-                        parts = full_name.split(" - ")
-                        display = f"{n}. {parts[0].replace('Microsoft ', '')} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
-                    elif " - " in full_name:
+                    if " - " in full_name:
                         parts = full_name.split(" - ")
                         display = f"{n}. {parts[0]} ({parts[1]})" if len(parts) == 2 else f"{n}. {full_name}"
                     else:
@@ -10104,7 +10098,7 @@ class GameTextReader:
                                     
                                     # Use PrintWindow to capture
                                     PW_RENDERFULLCONTENT = 0x00000002
-                                    result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetHandle(), PW_RENDERFULLCONTENT)
+                                    result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetSafeHdc(), PW_RENDERFULLCONTENT)
                                     
                                     if result:
                                         bmpinfo = bmp.GetInfo()
@@ -19696,6 +19690,10 @@ class GameTextReader:
             # Get the actual voice name (full name, not display name)
             actual_voice_name = getattr(voice_var, '_full_name', voice_var.get())
 
+            def _sapi_base(name):
+                return name.split(" - ")[0].strip().lower()
+            saved_base = _sapi_base(actual_voice_name)
+
             # First try to find in SAPI voices
             try:
                 voices = self.speaker.GetVoices()
@@ -19705,25 +19703,88 @@ class GameTextReader:
                         break
             except Exception as e:
                 print(f"Error getting SAPI voices: {e}")
-            
-            # If not found in SAPI, try our combined voice list (includes mock voices)
+
+            # Fallback: pure winreg lookup (no COM enumeration — bypasses NVDA interception entirely)
+            if not selected_voice:
+                import winreg as _winreg
+                _token_locations = [
+                    (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+                     r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens"),
+                    (r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens",
+                     r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"),
+                ]
+                for reg_sub, hklm_prefix in _token_locations:
+                    try:
+                        root = _winreg.OpenKey(_winreg.HKEY_LOCAL_MACHINE, reg_sub)
+                        idx = 0
+                        while True:
+                            try:
+                                token_name = _winreg.EnumKey(root, idx)
+                                idx += 1
+                            except OSError:
+                                break
+                            desc = None
+                            try:
+                                tok_key = _winreg.OpenKey(root, token_name)
+                                for sub in ("409", ""):
+                                    try:
+                                        if sub:
+                                            sk = _winreg.OpenKey(tok_key, sub)
+                                            desc, _ = _winreg.QueryValueEx(sk, "")
+                                            _winreg.CloseKey(sk)
+                                        else:
+                                            desc, _ = _winreg.QueryValueEx(tok_key, "")
+                                        if desc:
+                                            break
+                                    except Exception:
+                                        pass
+                                if not desc:
+                                    try:
+                                        ak = _winreg.OpenKey(tok_key, "Attributes")
+                                        desc, _ = _winreg.QueryValueEx(ak, "Name")
+                                        _winreg.CloseKey(ak)
+                                    except Exception:
+                                        pass
+                                _winreg.CloseKey(tok_key)
+                            except Exception:
+                                pass
+                            if desc and (desc == actual_voice_name
+                                         or _sapi_base(desc) == saved_base
+                                         or saved_base in desc.lower()):
+                                token_path = f"{hklm_prefix}\\{token_name}"
+                                try:
+                                    tok_obj = win32com.client.Dispatch("SAPI.SpObjectToken")
+                                    tok_obj.SetId(token_path, False)
+                                    print(f"[TTS] Found voice via winreg: '{desc}' at {token_path}")
+                                    selected_voice = tok_obj
+                                except Exception as e3:
+                                    print(f"[TTS] SpObjectToken.SetId failed: {e3}")
+                                break
+                        _winreg.CloseKey(root)
+                        if selected_voice:
+                            break
+                    except Exception as e2:
+                        print(f"[TTS] winreg fallback failed for {reg_sub}: {e2}")
+
+            # Last resort: try startup-enumerated voice list (WorkingOneCoreVoice objects)
             if not selected_voice and hasattr(self, 'voices'):
                 for voice in self.voices:
-                    if hasattr(voice, 'GetDescription') and voice.GetDescription() == actual_voice_name:
-                        # Check if this is a real SAPI voice object
-                        if hasattr(voice, 'GetId') and hasattr(voice, 'GetToken'):  # Working OneCore voice object
-                            print(f"Found working OneCore voice: {actual_voice_name}")
+                    if not hasattr(voice, 'GetDescription'):
+                        continue
+                    try:
+                        desc = voice.GetDescription()
+                    except Exception:
+                        continue
+                    if desc == actual_voice_name:
+                        selected_voice = voice if hasattr(voice, 'GetId') else "mock_voice"
+                        break
+                    if _sapi_base(desc) == saved_base or saved_base in desc.lower() or desc.lower() in actual_voice_name.lower():
+                        if hasattr(voice, 'GetId'):
+                            print(f"[TTS] Fuzzy-matched from startup list: '{actual_voice_name}' → '{desc}'")
                             selected_voice = voice
-                            break
-                        elif hasattr(voice, 'GetId'):  # Real SAPI voice object
-                            print(f"Found real voice in combined list: {actual_voice_name}")
-                            selected_voice = voice
-                            break
                         else:
-                            # For mock voices, we can't set them directly, so just continue
-                            print(f"Found mock voice: {actual_voice_name}")
-                            selected_voice = "mock_voice"  # Mark as found but don't set
-                            break
+                            selected_voice = "mock_voice"
+                        break
             
             if selected_voice and selected_voice != "mock_voice":
                 try:
@@ -19818,8 +19879,25 @@ class GameTextReader:
                 messagebox.showerror("Error", "Selected voice requires Windows Narrator TTS. Please install 'winsdk' (pip install winsdk) or choose a SAPI voice.")
                 return
             else:
-                messagebox.showerror("Error", "No voice selected. Please select a voice.")
-                print("Error: Did not speak, Reason: No selected voice.")
+                # All voice-finding methods failed. We can't set the requested voice, but
+                # speak with whatever SAPI's current default is anyway so the user at least
+                # hears the text — just warn them once that it's not the voice they picked.
+                print(f"[TTS] Could not resolve SAPI voice '{actual_voice_name}' — speaking with current default voice instead")
+                if not hasattr(self, '_voice_not_found_warned'):
+                    self._voice_not_found_warned = set()
+                if actual_voice_name not in self._voice_not_found_warned:
+                    self._voice_not_found_warned.add(actual_voice_name)
+                    msg = (f"The voice \"{actual_voice_name}\" can't be found, so the default voice "
+                           "is being used instead.\n\n"
+                           "Its installation files may have been moved or deleted. Reinstalling this "
+                           "SAPI online voice (Settings → Time & language → Speech → Manage voices — "
+                           "remove it, then add it again) should fix this.")
+                    messagebox.showerror("Voice Not Found", msg)
+                try:
+                    self.speaker.Speak(filtered_text, 1)
+                    self._start_speech_monitor()
+                except Exception as e_default:
+                    print(f"[TTS] Default SAPI speak also failed: {e_default}")
                 return
 
         # Update speed for win32com - Convert from percentage to rate (-10 to 10)
@@ -20645,7 +20723,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
                         # Use PrintWindow to capture the window's content
                         # PW_RENDERFULLCONTENT = 0x00000002 (captures even if window is occluded)
                         PW_RENDERFULLCONTENT = 0x00000002
-                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetHandle(), PW_RENDERFULLCONTENT)
+                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetSafeHdc(), PW_RENDERFULLCONTENT)
                         
                         if result:
                             # Convert bitmap to PIL Image

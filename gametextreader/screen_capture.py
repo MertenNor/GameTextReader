@@ -2,11 +2,11 @@
 Screen capture functions for capturing game text areas
 """
 import ctypes
-from PIL import Image
-import win32api
-import win32con
-import win32gui
-import win32ui
+from PIL import Image  # type: ignore
+import win32api  # type: ignore
+import win32con  # type: ignore
+import win32gui  # type: ignore
+import win32ui  # type: ignore
 
 
 def get_dpi_scale():
@@ -160,7 +160,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
                         # Use PrintWindow to capture the window's content
                         # PW_RENDERFULLCONTENT = 0x00000002 (captures even if window is occluded)
                         PW_RENDERFULLCONTENT = 0x00000002
-                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetHandle(), PW_RENDERFULLCONTENT)
+                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetSafeHdc(), PW_RENDERFULLCONTENT)
                         
                         if result:
                             # Convert bitmap to PIL Image

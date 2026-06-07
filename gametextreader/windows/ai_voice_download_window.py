@@ -154,8 +154,10 @@ class _VoiceListbox:
             self._tree.column("#0", stretch=True, minwidth=0)
         except Exception:
             pass
-        self._tree.tag_configure("normal", font=font)
-        self._tree.tag_configure("bold",   font=self._font_bold)
+        self._tree.tag_configure("normal",  font=font)
+        self._tree.tag_configure("bold",    font=self._font_bold)
+        self._tree.tag_configure("problem", font=font, foreground="#999999")
+        self._tree.tag_configure("problem_bold", font=self._font_bold, foreground="#999999")
         self.yview = self._tree.yview
 
     def configure(self, **kwargs):
@@ -167,8 +169,19 @@ class _VoiceListbox:
     def pack(self, **kwargs):
         self._tree.pack(**kwargs)
 
-    def insert(self, _index, text, bold=False):
-        self._tree.insert("", "end", text=text, tags=("bold" if bold else "normal",))
+    def insert(self, _index, text, bold=False, problem=False):
+        if problem:
+            tag = "problem_bold" if bold else "problem"
+        else:
+            tag = "bold" if bold else "normal"
+        self._tree.insert("", "end", text=text, tags=(tag,))
+
+    def identify_row(self, y):
+        return self._tree.identify_row(y)
+
+    def index_of_iid(self, iid):
+        children = self._tree.get_children()
+        return children.index(iid) if iid in children else None
 
     def delete(self, first, last=None):
         children = self._tree.get_children()
@@ -436,6 +449,7 @@ class AIVoiceDownloadWindow:
 
         self._all_voices_list.bind('<<ListboxSelect>>', self._voices_on_list_select)
         self._selected_voices_list.bind('<<ListboxSelect>>', self._voices_on_list_select)
+        self._selected_voices_list.bind('<Button-1>', self._voices_on_selected_click, add='+')
 
         # Populate both lists
         self._voices_tab_data = []   # list of (label, engine, key) for all voices
@@ -454,18 +468,56 @@ class AIVoiceDownloadWindow:
         regular = []
         custom  = []
 
-        # SAPI
+        # SAPI — try COM first, fall back to winreg if NVDA or another app blocks GetVoices()
+        sapi_names = []
         try:
             import win32com.client
             sapi = win32com.client.Dispatch("SAPI.SpVoice")
             for token in sapi.GetVoices():
                 try:
-                    name = token.GetDescription()
-                    regular.append((f"[SAPI] {name}", "sapi", name))
+                    sapi_names.append(token.GetDescription())
                 except Exception:
                     pass
         except Exception:
             pass
+        if not sapi_names:
+            import winreg as _wr
+            for _sub in (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+                         r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"):
+                try:
+                    _root = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, _sub)
+                    _i = 0
+                    while True:
+                        try:
+                            _tok = _wr.EnumKey(_root, _i); _i += 1
+                        except OSError:
+                            break
+                        _desc = None
+                        try:
+                            _tk = _wr.OpenKey(_root, _tok)
+                            for _s in ("409", ""):
+                                try:
+                                    if _s:
+                                        _sk = _wr.OpenKey(_tk, _s)
+                                        _desc, _ = _wr.QueryValueEx(_sk, ""); _wr.CloseKey(_sk)
+                                    else:
+                                        _desc, _ = _wr.QueryValueEx(_tk, "")
+                                    if _desc: break
+                                except Exception: pass
+                            if not _desc:
+                                try:
+                                    _ak = _wr.OpenKey(_tk, "Attributes")
+                                    _desc, _ = _wr.QueryValueEx(_ak, "Name"); _wr.CloseKey(_ak)
+                                except Exception: pass
+                            _wr.CloseKey(_tk)
+                        except Exception: pass
+                        if _desc and _desc not in sapi_names:
+                            sapi_names.append(_desc)
+                    _wr.CloseKey(_root)
+                except Exception:
+                    pass
+        for name in sapi_names:
+            regular.append((f"[SAPI] {name}", "sapi", name))
 
         # Piper — installed .onnx files (only shown when the engine binary is present)
         try:
@@ -518,10 +570,14 @@ class AIVoiceDownloadWindow:
     def _rebuild_selected_list(self):
         """Redraw the selected voices listbox using each voice's original available-list number."""
         self._selected_voices_list.delete(0, tk.END)
+        nums = getattr(self, '_voice_numbers', {})
+        fallback_nums = getattr(self, '_fallback_voice_numbers', {})
         for label, eng, key in self._selected_voices_data:
-            num  = getattr(self, '_voice_numbers', {}).get((eng, key), "?")
+            problem = (eng, key) in fallback_nums
+            num  = nums.get((eng, key), fallback_nums.get((eng, key), "?"))
             bold = eng in self._CUSTOM_ENGINES
-            self._selected_voices_list.insert(tk.END, f"{num}.  {label}", bold=bold)
+            suffix = "  (?)" if problem else ""
+            self._selected_voices_list.insert(tk.END, f"{num}.  {label}{suffix}", bold=bold, problem=problem)
 
     # ── settings persistence ──────────────────────────────────────────
 
@@ -533,8 +589,9 @@ class AIVoiceDownloadWindow:
                 with open(APP_SETTINGS_PATH, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
             nums = getattr(self, '_voice_numbers', {})
+            fallback_nums = getattr(self, '_fallback_voice_numbers', {})
             settings['voice_filter'] = [
-                {"engine": e, "key": k, "num": nums.get((e, k), i + 1)}
+                {"engine": e, "key": k, "num": nums.get((e, k), fallback_nums.get((e, k), i + 1))}
                 for i, (_label, e, k) in enumerate(self._selected_voices_data)
             ]
             with open(APP_SETTINGS_PATH, 'w', encoding='utf-8') as f:
@@ -555,6 +612,20 @@ class AIVoiceDownloadWindow:
             pass
         return None
 
+    def _voices_load_saved_ordered(self):
+        """Return saved voice_filter as an ordered list of (engine, key, num) tuples, or None if not saved.
+        `num` is the number that was saved alongside the entry (or None)."""
+        try:
+            if os.path.exists(APP_SETTINGS_PATH):
+                with open(APP_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                raw = settings.get('voice_filter')
+                if isinstance(raw, list) and len(raw) > 0:
+                    return [(item['engine'], item['key'], item.get('num')) for item in raw]
+        except Exception:
+            pass
+        return None
+
     def _populate_voices_lists(self):
         all_voices = self._enumerate_all_voices()
         self._voices_tab_data = all_voices
@@ -563,24 +634,80 @@ class AIVoiceDownloadWindow:
         # This number travels with the voice regardless of which list it lives in.
         self._voice_numbers = {(e, k): i + 1 for i, (_, e, k) in enumerate(all_voices)}
 
-        saved = self._voices_load_saved()
+        saved         = self._voices_load_saved()           # set of (engine, key) or None
+        saved_ordered = self._voices_load_saved_ordered()   # ordered [(engine, key, num)] or None
 
-        if saved is not None:
-            selected  = [(l, e, k) for l, e, k in all_voices if (e, k) in saved]
-            available = [(l, e, k) for l, e, k in all_voices if (e, k) not in saved]
+        # Numbers to fall back on for saved voices that can't be matched to anything
+        # currently enumerable (e.g. cloud "Online (Natural)" voices that have no
+        # registry token and so never appear in `all_voices`). Without this they'd
+        # show as "?." even though we know what number they were saved under.
+        self._fallback_voice_numbers = {}
+
+        if saved is not None and saved_ordered is not None:
+            all_voices_map = {(e, k): l for l, e, k in all_voices}
+
+            def _sapi_base(name):
+                return name.split(" - ")[0].strip().lower()
+            sapi_by_base = {}
+            for (eng, key), lbl in all_voices_map.items():
+                if eng == "sapi":
+                    sapi_by_base.setdefault(_sapi_base(key), (key, lbl))
+
+            # Preserve saved order; keep voices even if not currently enumerable (e.g. SAPI broken)
+            selected = []
+            used_keys = set()
+            for engine, key, saved_num in saved_ordered:
+                if (engine, key) in all_voices_map:
+                    label = all_voices_map[(engine, key)]
+                    selected.append((label, engine, key))
+                    used_keys.add((engine, key))
+                elif engine == "sapi":
+                    # Fuzzy match: find a current SAPI voice with the same base name
+                    base = _sapi_base(key)
+                    match = sapi_by_base.get(base)
+                    if not match:
+                        for cur_base, cur_val in sapi_by_base.items():
+                            if base in cur_base or cur_base in base:
+                                match = cur_val
+                                break
+                    if match:
+                        matched_key, matched_label = match
+                        selected.append((matched_label, engine, matched_key))
+                        used_keys.add((engine, matched_key))
+                    else:
+                        selected.append((f"[SAPI] {key}", engine, key))
+                        used_keys.add((engine, key))
+                        if saved_num is not None:
+                            self._fallback_voice_numbers[(engine, key)] = saved_num
+                else:
+                    selected.append((f"[{engine.upper()}] {key}", engine, key))
+                    used_keys.add((engine, key))
+                    if saved_num is not None:
+                        self._fallback_voice_numbers[(engine, key)] = saved_num
+            available = [(l, e, k) for l, e, k in all_voices if (e, k) not in used_keys]
+
+            # Always keep the Selected list in numbered order, regardless of the order
+            # it happened to be saved in.
+            _nums, _fallback = self._voice_numbers, self._fallback_voice_numbers
+            _orig_order = [(e, k) for _l, e, k in selected]
+            selected.sort(key=lambda x: _nums.get((x[1], x[2]), _fallback.get((x[1], x[2]), float('inf'))))
+            _reordered = [(e, k) for _l, e, k in selected] != _orig_order
         else:
-            selected  = [(l, e, k) for l, e, k in all_voices if e == "sapi"]
-            available = [(l, e, k) for l, e, k in all_voices if e != "sapi"]
+            selected   = [(l, e, k) for l, e, k in all_voices if e == "sapi"]
+            available  = [(l, e, k) for l, e, k in all_voices if e != "sapi"]
+            _reordered = False
 
         self._voices_available_data = available
         self._all_voices_list.delete(0, tk.END)
         for label, eng, key in available:
-            num  = self._voice_numbers.get((eng, key), 0)
+            num  = self._voice_numbers.get((eng, key), "?")
             bold = eng in self._CUSTOM_ENGINES
             self._all_voices_list.insert(tk.END, f"{num}.  {label}", bold=bold)
 
         self._selected_voices_data = selected
         self._rebuild_selected_list()
+        if _reordered:
+            self._voices_save()
 
     def _voices_add(self):
         sel = self._all_voices_list.curselection()
@@ -591,6 +718,12 @@ class AIVoiceDownloadWindow:
             entry = self._voices_available_data.pop(idx)
             self._all_voices_list.delete(idx)
             self._selected_voices_data.append(entry)
+        # Keep the Selected list in numbered order rather than insertion order
+        nums = getattr(self, '_voice_numbers', {})
+        fallback_nums = getattr(self, '_fallback_voice_numbers', {})
+        self._selected_voices_data.sort(
+            key=lambda x: nums.get((x[1], x[2]), fallback_nums.get((x[1], x[2]), float('inf')))
+        )
         self._rebuild_selected_list()
         self._voices_save()
         try:
@@ -608,10 +741,10 @@ class AIVoiceDownloadWindow:
         self._rebuild_selected_list()
         # Re-sort available list by original voice number so order stays consistent
         nums = getattr(self, '_voice_numbers', {})
-        self._voices_available_data.sort(key=lambda x: nums.get((x[1], x[2]), 0))
+        self._voices_available_data.sort(key=lambda x: nums.get((x[1], x[2]), float('inf')))
         self._all_voices_list.delete(0, tk.END)
         for lbl, eng, key in self._voices_available_data:
-            num  = nums.get((eng, key), 0)
+            num  = nums.get((eng, key), "?")
             bold = eng in self._CUSTOM_ENGINES
             self._all_voices_list.insert(tk.END, f"{num}.  {lbl}", bold=bold)
         self._voices_save()
@@ -777,6 +910,30 @@ class AIVoiceDownloadWindow:
                 self._voices_selected_name_label.config(text="Selected Voice: —")
         finally:
             self._selection_updating = False
+
+    def _voices_on_selected_click(self, event):
+        """If the user clicks a SAPI voice that couldn't be located (greyed out, marked '(?)'),
+        explain why and that re-installing the voice in Windows often fixes it."""
+        try:
+            iid = self._selected_voices_list.identify_row(event.y)
+            if not iid:
+                return
+            idx = self._selected_voices_list.index_of_iid(iid)
+            if idx is None or idx >= len(self._selected_voices_data):
+                return
+            label, eng, key = self._selected_voices_data[idx]
+            fallback_nums = getattr(self, '_fallback_voice_numbers', {})
+            if (eng, key) not in fallback_nums:
+                return
+            messagebox.showinfo(
+                "Voice Unavailable",
+                f"The voice \"{label}\" can't be found.\n\n"
+                "Its installation files may have been moved or deleted. Reinstalling this "
+                "SAPI online voice (Settings → Time & language → Speech → Manage voices — "
+                "remove it, then add it again) should fix this.\n\n"
+                "It's kept in this list, greyed out, so your selection isn't lost.")
+        except Exception:
+            pass
 
     # ── animation helpers ─────────────────────────────────────────────
 
@@ -1578,18 +1735,14 @@ class AIVoiceDownloadWindow:
         self._sapi_voices_list.config(yscrollcommand=sb_sv.set)
         self._sapi_voices_list.bind("<<ListboxSelect>>", self._on_sapi_voice_select)
 
+        # Reuse the same enumeration as the Available Voices list — it falls back to
+        # winreg when SAPI.GetVoices() is broken (e.g. blocked by NVDA, or corrupted by
+        # Windows' "Online (Natural)" voices), so this list stays populated either way.
         self._sapi_voice_names = []
-        try:
-            import win32com.client as _wc
-            for v in _wc.Dispatch("SAPI.SpVoice").GetVoices():
-                try:
-                    name = v.GetDescription()
-                    self._sapi_voice_names.append(name)
-                    self._sapi_voices_list.insert(tk.END, name)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        for label, engine, key in self._enumerate_all_voices():
+            if engine == "sapi":
+                self._sapi_voice_names.append(key)
+                self._sapi_voices_list.insert(tk.END, key)
 
         # CENTER: Parameters + Preview text stacked vertically
         center = tk.Frame(main_row)
