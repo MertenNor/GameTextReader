@@ -4,7 +4,7 @@
 Link to Video: https://www.youtube.com/watch?v=GvmhcmowcS8
 
 ## 💾 Download:
-Click Releases on the right side of the page (GameTextReader 0.9.2), scroll down to Assets at the bottom, and click do downlad the GameTextReader.exe file.
+Click Releases on the right side of the page (GameTextReader 0.9.x), scroll down to Assets at the bottom, and click do downlad the GameTextReader.exe file.
 
 ## 🎮 About
 As a person with dyslexia, I wanted a program to read text in video games aloud. However, I could never find a solution that was easy to work with, so I made this program with coding help from AI. I know it's not the best code, but in the end, I got the program to the state I envisioned, and I'm now using it in different games to help me 'read' long dialogues. I'm uploading it here so other people can use it as well.
@@ -25,9 +25,7 @@ As a person with dyslexia, I wanted a program to read text in video games aloud.
 - Note! When the program opens for the first time, it will guide you through how to install this.
 
 ## 🗣️ Adding More High-Quality Voices
-For access to more natural-sounding voices, including online voices:
-
-Download and install [NaturalVoiceSAPIAdapter](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter) by gexgd0419
+Use the built-in Voice Manager to add different AI Voices.
 
 > 💡 Note: Online voices may take a moment to load when first activated.
 
