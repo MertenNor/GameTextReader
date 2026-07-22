@@ -13,6 +13,8 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 
 from .constants import APP_NAME, APP_VERSION, GITHUB_REPO, UPDATE_SERVER_URL, SHOW_UPDATE_POPUP_FOR_TESTING
+from .screen_capture import get_dpi_scale
+from .window_geometry import apply_window_geometry
 
 
 def version_tuple(v):
@@ -28,8 +30,9 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
     """
     popup = tk.Toplevel(root)
     popup.title("News Update" if is_news_update else "Update Available")
-    popup.geometry("750x500")  # Set initial size
-    popup.minsize(400, 150)    # Set minimum size
+    apply_window_geometry(popup, 'update_popup', 750, 500)
+    _dpi_scale = get_dpi_scale()
+    popup.minsize(int(400 * _dpi_scale), int(150 * _dpi_scale))
     
     # Set the window icon
     try:
@@ -440,14 +443,6 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
     # Only show download button if it's a version update (not just news)
     if not is_news_update:
         ttk.Button(button_frame, text="Go to download page", command=open_github).pack(side='right', padx=5)
-    
-    # Center the popup on screen
-    popup.update_idletasks()
-    width = popup.winfo_width()
-    height = popup.winfo_height()
-    x = (popup.winfo_screenwidth() // 2) - (width // 2)
-    y = (popup.winfo_screenheight() // 2) - (height // 2)
-    popup.geometry(f'{width}x{height}+{x}+{y}')
     
     # Make popup modal
     popup.transient(root)

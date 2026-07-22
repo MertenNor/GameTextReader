@@ -5,6 +5,7 @@ import os
 import argostranslate.settings
 from ..constants import APP_SETTINGS_PATH
 from ..translation.translation_manager import TranslationManager
+from ..window_geometry import apply_window_geometry
 
 class PerformanceSettingsWindow:
     def __init__(self, game_reader):
@@ -12,9 +13,9 @@ class PerformanceSettingsWindow:
         self.window = tk.Toplevel(game_reader.root)
         self.window.withdraw()
         self.window.title("Argos-Translate Performance Settings")
-        self.window.geometry("450x550")
         self.window.resizable(False, False)
-        
+        apply_window_geometry(self.window, 'performance_settings', 450, 550)
+
         # Register as hotkey disabling window
         if hasattr(self.game_reader, 'register_hotkey_disabling_window'):
             self.game_reader.register_hotkey_disabling_window("Performance Settings", self.window)
@@ -28,15 +29,7 @@ class PerformanceSettingsWindow:
                 self.window.iconbitmap(icon_path)
         except Exception as e:
             pass
-            
-        # Center the window
-        self.window.update_idletasks()
-        width = self.window.winfo_width()
-        height = self.window.winfo_height()
-        x = (self.window.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.window.winfo_screenheight() // 2) - (height // 2)
-        self.window.geometry('{}x{}+{}+{}'.format(width, height, x, y))
-        
+
         # Load current settings
         self.current_settings = self.load_settings()
         

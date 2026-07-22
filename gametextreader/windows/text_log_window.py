@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from ..utils import _ensure_uwp_available
+from ..window_geometry import apply_window_geometry
 
 
 class TextLogWindow:
@@ -18,12 +19,12 @@ class TextLogWindow:
         self.window = tk.Toplevel(root)
         self.window.withdraw()
         self.window.title("Scan History")
-        self.window.geometry("700x300")
         self.window.resizable(True, True)
-        
+        apply_window_geometry(self.window, 'scan_history', 700, 300)
+
         # Register this window as one that disables hotkeys
         self.game_text_reader.register_hotkey_disabling_window("Scan History", self.window)
-        
+
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -31,12 +32,6 @@ class TextLogWindow:
                 self.window.iconbitmap(icon_path)
         except Exception as e:
             pass
-        
-        # Center the window
-        self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() // 2) - (700 // 2)
-        y = (self.window.winfo_screenheight() // 2) - (300 // 2)
-        self.window.geometry(f"700x300+{x}+{y}")
         
         # Create main frame
         main_frame = tk.Frame(self.window)

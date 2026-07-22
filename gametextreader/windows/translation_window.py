@@ -5,6 +5,7 @@ import threading
 import os
 import webbrowser
 from ..translation.translation_manager import TranslationManager
+from ..window_geometry import apply_window_geometry
 
 class TranslationWindow:
     def __init__(self, parent):
@@ -12,17 +13,9 @@ class TranslationWindow:
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
         self.window.title("Language Manager")
-        self.window.geometry("700x500")
         self.window.resizable(False, False)
-        
-        # Center the window
-        self.window.update_idletasks()
-        width = self.window.winfo_width()
-        height = self.window.winfo_height()
-        x = (self.window.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.window.winfo_screenheight() // 2) - (height // 2)
-        self.window.geometry('{}x{}+{}+{}'.format(width, height, x, y))
-        
+        apply_window_geometry(self.window, 'language_manager', 700, 500)
+
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')

@@ -10,6 +10,7 @@ from PIL import Image, ImageTk, ImageStat
 import pytesseract
 
 from ..screen_capture import capture_screen_area
+from ..window_geometry import apply_window_geometry
 
 # Try to import numpy for better image comparison (optional)
 try:
@@ -84,9 +85,9 @@ class AutomationsWindow:
         self.window = tk.Toplevel(self.root)
         self.window.withdraw()
         self.window.title("Automations")
-        self.window.geometry("800x600")
         self.window.resizable(True, True)
-        
+        apply_window_geometry(self.window, 'automations', 840, 600)
+
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -94,12 +95,6 @@ class AutomationsWindow:
                 self.window.iconbitmap(icon_path)
         except Exception as e:
             pass
-        
-        # Center the window
-        self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() // 2) - (840 // 2)
-        y = (self.window.winfo_screenheight() // 2) - (600 // 2)
-        self.window.geometry(f"840x600+{x}+{y}")
         
         # Store automation rules
         self.automations = []  # List of automation dictionaries
@@ -1170,21 +1165,16 @@ class AutomationsWindow:
             print(f"[ERROR] Automations: {e}")
             return
         selection_window.title("Select Automation(s)")
-        # Make window taller to accommodate multiple checkboxes
-        selection_window.geometry("300x300")
         selection_window.transient(window_instance.window)
         selection_window.grab_set()
-        
+
+        # Make window taller to accommodate multiple checkboxes
+        apply_window_geometry(selection_window, 'automations_select_dialog', 300, 300, parent=window_instance.window)
+
         # Ensure dialog appears on top
         selection_window.lift()
         selection_window.focus_force()
         selection_window.attributes("-topmost", True)
-        
-        # Center the dialog
-        selection_window.update_idletasks()
-        x = window_instance.window.winfo_x() + (window_instance.window.winfo_width() // 2) - 150
-        y = window_instance.window.winfo_y() + (window_instance.window.winfo_height() // 2) - 150
-        selection_window.geometry(f"300x300+{x}+{y}")
         
         # Remove topmost after positioning (so it doesn't stay on top forever)
         selection_window.after(100, lambda: selection_window.attributes("-topmost", False))

@@ -135,6 +135,7 @@ from ..utils import (
     is_special_character, suggest_alternative_key, InputManager
 )
 from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale
+from ..window_geometry import apply_window_geometry
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
 from .tesseract_manager import TesseractManager
@@ -169,11 +170,11 @@ def show_thinkr_warning(game_reader, area_name):
     win = tk.Toplevel(game_reader.root)
     win.withdraw()
     win.title("Hotkey Conflict Detected!")
-    win.geometry("370x170")
     win.resizable(False, False)
     win.grab_set()
     win.transient(game_reader.root)
-    
+    apply_window_geometry(win, 'hotkey_conflict_single', 370, 170, parent=game_reader.root)
+
     # Set the window icon
     try:
         icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -181,12 +182,6 @@ def show_thinkr_warning(game_reader, area_name):
             win.iconbitmap(icon_path)
     except Exception as e:
         pass
-
-    # Center the dialog
-    win.update_idletasks()
-    x = game_reader.root.winfo_rootx() + game_reader.root.winfo_width() // 2 - 185
-    y = game_reader.root.winfo_rooty() + game_reader.root.winfo_height() // 2 - 85
-    win.geometry(f"370x170+{x}+{y}")
 
     # Remove the warning icon (if any)
     for child in win.winfo_children():
@@ -245,11 +240,11 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
     win = tk.Toplevel(game_reader.root)
     win.withdraw()
     win.title("Hotkey Conflict Detected!")
-    win.geometry("400x200")
     win.resizable(False, False)
     win.grab_set()
     win.transient(game_reader.root)
-    
+    apply_window_geometry(win, 'hotkey_conflict_combo', 400, 200, parent=game_reader.root)
+
     # Set the window icon
     try:
         icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -257,12 +252,6 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
             win.iconbitmap(icon_path)
     except Exception as e:
         pass
-
-    # Center the dialog
-    win.update_idletasks()
-    x = game_reader.root.winfo_rootx() + game_reader.root.winfo_width() // 2 - 200
-    y = game_reader.root.winfo_rooty() + game_reader.root.winfo_height() // 2 - 100
-    win.geometry(f"400x200+{x}+{y}")
 
     # Build the message
     locations_text = "\n".join(conflict_locations)
@@ -561,6 +550,10 @@ class GameTextReader:
         self.standalone_numbers_var = tk.BooleanVar(value=False)
         # Add variable for character normalization (bundles all common mappings including | to i)
         self.char_normalization_var = tk.BooleanVar(value=True)
+        # Add variable for whether opening secondary windows (Voice Manager, Text
+        # Replacement editor, etc.) disables hotkeys - on by default since it
+        # prevents scan hotkeys from firing while typing into those windows.
+        self.disable_hotkeys_on_window_var = tk.BooleanVar(value=True)
 
         # Translation variables
         self.translation_enabled_var = tk.BooleanVar(value=False)
@@ -3818,6 +3811,9 @@ class GameTextReader:
                 if 'master_hotkey_banner_enabled' in settings and hasattr(self, 'master_hotkey_banner_var'):
                     self.master_hotkey_banner_var.set(settings['master_hotkey_banner_enabled'])
 
+                if 'disable_hotkeys_on_window_open' in settings and hasattr(self, 'disable_hotkeys_on_window_var'):
+                    self.disable_hotkeys_on_window_var.set(settings['disable_hotkeys_on_window_open'])
+
                 # Load Kokoro CPU thread setting
                 saved_kokoro_threads = settings.get('kokoro_num_threads')
                 if saved_kokoro_threads is not None and hasattr(self, 'kokoro_num_threads_var'):
@@ -4004,6 +4000,9 @@ class GameTextReader:
                 
             if hasattr(self, 'master_hotkey_banner_var'):
                 settings['master_hotkey_banner_enabled'] = self.master_hotkey_banner_var.get()
+
+            if hasattr(self, 'disable_hotkeys_on_window_var'):
+                settings['disable_hotkeys_on_window_open'] = self.disable_hotkeys_on_window_var.get()
                 
             # Update Translation settings
             if hasattr(self, 'translation_enabled_var'):
@@ -4461,6 +4460,8 @@ class GameTextReader:
         # Auto-save settings on change
         self.master_hotkey_sound_var.trace('w', lambda *args: self.save_global_settings())
         self.master_hotkey_banner_var.trace('w', lambda *args: self.save_global_settings())
+        self.disable_hotkeys_on_window_var.trace('w', lambda *args: self.save_global_settings())
+        self.disable_hotkeys_on_window_var.trace('w', self._on_disable_hotkeys_on_window_setting_changed)
         
         options_frame = tk.Frame(buttons_frame)
         options_frame.pack(side='left', padx=2)
@@ -5014,8 +5015,8 @@ class GameTextReader:
         options_window = tk.Toplevel(self.root)
         options_window.withdraw()
         options_window.title("Additional Options")
-        options_window.geometry("1165x700")
         options_window.resizable(True, True)
+        apply_window_geometry(options_window, 'options', 1165, 700)
         
         # Store reference to the window
         self.additional_options_window = options_window
@@ -5353,6 +5354,20 @@ class GameTextReader:
                  text="Replace specific words or abbreviations before reading. Use Edit to configure.",
                  font=("Helvetica", 8), fg="#555555", wraplength=460, justify="left").pack(anchor='w', pady=(2, 0))
 
+        # Hotkey Behavior section (left column, below Text Replacement)
+        ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=(12, 8))
+
+        hotkey_behavior_frame = tk.Frame(left_col)
+        hotkey_behavior_frame.pack(fill='x')
+
+        tk.Checkbutton(hotkey_behavior_frame, variable=self.disable_hotkeys_on_window_var,
+                       text="Disable hotkeys while a settings window is open", font=("Helvetica", 10)).pack(anchor='w')
+        tk.Label(hotkey_behavior_frame,
+                 text="Applies to windows like Voice Manager, Text Replacement, and Image Processing. "
+                      "Turn off if you want scan/read hotkeys to keep working while those are open - "
+                      "note this can let a hotkey fire while you're typing into one of those windows.",
+                 font=("Helvetica", 8), fg="#555555", wraplength=460, justify="left").pack(anchor='w', pady=(2, 0))
+
         # Save button at bottom of left column
         tk.Button(left_col, text="Save & Close", command=lambda: on_close(),
                   width=15).pack(side='bottom', pady=(10, 0))
@@ -5650,7 +5665,7 @@ class GameTextReader:
                 self.root.after(200, lambda: credits_window.attributes("-topmost", False) if credits_window.winfo_exists() else None)
         
         self.root.after(100, set_window_props)
-        credits_window.geometry("600x700")
+        apply_window_geometry(credits_window, 'credits', 600, 700, center=False)
         credits_window.resizable(False, False)
         
         # Set icon
@@ -5743,7 +5758,7 @@ class GameTextReader:
         info_window = tk.Toplevel(self.root)
         self.info_window_ref = info_window  # Store reference for Credits window to use
         info_window.title(f"{APP_NAME} - Information")
-        info_window.geometry("810x650")  # Slightly taller for better spacing
+        apply_window_geometry(info_window, 'info', 810, 650)
 
         # --- Set flag to prevent hotkeys from interfering with info window ---
         self.info_window_open = True
@@ -6673,17 +6688,7 @@ class GameTextReader:
         # Add bottom frame for close button with padding
         bottom_frame = ttk.Frame(main_frame)
         bottom_frame.pack(fill='x', pady=(20, 0))
-        
 
-        
-        # Center window on screen
-        info_window.update_idletasks()
-        width = info_window.winfo_width()
-        height = info_window.winfo_height()
-        x = (info_window.winfo_screenwidth() // 2) - (width // 2)
-        y = (info_window.winfo_screenheight() // 2) - (height // 2)
-        info_window.geometry(f'{width}x{height}+{x}+{y}')
-        
         # Make window transient to root so it stays on top
         info_window.transient(self.root)
         # info_window.grab_set() - Removed to allow interacting with other windows (like Credits)
@@ -6693,7 +6698,7 @@ class GameTextReader:
         how_to_use_window = tk.Toplevel(self.root)
         how_to_use_window.withdraw()
         how_to_use_window.title(f"{APP_NAME} - How to Use")
-        how_to_use_window.geometry("900x700")
+        apply_window_geometry(how_to_use_window, 'how_to_use', 900, 700)
         
         # Set window icon if available
         try:
@@ -6936,14 +6941,7 @@ class GameTextReader:
         
         # Bind Escape key to close
         how_to_use_window.bind('<Escape>', lambda e: how_to_use_window.destroy())
-        
-        # Center window on screen
-        how_to_use_window.update_idletasks()
-        width = how_to_use_window.winfo_width()
-        height = how_to_use_window.winfo_height()
-        x = (how_to_use_window.winfo_screenwidth() // 2) - (width // 2)
-        y = (how_to_use_window.winfo_screenheight() // 2) - (height // 2)
-        how_to_use_window.geometry(f'{width}x{height}+{x}+{y}')
+
         how_to_use_window.deiconify()
 
         # Make window modal
@@ -12550,18 +12548,14 @@ class GameTextReader:
         dialog = tk.Toplevel(self.root)
         dialog.withdraw()
         dialog.title("Area Name")
-        dialog.geometry("250x120")
         dialog.resizable(False, False)
 
         # Make dialog stay on top of main window
         dialog.transient(self.root)
         dialog.grab_set()  # Make it modal
 
-        # Center the dialog on the main window
-        dialog.geometry("+%d+%d" % (
-            self.root.winfo_rootx() + self.root.winfo_width()//2 - 150,
-            self.root.winfo_rooty() + self.root.winfo_height()//2 - 60))
-        
+        apply_window_geometry(dialog, 'area_name_dialog', 250, 120, parent=self.root)
+
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -12651,22 +12645,16 @@ class GameTextReader:
         dialog = tk.Toplevel(self.root)
         dialog.withdraw()
         dialog.title("Edit Area Name")
-        dialog.geometry("80x100")  # Set window size here (width x height) - CHANGE THIS TO ADJUST SIZE
         dialog.resizable(True, True)  # Allow resizing if desired
-        dialog.minsize(150, 120)  # Set minimum size
 
         # Make dialog stay on top of main window
         dialog.transient(self.root)
         dialog.grab_set()  # Make it modal
 
-        # Center the dialog on the main window
-        dialog.update_idletasks()
-        width = dialog.winfo_width()
-        height = dialog.winfo_height()
-        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-        y = (dialog.winfo_screenheight() // 2) - (height // 2)
-        dialog.geometry(f'{width}x{height}+{x}+{y}')
-        
+        apply_window_geometry(dialog, 'edit_area_name_dialog', 150, 120, parent=self.root)
+        _dpi_scale = get_dpi_scale()
+        dialog.minsize(int(150 * _dpi_scale), int(120 * _dpi_scale))
+
         # Set the window icon
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -15632,7 +15620,7 @@ class GameTextReader:
         temp_path = APP_DOCUMENTS_DIR
         os.makedirs(temp_path, exist_ok=True)
         
-        file_path = os.path.join(temp_path, 'game_units.json')
+        file_path = os.path.join(temp_path, 'gamer_units.json')
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 header = '''//  Text Replacement Configuration
@@ -19020,7 +19008,7 @@ class GameTextReader:
             if not isinstance(self.game_units, dict):
                 print("[WARNING] Game Units: Invalid file or skipping.")
             else:
-                # Load case-sensitive settings
+                # Load case-sensitive and regex settings
                 import json as _json, os as _os
                 _cs_path = _os.path.join(APP_DOCUMENTS_DIR, 'gamer_units_case_sensitive.json')
                 case_sensitive_settings = {}
@@ -19031,72 +19019,37 @@ class GameTextReader:
                 except Exception:
                     pass
 
-                # Split user units into case-sensitive and case-insensitive groups
+                _regex_path = _os.path.join(APP_DOCUMENTS_DIR, 'gamer_units_regex.json')
+                regex_settings = {}
+                try:
+                    if _os.path.exists(_regex_path):
+                        with open(_regex_path, 'r', encoding='utf-8') as _f:
+                            regex_settings = _json.load(_f)
+                except Exception:
+                    pass
+
+                # Split user units into regex, case-sensitive, and case-insensitive groups
                 cs_map = {}  # exact-case matching (original key casing)
                 ci_map = {}  # case-insensitive matching (lowercase keys)
+                regex_entries = []  # [(pattern_str, replacement), ...] applied individually
                 for k, v in self.game_units.items():
-                    if case_sensitive_settings.get(k, False):
+                    if regex_settings.get(k, False):
+                        regex_entries.append((k, v, case_sensitive_settings.get(k, False)))
+                    elif case_sensitive_settings.get(k, False):
                         cs_map[k] = v
                     else:
                         ci_map[k.lower()] = v
 
-                # Add default mappings for common game units (case-insensitive only)
-                default_mappings = {
-                    'xp': 'Experience Points',
-                    'hp': 'Health Points',
-                    'mp': 'Mana Points',
-                    'gp': 'Gold Pieces',
-                    'pp': 'Platinum Pieces',
-                    'sp': 'Skill Points',
-                    'ep': 'Energy Points',
-                    'ap': 'Action Points',
-                    'bp': 'Battle Points',
-                    'lp': 'Loyalty Points',
-                    'cp': 'Challenge Points',
-                    'vp': 'Victory Points',
-                    'rp': 'Reputation Points',
-                    'tp': 'Talent Points',
-                    'ar': 'Armor Rating',
-                    'dmg': 'Damage',
-                    'dps': 'Damage Per Second',
-                    'def': 'Defense',
-                    'mat': 'Materials',
-                    'exp': 'Exploration Points',
-                    '§': 'Simoliance',
-                    'v-bucks': 'Virtual Bucks',
-                    'r$': 'Robux',
-                    'nmt': 'Nook Miles Tickets',
-                    'be': 'Blue Essence',
-                    'radianite': 'Radianite Points',
-                    'ow coins': 'Overwatch Coins',
-                    '₽': 'PokeDollars',
-                    '€$': 'Eurodollars',
-                    'z': 'Zenny',
-                    'l': 'Lunas',
-                    'e': 'Eve',
-                    'i': 'Isk',
-                    'j': 'Jewel',
-                    'sc': 'Star Coins',
-                    'o2': 'Oxygen',
-                    'pu': 'Power Units',
-                    'mc': 'Mana Crystals',
-                    'es': 'Essence',
-                    'sh': 'Shards',
-                    'st': 'Stars',
-                    'mu': 'Munny',
-                    'b': 'Bolts',
-                    'r': 'Rings',
-                    'ca': 'Caps',
-                    'rns': 'Runes',
-                    'sl': 'Souls',
-                    'fav': 'Favor',
-                    'am': 'Amber',
-                    'cc': 'Crystal Cores',
-                    'fg': 'Fragments'
-                }
-                for key, value in default_mappings.items():
-                    if key not in ci_map:
-                        ci_map[key] = value
+                # Apply regex entries first (most specific/powerful) - each pattern is
+                # matched against the raw OCR text and substituted independently, so
+                # capture-group backreferences (\1, \2, ...) in the replacement work
+                # as in any normal re.sub() call.
+                for pattern_str, replacement, is_case_sensitive in regex_entries:
+                    try:
+                        flags = 0 if is_case_sensitive else re.IGNORECASE
+                        text = re.sub(pattern_str, replacement, text, flags=flags)
+                    except re.error as e:
+                        print(f"[WARNING] Game Units: Skipping invalid regex '{pattern_str}': {e}")
 
                 # Apply case-sensitive replacements first (exact casing required)
                 if cs_map:
@@ -19963,8 +19916,25 @@ class GameTextReader:
                 print(f"Error reinitializing speaker: {e2}")
                 self.is_speaking = False
 
+    def _on_disable_hotkeys_on_window_setting_changed(self, *args):
+        "If the user unchecks this while a window is already blocking hotkeys, restore them immediately rather than waiting for that window to close."
+        if not self.disable_hotkeys_on_window_var.get() and self.hotkey_disabling_windows:
+            self.hotkey_disabling_windows.clear()
+            self.restore_all_hotkeys()
+            self.hotkey_warning_count = 0
+            if hasattr(self, 'status_label'):
+                if hasattr(self, 'master_hotkeys_enabled') and not self.master_hotkeys_enabled:
+                    self.status_label.config(text="HOTKEYS DISABLED", fg="red", font=("Helvetica", 10, "bold"))
+                else:
+                    self.status_label.config(text="")
+
     def register_hotkey_disabling_window(self, window_name, window_ref):
         "Register a window that disables hotkeys when opened."
+        # User opted out (Additional Options) - leave hotkeys live and skip
+        # tracking entirely, so the status label / warning dialog / etc. all
+        # naturally behave as if no window is blocking hotkeys.
+        if hasattr(self, 'disable_hotkeys_on_window_var') and not self.disable_hotkeys_on_window_var.get():
+            return
         self.hotkey_disabling_windows[window_name] = window_ref
         # If this is the first window, disable hotkeys and show notification
         if len(self.hotkey_disabling_windows) == 1:

@@ -9,6 +9,7 @@ from tkinter import font as tkfont
 import time
 
 from ..image_processing import preprocess_image, apply_color_mask
+from ..window_geometry import apply_window_geometry
 
 
 class ImageProcessingWindow:
@@ -243,68 +244,59 @@ class ImageProcessingWindow:
         self.window.deiconify()
 
     def create_scrollable_frame(self):
-        """Create a layout with fixed image area and scrollable settings section"""
-        # Main container
-        main_container = ttk.Frame(self.window)
-        main_container.pack(side='left', fill='both', expand=True, padx=10, pady=10)
-        
-        # Fixed image section at the top
-        self.image_section = ttk.Frame(main_container)
-        self.image_section.pack(fill='x', pady=(0, 10))
-        
-        # Scrollable settings section at the bottom
-        self.create_scrollable_settings(main_container)
-        
-        # Set initial window size
-        self.window.geometry("910x600")
-        
-    def create_scrollable_settings(self, parent):
-        """Create a scrollable frame for settings sliders and color mask"""
-        # Create frame for scrollable settings
-        settings_container = ttk.LabelFrame(parent, text="Image Processing Settings")
-        settings_container.pack(fill='both', expand=True)
-        
-        # Create canvas with scrollbars for settings
-        self.settings_canvas = tk.Canvas(settings_container, highlightthickness=0)
-        self.settings_canvas.pack(side='left', fill='both', expand=True)
-        
-        # Create vertical scrollbar for settings
-        v_scrollbar = ttk.Scrollbar(settings_container, orient='vertical', command=self.settings_canvas.yview)
-        v_scrollbar.pack(side='right', fill='y')
-        
-        # Configure canvas to use scrollbar
-        self.settings_canvas.configure(yscrollcommand=v_scrollbar.set)
-        
-        # Create scrollable frame inside canvas
-        self.scrollable_frame = ttk.Frame(self.settings_canvas)
-        self.settings_canvas_window = self.settings_canvas.create_window((0, 0), window=self.scrollable_frame, anchor='nw')
-        
-        # Bind events to update scrollregion when frame changes size
-        self.scrollable_frame.bind('<Configure>', self.on_settings_frame_configure)
-        self.settings_canvas.bind('<Configure>', self.on_settings_canvas_configure)
-        
-        # Enable mouse wheel scrolling for settings - bind to entire window and scrollable frame
+        """Create a single scrollable window: image section on top, settings below.
+        Everything scrolls together so the settings are always reachable even when
+        the captured area (and therefore the image preview) is very tall."""
+        # Size the window (DPI-scaled default, remembers last resize, and is
+        # always clamped to the screen so it can never spawn taller than the
+        # display regardless of how tall the captured area's image is).
+        apply_window_geometry(self.window, 'image_processing', 910, 600, center=False)
+
+        # Outer canvas + scrollbar spans the whole window content
+        self.outer_canvas = tk.Canvas(self.window, highlightthickness=0)
+        self.outer_canvas.pack(side='left', fill='both', expand=True)
+
+        outer_scrollbar = ttk.Scrollbar(self.window, orient='vertical', command=self.outer_canvas.yview)
+        outer_scrollbar.pack(side='right', fill='y')
+        self.outer_canvas.configure(yscrollcommand=outer_scrollbar.set)
+
+        main_container = ttk.Frame(self.outer_canvas)
+        self.outer_canvas_window = self.outer_canvas.create_window((0, 0), window=main_container, anchor='nw')
+
+        main_container.bind('<Configure>', self.on_settings_frame_configure)
+        self.outer_canvas.bind('<Configure>', self.on_settings_canvas_configure)
+
+        # Enable mouse wheel scrolling anywhere in the window
         self.window.bind('<MouseWheel>', self.on_settings_mousewheel)
         self.window.bind('<Button-4>', self.on_settings_mousewheel)  # Linux scroll up
         self.window.bind('<Button-5>', self.on_settings_mousewheel)  # Linux scroll down
-        self.scrollable_frame.bind('<MouseWheel>', self.on_settings_mousewheel)
-        self.scrollable_frame.bind('<Button-4>', self.on_settings_mousewheel)  # Linux scroll up
-        self.scrollable_frame.bind('<Button-5>', self.on_settings_mousewheel)  # Linux scroll down
-        self.settings_canvas.bind('<MouseWheel>', self.on_settings_mousewheel)
-        self.settings_canvas.bind('<Button-4>', self.on_settings_mousewheel)  # Linux scroll up
-        self.settings_canvas.bind('<Button-5>', self.on_settings_mousewheel)  # Linux scroll down
-        
+
+        # Fixed image section at the top
+        self.image_section = ttk.Frame(main_container)
+        self.image_section.pack(fill='x', padx=10, pady=(10, 10))
+
+        # Settings section below (part of the same scrollable content now)
+        self.create_scrollable_settings(main_container)
+
+    def create_scrollable_settings(self, parent):
+        """Create the settings sliders and color mask section (no longer independently
+        scrollable - it scrolls as part of the whole window via the outer canvas)."""
+        settings_container = ttk.LabelFrame(parent, text="Image Processing Settings")
+        settings_container.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+        self.scrollable_frame = ttk.Frame(settings_container)
+        self.scrollable_frame.pack(fill='both', expand=True)
+
     def on_settings_frame_configure(self, event):
-        """Update scrollregion when the settings frame changes size"""
-        self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox('all'))
-        
+        """Update the outer canvas scrollregion when its content changes size"""
+        self.outer_canvas.configure(scrollregion=self.outer_canvas.bbox('all'))
+
     def on_settings_canvas_configure(self, event):
-        """Update frame width when settings canvas changes size"""
-        canvas_width = event.width
-        self.settings_canvas.itemconfig(self.settings_canvas_window, width=canvas_width)
-        
+        """Keep the inner content frame the same width as the outer canvas"""
+        self.outer_canvas.itemconfig(self.outer_canvas_window, width=event.width)
+
     def on_settings_mousewheel(self, event):
-        """Handle mouse wheel scrolling in settings area"""
+        """Handle mouse wheel scrolling for the whole window"""
         # Get the current scroll position
         if event.delta:  # Windows
             delta = -1 * (event.delta // 120)
@@ -314,10 +306,10 @@ class ImageProcessingWindow:
             delta = 1
         else:
             delta = 0
-            
+
         # Scroll vertically
-        self.settings_canvas.yview_scroll(delta, 'units')
-        
+        self.outer_canvas.yview_scroll(delta, 'units')
+
 
     def has_settings_changed(self):
         """Check if any settings have changed from initial values"""
@@ -659,9 +651,9 @@ class ImageProcessingWindow:
             # Create a new window for color picking
             picker_window = tk.Toplevel(self.window)
             picker_window.title("Pick Color from Image")
-            picker_window.geometry("600x500")
             picker_window.resizable(True, True)
-            
+            apply_window_geometry(picker_window, 'color_picker', 600, 500)
+
             # Set the window icon
             try:
                 icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -669,13 +661,7 @@ class ImageProcessingWindow:
                     picker_window.iconbitmap(icon_path)
             except Exception as e:
                 pass
-            
-            # Center the window
-            picker_window.update_idletasks()
-            x = (picker_window.winfo_screenwidth() // 2) - (600 // 2)
-            y = (picker_window.winfo_screenheight() // 2) - (500 // 2)
-            picker_window.geometry(f"600x500+{x}+{y}")
-            
+
             # Add instruction label
             instruction_label = tk.Label(
                 picker_window, 

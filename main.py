@@ -684,7 +684,27 @@ def main():
             root = tk.Tk()
     else:
         root = tk.Tk()
-    
+
+    # Tell Tk itself the real display scale. SetProcessDpiAwareness() above only
+    # stops Windows from bitmap-stretching the app - Tk still assumes 96 DPI
+    # (tk scaling 1.333) internally unless told otherwise, so every font-derived
+    # measurement (labels, checkbox/radio indicators, ttk row heights, etc.)
+    # renders at 100%-scaling size no matter how high the actual Windows display
+    # scaling is set. This is what made things like checkboxes look tiny/unusable
+    # at high scaling (e.g. 300% on a 4K display).
+    _dpi_scale_log_msg = None
+    try:
+        from gametextreader.screen_capture import get_dpi_scale
+        _dpi_scale = get_dpi_scale()
+        _tk_scaling = _dpi_scale * 96.0 / 72.0
+        root.tk.call('tk', 'scaling', _tk_scaling)
+        # Deferred: printed after setup_logging() below so it lands in debug_log.txt
+        # (this runs before stdout is Tee'd to the log file, so printing here would
+        # only be visible with a console attached, which the packaged exe doesn't have).
+        _dpi_scale_log_msg = f"[DPI] Detected display scale: {_dpi_scale:.2f}x (Windows: {int(_dpi_scale * 100)}%) -> tk scaling set to {_tk_scaling:.3f}"
+    except Exception as e:
+        _dpi_scale_log_msg = f"Warning: Could not set Tk DPI scaling: {e}"
+
     # Hide the main window during setup to prevent the "stretching" effect
     root.withdraw()
     
@@ -730,7 +750,9 @@ def main():
     
     # Initialize logging after the loading window is shown
     setup_logging()
-    
+    if _dpi_scale_log_msg:
+        print(_dpi_scale_log_msg)
+
     # Import GameTextReader here to allow loading window to appear first
     # This delays the loading of heavy dependencies (OCR, TTS, etc.) until after UI is shown
     from gametextreader.core.game_text_reader import GameTextReader

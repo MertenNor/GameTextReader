@@ -5,7 +5,7 @@ import os
 
 # App information
 APP_NAME = "GameTextReader"
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.5.1"
 APP_SLUG = APP_NAME.lower().replace(" ", "")
 
 # Determine the Documents directory path reliably on Windows (respecting redirection)
@@ -46,4 +46,12 @@ UPDATE_SERVER_URL = ""
 
 # Testing: Set to True to always show update popup (for testing UI). Set to False for release (only shows when update is actually available)
 SHOW_UPDATE_POPUP_FOR_TESTING = False
+
+# Debug: force get_dpi_scale() to return this value instead of the real Windows
+# display scale, so DPI/high-scaling behavior (window sizing, checkbox/font
+# rendering, etc.) can be tested without changing actual display settings.
+# Set to a number (e.g. 3.0 for 300%) to test; set to False to use the real
+# scale. Only takes effect when running from source - ignored in a compiled
+# build even if accidentally left non-False, so this can't ship enabled.
+DEBUG_FORCE_DPI_SCALE = False
 

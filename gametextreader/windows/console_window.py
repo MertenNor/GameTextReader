@@ -9,6 +9,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
+from ..screen_capture import get_dpi_scale
+from ..window_geometry import apply_window_geometry
+
 # Maximum buffer size to prevent memory issues (10MB)
 MAX_LOG_BUFFER_SIZE = 10 * 1024 * 1024
 
@@ -18,7 +21,7 @@ class ConsoleWindow:
         self.game_reader = game_reader
         self.window = tk.Toplevel(root)
         self.window.title("Debug Window")
-        
+
         # Flag to prevent infinite recursion in update_image_display
         self._updating_image = False
         
@@ -31,7 +34,7 @@ class ConsoleWindow:
             pass
         
         self.latest_images = latest_images
-        self.window.geometry("690x500")  # Initial size, will adjust based on image
+        apply_window_geometry(self.window, 'debug_console', 690, 500, center=False)  # Initial size, will adjust based on image
 
         # Create a top frame for controls
         top_frame = tk.Frame(self.window)
@@ -303,8 +306,14 @@ class ConsoleWindow:
                     self.image_label.config(image=photo_image)
                     self.image_label.image = photo_image  # Keep a reference
 
-                    # Update window size to fit image
-                    self.window.geometry(f"{max(new_width + 50, 690)}x{max(new_height + 150, 500)}")
+                    # Update window size to fit image. The image itself is
+                    # already real screen pixels (unaffected by Tk's DPI
+                    # scaling), but the reserved chrome/padding and floor
+                    # size are UI-derived and need to scale with it.
+                    _scale = get_dpi_scale()
+                    _chrome_w, _chrome_h = int(50 * _scale), int(150 * _scale)
+                    _floor_w, _floor_h = int(690 * _scale), int(500 * _scale)
+                    self.window.geometry(f"{max(new_width + _chrome_w, _floor_w)}x{max(new_height + _chrome_h, _floor_h)}")
                     
                     # Create new photo before deleting old one to prevent AttributeError
                     new_photo = ImageTk.PhotoImage(image)

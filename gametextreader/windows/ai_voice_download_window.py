@@ -4,6 +4,7 @@ import threading
 import webbrowser
 import tkinter as tk
 from tkinter import messagebox, ttk
+from tkinter import font as tkfont
 
 from ..constants import (APP_AI_VOICES_DIR, APP_PIPER_DIR, APP_PIPER_BIN_DIR,
                           APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR,
@@ -12,6 +13,8 @@ from ..constants import (APP_AI_VOICES_DIR, APP_PIPER_DIR, APP_PIPER_BIN_DIR,
 from ..kokoro_catalog import (KOKORO_VOICES, KOKORO_GITHUB_API,
                                KOKORO_MODEL_FILE, KOKORO_VOICES_FILE,
                                load_voices_from_file)
+from ..window_geometry import apply_window_geometry
+from ..screen_capture import get_dpi_scale
 
 PIPER_VOICES_JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json"
 PIPER_HF_BASE        = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
@@ -141,7 +144,11 @@ class _VoiceListbox:
         self._font_bold = (font[0], font[1], "bold")
         style_name = "VoiceList.Treeview"
         s = ttk.Style()
-        s.configure(style_name, font=font, rowheight=18)
+        # Derive rowheight from the actual font metrics rather than a fixed pixel
+        # count - a hardcoded value doesn't scale with Windows display scaling
+        # (e.g. 300%), causing the text to be clipped inside too-short rows.
+        row_height = tkfont.Font(font=font).metrics("linespace") + 6
+        s.configure(style_name, font=font, rowheight=row_height)
         # Remove the outer border so it looks like a plain listbox.
         # The layout element name varies by theme, so guard the call.
         try:
@@ -220,15 +227,9 @@ class AIVoiceDownloadWindow:
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
         self.window.title("Voice Manager")
-        self.window.geometry("1100x710")
         self.window.resizable(True, True)
-
-        self.window.update_idletasks()
-        w, h = self.window.winfo_width(), self.window.winfo_height()
-        x = (self.window.winfo_screenwidth() // 2) - (w // 2)
-        y = (self.window.winfo_screenheight() // 2) - (h // 2)
-        self.window.geometry(f"{w}x{h}+{x}+{y}")
-        self.window.minsize(400, 300)
+        apply_window_geometry(self.window, 'voice_manager', 1100, 710)
+        self.window.minsize(*[int(v * get_dpi_scale()) for v in (400, 300)])
 
         try:
             icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
@@ -266,19 +267,35 @@ class AIVoiceDownloadWindow:
 
     # ---------------------------------------------------------------- UI setup
 
-    def _make_scrollable(self, parent):
-        """Wrap parent in a canvas+scrollbar and return an inner frame to build content into."""
+    def _make_scrollable(self, parent, horizontal=False):
+        """Wrap parent in a canvas+scrollbar(s) and return an inner frame to build content into.
+
+        By default only vertical scrolling is enabled and the inner frame's
+        width is kept locked to the canvas viewport width, so `fill=X`
+        children behave as if they were packed directly into `parent`. Pass
+        horizontal=True for tabs that pack several fixed-width columns
+        side by side and can also overflow sideways - the inner frame then
+        keeps its own natural (unclamped) width and a horizontal scrollbar
+        is added too.
+        """
         canvas = tk.Canvas(parent, highlightthickness=0)
-        sb = tk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        vsb = tk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        if horizontal:
+            hsb = tk.Scrollbar(parent, orient=tk.HORIZONTAL, command=canvas.xview)
+            canvas.configure(xscrollcommand=hsb.set)
+            hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         inner = tk.Frame(canvas)
         win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
 
         inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
+        if not horizontal:
+            canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
 
         def _scroll(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
@@ -391,9 +408,9 @@ class AIVoiceDownloadWindow:
         mid = tk.Frame(body)
         mid.place(relx=0.46, rely=0.0, relwidth=0.10, relheight=1.0)
         tk.Frame(mid).pack(side=tk.TOP, expand=True, fill=tk.BOTH)
-        tk.Button(mid, text="Add →", width=8,
+        tk.Button(mid, text="Add →", width=10,
                   command=self._voices_add).pack(side=tk.TOP, pady=4)
-        tk.Button(mid, text="← Remove", width=8,
+        tk.Button(mid, text="← Remove", width=10,
                   command=self._voices_remove).pack(side=tk.TOP, pady=4)
         tk.Frame(mid).pack(side=tk.TOP, expand=True, fill=tk.BOTH)
 
@@ -438,8 +455,13 @@ class AIVoiceDownloadWindow:
                                           command=self._voices_next_test_text)
         self._voices_next_btn.pack(side=tk.LEFT, padx=(8, 0))
 
-        tk.Label(right_frame, text="Selected Voices (shown in main window voice dropdown):",
-                 anchor="w", font=("Helvetica", 12, "bold")).pack(fill=tk.X)
+        selected_voices_label = tk.Label(right_frame, text="Selected Voices (shown in main window voice dropdown):",
+                 anchor="w", justify="left", font=("Helvetica", 12, "bold"))
+        selected_voices_label.pack(fill=tk.X)
+        # right_frame is placed at a relative width (proportional layout), so
+        # a fixed wraplength would be wrong at other window sizes - keep it
+        # tied to the label's actual current width instead.
+        selected_voices_label.bind('<Configure>', lambda e: selected_voices_label.config(wraplength=e.width))
         self._selected_voices_list = _VoiceListbox(right_frame, font=("Helvetica", 9))
         sb_r = tk.Scrollbar(right_frame, orient=tk.VERTICAL,
                              command=self._selected_voices_list.yview)
@@ -1057,6 +1079,11 @@ class AIVoiceDownloadWindow:
             pass
 
     def _build_piper_tab(self, parent):
+        # Scrollable: this tab stacks a lot of content vertically (lists row,
+        # parameters, generating options) that can run past the bottom of
+        # the window at high DPI scaling, with no other way to reach it.
+        parent = self._make_scrollable(parent)
+
         # ── Top row: Available | arrows | Installed | Custom Voices ──
         lists = tk.Frame(parent)
         lists.pack(fill=tk.X, pady=(0, 6))
@@ -1268,6 +1295,11 @@ class AIVoiceDownloadWindow:
         self._update_piper_list_state()
 
     def _build_kokoro_tab(self, parent):
+        # Scrollable in both directions: this tab packs several fixed-width
+        # columns side by side (voice list, mixer, pitch, custom voices) that
+        # can overflow sideways at high DPI scaling, on top of the usual
+        # risk of overflowing past the bottom of the window.
+        parent = self._make_scrollable(parent, horizontal=True)
         parent = tk.Frame(parent)
         parent.pack(fill=tk.BOTH, expand=True)
 
@@ -1714,7 +1746,13 @@ class AIVoiceDownloadWindow:
     def _build_sapi_tab(self, parent):
         main_row = tk.Frame(parent)
         main_row.pack(fill=tk.BOTH, expand=True)
-        main_row.columnconfigure(0, weight=10)
+        # grid's weight-based distribution only kicks in for space left over
+        # after each column's minimum (content-driven) width is satisfied -
+        # columns 1/2 have several fixed character-width labels/entries that
+        # can end up claiming most of the row at high DPI scaling, squeezing
+        # column 0's voice list down to almost nothing. An explicit minsize
+        # guarantees it stays usable regardless of what the other columns need.
+        main_row.columnconfigure(0, weight=10, minsize=int(220 * get_dpi_scale()))
         main_row.columnconfigure(1, weight=3)
         main_row.columnconfigure(2, weight=2)
         main_row.rowconfigure(0, weight=1)

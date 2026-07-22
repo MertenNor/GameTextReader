@@ -25,6 +25,7 @@ def preprocess_image(image, brightness=1.0, contrast=1.0, saturation=1.0, sharpn
     
     # Apply enhancements in sequence
     for param_type, value in enhancer_params:
+        enhancer = None
         if param_type == 'brightness':
             enhancer = ImageEnhance.Brightness(image)
         elif param_type == 'contrast':
@@ -33,7 +34,8 @@ def preprocess_image(image, brightness=1.0, contrast=1.0, saturation=1.0, sharpn
             enhancer = ImageEnhance.Color(image)
         elif param_type == 'sharpness':
             enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(value)
+        if enhancer is not None:
+            image = enhancer.enhance(value)
 
     # Apply blur if needed
     if blur > 0:
@@ -51,7 +53,12 @@ def preprocess_image(image, brightness=1.0, contrast=1.0, saturation=1.0, sharpn
         
         # Apply hue shift if needed
         if hue != 0.0:
-            channels[0] = channels[0].point(lambda p: (p + int(hue * 255)) % 256)
+            hue_shift = int(hue * 255)
+
+            def _shift_hue(p: int) -> int:
+                return (p + hue_shift) % 256
+
+            channels[0] = channels[0].point(_shift_hue)
         
         # Convert back to RGB
         image = Image.merge('HSV', channels).convert('RGB')
@@ -102,7 +109,7 @@ def apply_color_mask(image, target_color, tolerance, background='black', text_mo
             
             # Apply morphological operations to clean up text
             try:
-                from scipy import ndimage
+                from scipy import ndimage  # type: ignore[import-not-found]
                 
                 # Convert mask to binary for morphological operations
                 binary_mask = mask.astype(np.uint8) * 255
@@ -192,6 +199,7 @@ def filter_by_color(image, target_color, tolerance=30):
     # Get pixel data
     pixels = image.load()
     filtered_pixels = filtered.load()
+    assert filtered_pixels is not None  # always true for a freshly created in-memory image
     
     # Calculate maximum distance squared for tolerance
     max_distance_squared = (tolerance * 4.41) ** 2  # 4.41 ≈ sqrt(255^2 + 255^2 + 255^2) / 100

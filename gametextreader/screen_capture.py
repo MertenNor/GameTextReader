@@ -2,11 +2,14 @@
 Screen capture functions for capturing game text areas
 """
 import ctypes
-from PIL import Image  # type: ignore
-import win32api  # type: ignore
-import win32con  # type: ignore
-import win32gui  # type: ignore
-import win32ui  # type: ignore
+import sys
+from PIL import Image
+import win32api
+import win32con
+import win32gui
+import win32ui
+
+from .constants import DEBUG_FORCE_DPI_SCALE
 
 
 def get_dpi_scale():
@@ -16,6 +19,12 @@ def get_dpi_scale():
     This is needed to convert Tkinter logical pixel coordinates (mouse events)
     to physical pixel coordinates for screen capture via BitBlt.
     """
+    # Debug override (see constants.py) - only honored when running from
+    # source (not a frozen/compiled build), so it can never affect a real
+    # build even if left set by mistake.
+    if DEBUG_FORCE_DPI_SCALE is not False and not getattr(sys, 'frozen', False):
+        return float(DEBUG_FORCE_DPI_SCALE)
+
     try:
         dpi = ctypes.windll.user32.GetDpiForSystem()
         return dpi / 96.0
