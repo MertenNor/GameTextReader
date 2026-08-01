@@ -27,14 +27,11 @@ else:
 from functools import partial
 from tkinter import filedialog, messagebox, simpledialog, ttk, font as tkfont
 
-import keyboard
-import mouse
 import pyttsx3
 import pytesseract
 import requests
 import tkinter as tk
 if sys.platform.startswith('win'):
-    import win32api
     import win32com.client
     import win32con
     import win32gui
@@ -136,7 +133,8 @@ from ..utils import (
     get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
     is_special_character, suggest_alternative_key, InputManager
 )
-from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale
+from ..input_adapter import keyboard, mouse
+from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale, get_virtual_screen_bounds
 from ..window_geometry import apply_window_geometry
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
@@ -9955,12 +9953,8 @@ class GameTextReader:
         
         select_area_window.protocol("WM_DELETE_WINDOW", on_window_destroy)
         
-        # Get the true multi-monitor dimensions using win32api.GetSystemMetrics
-        # This ensures consistency with capture_screen_area function
-        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        # Get true multi-monitor dimensions using shared helper.
+        min_x, min_y, virtual_width, virtual_height = get_virtual_screen_bounds()
         max_x = min_x + virtual_width
         max_y = min_y + virtual_height
         
@@ -10651,10 +10645,7 @@ class GameTextReader:
         self.hotkeys_disabled_for_selection = True
         
         # Get virtual screen dimensions
-        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
-        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
-        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        min_x, min_y, virtual_width, virtual_height = get_virtual_screen_bounds()
         
         # Get primary monitor position and dimensions
         # Use EnumDisplayMonitors to reliably find the primary monitor
@@ -16008,10 +15999,7 @@ class GameTextReader:
         
         try:
             # Get current virtual screen bounds (all monitors combined)
-            min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
-            min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
-            total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-            total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+            min_x, min_y, total_width, total_height = get_virtual_screen_bounds()
             max_x = min_x + total_width
             max_y = min_y + total_height
             
@@ -20621,22 +20609,20 @@ def get_primary_monitor_info():
         if primary_monitor_info:
             return primary_monitor_info
         else:
-            # Fallback: use GetSystemMetrics
+            # Fallback: use virtual bounds helper
             print("Warning: Could not find primary monitor via EnumDisplayMonitors, using fallback")
-            return (0, 0, 
-                   win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+            _, _, screen_w, screen_h = get_virtual_screen_bounds()
+            return (0, 0, screen_w, screen_h)
     
     except Exception as e:
         print(f"Error detecting primary monitor: {e}, using fallback")
-        # Fallback: use GetSystemMetrics
-        return (0, 0,
-               win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-               win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+        # Fallback: use virtual bounds helper
+        _, _, screen_w, screen_h = get_virtual_screen_bounds()
+        return (0, 0, screen_w, screen_h)
 
 def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None):
     '''
-    Capture screen area across multiple monitors using win32api.
+    Capture screen area across multiple monitors.
     
     Args:
         x1, y1, x2, y2: Screen coordinates for the area to capture
@@ -20644,10 +20630,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         target_hwnd: Window handle to capture from (for PrintWindow mode)
     '''
     # Get virtual screen bounds
-    min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-    min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-    total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-    total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    min_x, min_y, total_width, total_height = get_virtual_screen_bounds()
     max_x = min_x + total_width
     max_y = min_y + total_height
     

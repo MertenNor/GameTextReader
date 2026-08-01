@@ -3,9 +3,9 @@ Screen capture functions for capturing game text areas
 """
 import ctypes
 import sys
+import pyautogui
 from PIL import Image
 if sys.platform.startswith('win'):
-    import win32api
     import win32con
     import win32gui
     import win32ui
@@ -99,23 +99,78 @@ def get_primary_monitor_info():
         if primary_monitor_info:
             return primary_monitor_info
         else:
-            # Fallback: use GetSystemMetrics
+            # Fallback: use pyautogui primary screen size
             print("Warning: Could not find primary monitor via EnumDisplayMonitors, using fallback")
+            screen_w, screen_h = pyautogui.size()
             return (0, 0, 
-                   win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+                   int(screen_w),
+                   int(screen_h))
     
     except Exception as e:
         print(f"Error detecting primary monitor: {e}, using fallback")
-        # Fallback: use GetSystemMetrics
+        # Fallback: use pyautogui primary screen size
+        screen_w, screen_h = pyautogui.size()
         return (0, 0,
-               win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-               win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+               int(screen_w),
+               int(screen_h))
+
+
+def get_virtual_screen_bounds():
+    """Return virtual desktop bounds as (min_x, min_y, width, height)."""
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ('left', ctypes.c_long),
+                ('top', ctypes.c_long),
+                ('right', ctypes.c_long),
+                ('bottom', ctypes.c_long)
+            ]
+
+        bounds = {'left': None, 'top': None, 'right': None, 'bottom': None}
+
+        def monitor_enum_proc(hmonitor, hdc, lprcMonitor, lParam):
+            del hmonitor, hdc, lParam
+            rect = lprcMonitor.contents
+            if bounds['left'] is None:
+                bounds['left'] = rect.left
+                bounds['top'] = rect.top
+                bounds['right'] = rect.right
+                bounds['bottom'] = rect.bottom
+            else:
+                bounds['left'] = min(bounds['left'], rect.left)
+                bounds['top'] = min(bounds['top'], rect.top)
+                bounds['right'] = max(bounds['right'], rect.right)
+                bounds['bottom'] = max(bounds['bottom'], rect.bottom)
+            return 1
+
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(RECT),
+            ctypes.c_ulong
+        )
+
+        callback = MonitorEnumProc(monitor_enum_proc)
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0)
+
+        if bounds['left'] is not None:
+            min_x = int(bounds['left'])
+            min_y = int(bounds['top'])
+            width = int(bounds['right'] - bounds['left'])
+            height = int(bounds['bottom'] - bounds['top'])
+            return min_x, min_y, width, height
+    except Exception:
+        pass
+
+    # Final fallback: primary screen via pyautogui
+    screen_w, screen_h = pyautogui.size()
+    return 0, 0, int(screen_w), int(screen_h)
 
 
 def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None):
     """
-    Capture screen area across multiple monitors using win32api.
+    Capture screen area across multiple monitors.
     
     Args:
         x1, y1, x2, y2: Screen coordinates for the area to capture
@@ -123,10 +178,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         target_hwnd: Window handle to capture from (for PrintWindow mode)
     """
     # Get virtual screen bounds
-    min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-    min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-    total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-    total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    min_x, min_y, total_width, total_height = get_virtual_screen_bounds()
     max_x = min_x + total_width
     max_y = min_y + total_height
 

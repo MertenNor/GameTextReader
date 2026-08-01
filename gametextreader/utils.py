@@ -1,8 +1,9 @@
 """
 Utility functions for GameTextReader
 """
-import keyboard
 import threading
+
+from .input_adapter import keyboard
 
 
 class InputManager:

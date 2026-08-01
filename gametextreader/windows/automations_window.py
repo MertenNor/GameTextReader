@@ -11,6 +11,7 @@ import pytesseract
 
 from ..screen_capture import capture_screen_area
 from ..window_geometry import apply_window_geometry
+from ..input_adapter import keyboard, mouse
 
 # Try to import numpy for better image comparison (optional)
 try:
@@ -1695,7 +1696,6 @@ class AutomationsWindow:
                     # Clean up any existing hook first to avoid duplicates
                     if hasattr(button, 'keyboard_hook') and button.keyboard_hook:
                         try:
-                            import keyboard
                             if hasattr(button.keyboard_hook, 'remove'):
                                 keyboard.remove_hotkey(button.keyboard_hook)
                             else:
@@ -2014,7 +2014,6 @@ class AutomationsWindow:
         # Clean up hotkey hook if it exists - try multiple methods to ensure it's removed
         if hotkey_button and hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
             try:
-                import keyboard
                 # Method 1: Remove by hotkey name (most reliable for add_hotkey)
                 try:
                     keyboard.remove_hotkey(hotkey_button.hotkey)
@@ -2045,7 +2044,6 @@ class AutomationsWindow:
         # Clean up mouse hook if it exists
         if hotkey_button and hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
             try:
-                import mouse
                 mouse.unhook(hotkey_button.mouse_hook_id)
                 pass
             except Exception as e:
