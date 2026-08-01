@@ -15,7 +15,6 @@ import tempfile
 import threading
 import time
 import webbrowser
-import winreg
 import ssl
 
 # Monkeypatch SSL to fix certificate verification errors in compiled app
@@ -34,15 +33,18 @@ import pyttsx3
 import pytesseract
 import requests
 import tkinter as tk
-import win32api
-import win32com.client
-import win32con
-import win32gui
-import win32ui
-import win32process
+if sys.platform.startswith('win'):
+    import win32api
+    import win32com.client
+    import win32con
+    import win32gui
+    import win32ui
+    import win32process
+    import winsound
+    import winreg
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageGrab, ImageTk
 import ctypes
-import winsound
+
 import queue
 
 # Try to import tkinterdnd2 for drag and drop functionality
@@ -344,8 +346,9 @@ class GameTextReader:
         self.processing_settings = {}  # Dictionary to store processing settings for each area
         self.processing_settings_widgets = {}  # Dictionary to store processing settings widgets for each area
         self.volume = tk.StringVar(value="100")  # Default volume 100%
-        self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
-        self.speaker.Volume = int(self.volume.get())  # Set initial volume
+        if sys.platform.startswith('win'):
+            self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            self.speaker.Volume = int(self.volume.get())  # Set initial volume
         self.is_speaking = False
         self._speech_monitor_active = False  # Flag to track if speech monitor thread is running
         self._speech_monitor_thread = None  # Thread that monitors speech completion
@@ -2725,7 +2728,7 @@ class GameTextReader:
             
             if file_path:
                 # Validate that the selected file is actually tesseract.exe
-                if os.path.basename(file_path).lower() == 'tesseract.exe':
+                if True: #os.path.basename(file_path).lower() == 'tesseract.exe':
                     # Test if the selected executable works
                     try:
                         # Temporarily set the path and test

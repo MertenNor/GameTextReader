@@ -6,7 +6,9 @@ import os
 import re
 import tkinter as tk
 from tkinter import messagebox, ttk
-import win32com.client
+import sys
+if sys.platform.startswith('win'):
+    import win32com.client
 
 from ..constants import APP_DOCUMENTS_DIR
 from ..window_geometry import apply_window_geometry

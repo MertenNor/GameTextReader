@@ -4,10 +4,11 @@ Screen capture functions for capturing game text areas
 import ctypes
 import sys
 from PIL import Image
-import win32api
-import win32con
-import win32gui
-import win32ui
+if sys.platform.startswith('win'):
+    import win32api
+    import win32con
+    import win32gui
+    import win32ui
 
 from .constants import DEBUG_FORCE_DPI_SCALE
 
