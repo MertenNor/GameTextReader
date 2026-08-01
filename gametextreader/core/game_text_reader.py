@@ -16,6 +16,7 @@ import threading
 import time
 import webbrowser
 import ssl
+import pygame
 
 # Monkeypatch SSL to fix certificate verification errors in compiled app
 try:
@@ -2166,7 +2167,10 @@ class GameTextReader:
                 print(f"[AI Voice] WAV written, playing...")
                 self._piper_playing = True
                 self._piper_wav_path = wav_path
-                self._mci_play(wav_path, _dur)
+                # self._mci_play(wav_path, _dur)
+                pygame.mixer.init()
+                sound_prompt = pygame.mixer.Sound(wav_path)
+                sound_prompt.play()
                 print(f"[AI Voice] Playback complete")
 
                 # Store in cache if not stopped
@@ -18695,14 +18699,15 @@ class GameTextReader:
                 messagebox.showerror("Error", "No area coordinates set. Click Set Area to set one.")
                 return
 
-        # Ensure speaker is initialized
-        if not self.speaker:
-            try:
-                self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
-                self.speaker.Volume = int(self.volume.get())
-            except Exception as e:
-                print(f"Error initializing speaker: {e}")
-                return
+        if sys.platform.startswith('win'):
+            # Ensure speaker is initialized
+            if not self.speaker:
+                try:
+                    self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                    self.speaker.Volume = int(self.volume.get())
+                except Exception as e:
+                    print(f"Error initializing speaker: {e}")
+                    return
 
         # Get area info first
         area_info = None

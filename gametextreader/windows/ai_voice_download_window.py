@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 import threading
 import webbrowser
 import tkinter as tk
@@ -490,56 +491,57 @@ class AIVoiceDownloadWindow:
         regular = []
         custom  = []
 
-        # SAPI — try COM first, fall back to winreg if NVDA or another app blocks GetVoices()
-        sapi_names = []
-        try:
-            import win32com.client
-            sapi = win32com.client.Dispatch("SAPI.SpVoice")
-            for token in sapi.GetVoices():
-                try:
-                    sapi_names.append(token.GetDescription())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if not sapi_names:
-            import winreg as _wr
-            for _sub in (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
-                         r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"):
-                try:
-                    _root = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, _sub)
-                    _i = 0
-                    while True:
-                        try:
-                            _tok = _wr.EnumKey(_root, _i); _i += 1
-                        except OSError:
-                            break
-                        _desc = None
-                        try:
-                            _tk = _wr.OpenKey(_root, _tok)
-                            for _s in ("409", ""):
-                                try:
-                                    if _s:
-                                        _sk = _wr.OpenKey(_tk, _s)
-                                        _desc, _ = _wr.QueryValueEx(_sk, ""); _wr.CloseKey(_sk)
-                                    else:
-                                        _desc, _ = _wr.QueryValueEx(_tk, "")
-                                    if _desc: break
-                                except Exception: pass
-                            if not _desc:
-                                try:
-                                    _ak = _wr.OpenKey(_tk, "Attributes")
-                                    _desc, _ = _wr.QueryValueEx(_ak, "Name"); _wr.CloseKey(_ak)
-                                except Exception: pass
-                            _wr.CloseKey(_tk)
-                        except Exception: pass
-                        if _desc and _desc not in sapi_names:
-                            sapi_names.append(_desc)
-                    _wr.CloseKey(_root)
-                except Exception:
-                    pass
-        for name in sapi_names:
-            regular.append((f"[SAPI] {name}", "sapi", name))
+        if sys.platform.startswith('win'):
+            # SAPI — try COM first, fall back to winreg if NVDA or another app blocks GetVoices()
+            sapi_names = []
+            try:
+                import win32com.client
+                sapi = win32com.client.Dispatch("SAPI.SpVoice")
+                for token in sapi.GetVoices():
+                    try:
+                        sapi_names.append(token.GetDescription())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if not sapi_names:
+                import winreg as _wr
+                for _sub in (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+                            r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"):
+                    try:
+                        _root = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, _sub)
+                        _i = 0
+                        while True:
+                            try:
+                                _tok = _wr.EnumKey(_root, _i); _i += 1
+                            except OSError:
+                                break
+                            _desc = None
+                            try:
+                                _tk = _wr.OpenKey(_root, _tok)
+                                for _s in ("409", ""):
+                                    try:
+                                        if _s:
+                                            _sk = _wr.OpenKey(_tk, _s)
+                                            _desc, _ = _wr.QueryValueEx(_sk, ""); _wr.CloseKey(_sk)
+                                        else:
+                                            _desc, _ = _wr.QueryValueEx(_tk, "")
+                                        if _desc: break
+                                    except Exception: pass
+                                if not _desc:
+                                    try:
+                                        _ak = _wr.OpenKey(_tk, "Attributes")
+                                        _desc, _ = _wr.QueryValueEx(_ak, "Name"); _wr.CloseKey(_ak)
+                                    except Exception: pass
+                                _wr.CloseKey(_tk)
+                            except Exception: pass
+                            if _desc and _desc not in sapi_names:
+                                sapi_names.append(_desc)
+                        _wr.CloseKey(_root)
+                    except Exception:
+                        pass
+            for name in sapi_names:
+                regular.append((f"[SAPI] {name}", "sapi", name))
 
         # Piper — installed .onnx files (only shown when the engine binary is present)
         try:
