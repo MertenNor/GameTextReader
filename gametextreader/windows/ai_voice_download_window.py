@@ -478,9 +478,12 @@ class AIVoiceDownloadWindow:
         self._voices_tab_data = []   # list of (label, engine, key) for all voices
         self._selected_voices_data = []  # same structure for selected list
         self._populate_voices_lists()
-        self._start_sapi_worker()
-        self.window.protocol("WM_DELETE_WINDOW",
-                             lambda: (self._sapi_q.put(None), self.window.destroy()))
+        if sys.platform.startswith('win'):
+            self._start_sapi_worker()
+            self.window.protocol("WM_DELETE_WINDOW",
+                                lambda: (self._sapi_q.put(None), self.window.destroy()))
+        else:
+            self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
     # Engine types that are user-created custom presets/voices
     _CUSTOM_ENGINES = {"sapi_preset", "piper_preset", "kokoro_custom"}
@@ -2703,24 +2706,30 @@ class AIVoiceDownloadWindow:
                 f.setframerate(sample_rate); f.writeframes(pcm.tobytes())
 
             self.window.after(0, self._switch_pitch_to_stop)
-            _winmm = ctypes.windll.winmm
-            _alias = 'pitchprev'
-            _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
-            ret = _winmm.mciSendStringW(
-                f'open "{wav_path}" type waveaudio alias {_alias}', None, 0, None)
-            if ret == 0:
-                _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
-                buf = ctypes.create_unicode_buffer(256)
-                while self._pitch_preview_playing:
-                    _winmm.mciSendStringW(f'status {_alias} mode', buf, 256, None)
-                    if buf.value in ('stopped', ''):
-                        break
-                    time.sleep(0.05)
-                _winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+            if sys.platform.startswith('win'):
+                _winmm = ctypes.windll.winmm
+                _alias = 'pitchprev'
                 _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                ret = _winmm.mciSendStringW(
+                    f'open "{wav_path}" type waveaudio alias {_alias}', None, 0, None)
+                if ret == 0:
+                    _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
+                    buf = ctypes.create_unicode_buffer(256)
+                    while self._pitch_preview_playing:
+                        _winmm.mciSendStringW(f'status {_alias} mode', buf, 256, None)
+                        if buf.value in ('stopped', ''):
+                            break
+                        time.sleep(0.05)
+                    _winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+                    _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                else:
+                    import winsound
+                    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
             else:
-                import winsound
-                winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+                import pygame
+                pygame.mixer.init()
+                sound_prompt = pygame.mixer.Sound(wav_path)
+                sound_prompt.play()
         except Exception as e:
             self.window.after(0, lambda: messagebox.showerror(
                 "Preview Failed", f"Could not generate pitch preview:\n{e}",

@@ -1516,7 +1516,12 @@ class GameTextReader:
                             text="Kokoro: Playing...", fg="#7700aa"))
                         self._piper_playing = True
                         self._piper_wav_path = _cf
-                        self._mci_play(_cf, _dur)
+                        # self._mci_play(_cf, _dur)
+                        pygame.mixer.init()
+                        sound_prompt = pygame.mixer.Sound(_cf)
+                        sound_prompt.play()
+                        while pygame.mixer.get_busy():
+                            time.sleep(0.05)
                         while self._pause_requested and not self._piper_stop_requested:
                             time.sleep(0.05)
                 finally:
@@ -1721,7 +1726,12 @@ class GameTextReader:
                     self._piper_playing = True
                     self._piper_wav_path = _current_chunk
                     print(f"[Kokoro] Playing chunk {play_idx+1}")
-                    self._mci_play(_current_chunk, len(samples) / float(sample_rate))
+                    # self._mci_play(_current_chunk, len(samples) / float(sample_rate))
+                    pygame.mixer.init()
+                    sound_prompt = pygame.mixer.Sound(_current_chunk)
+                    sound_prompt.play()
+                    while pygame.mixer.get_busy():
+                        time.sleep(0.05)
                     _played_chunks.append(_current_chunk)
                     _current_chunk = None
                     while self._pause_requested and not self._piper_stop_requested:
@@ -1799,7 +1809,10 @@ class GameTextReader:
                 self._piper_playing = True
                 self._piper_wav_path = wav_path
                 _dur = len(samples) / float(sample_rate)
-                self._mci_play(wav_path, _dur)
+                # self._mci_play(wav_path, _dur)
+                pygame.mixer.init()
+                sound_prompt = pygame.mixer.Sound(wav_path)
+                sound_prompt.play()
                 print("[Kokoro] Playback complete")
 
                 # Store in cache if not stopped
@@ -16746,7 +16759,8 @@ class GameTextReader:
                                             display_name = disp
                                             full_voice_name = saved_voice
                                             break
-
+                            if full_voice_name is None and saved_voice:
+                                print(f"Warning: Voice '{saved_voice}' not found in current SAPI voices or AI voices. Using default voice.")
                             if full_voice_name:
                                 voice_var.set(display_name)
                                 voice_var._full_name = full_voice_name
@@ -20800,15 +20814,15 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
                 pass
 
     # Try PyAutoGUI first to avoid relying on DesktopWindow for standard captures.
-    try:
-        import pyautogui
-        img = pyautogui.screenshot(region=(int(x1), int(y1), int(width), int(height)))
-        if img and img.mode != 'RGB':
-            img = img.convert('RGB')
-        if img:
-            return img
-    except Exception as e:
-        print(f"PyAutoGUI capture failed, falling back to Win32 capture: {e}")
+    # try:
+    #     import pyautogui
+    #     img = pyautogui.screenshot(region=(int(x1), int(y1), int(width), int(height)))
+    #     if img and img.mode != 'RGB':
+    #         img = img.convert('RGB')
+    #     if img:
+    #         return img
+    # except Exception as e:
+    #     print(f"PyAutoGUI capture failed, falling back to Win32 capture: {e}")
 
     try:
         img = ImageGrab.grab(
@@ -20824,82 +20838,82 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
     # Final safety fallback
     return Image.new('RGB', (max(1, width), max(1, height)))
 
-    def get_text_of_color(self, image, target_color, tolerance=30):
-        "Extract text of specific color from image using OCR"
-        try:
-            import numpy as np
-            
-            # Convert target_color from hex to RGB if needed
-            if isinstance(target_color, str) and target_color.startswith('#'):
-                target_color = target_color.lstrip('#')
-                target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
-            else:
-                target_rgb = target_color
-            
-            # Get OCR data with bounding boxes
-            import pytesseract
-            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
-            
-            # Convert image to numpy array for color analysis
-            img_array = np.array(image)
-            if len(img_array.shape) == 3:
-                # RGB image
-                height, width = img_array.shape[:2]
-            else:
-                # Grayscale - convert to RGB
-                img_array = np.stack([img_array]*3, axis=-1)
-                height, width = img_array.shape[:2]
-            
-            # Collect text of matching color
-            matching_text = []
-            
-            # Check each detected text region for color match
-            for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 30:  # Only consider confident detections
-                    text = data['text'][i].strip()
-                    if text:  # Non-empty text
-                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+def get_text_of_color(self, image, target_color, tolerance=30):
+    "Extract text of specific color from image using OCR"
+    try:
+        import numpy as np
+        
+        # Convert target_color from hex to RGB if needed
+        if isinstance(target_color, str) and target_color.startswith('#'):
+            target_color = target_color.lstrip('#')
+            target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
+        else:
+            target_rgb = target_color
+        
+        # Get OCR data with bounding boxes
+        import pytesseract
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
+        
+        # Convert image to numpy array for color analysis
+        img_array = np.array(image)
+        if len(img_array.shape) == 3:
+            # RGB image
+            height, width = img_array.shape[:2]
+        else:
+            # Grayscale - convert to RGB
+            img_array = np.stack([img_array]*3, axis=-1)
+            height, width = img_array.shape[:2]
+        
+        # Collect text of matching color
+        matching_text = []
+        
+        # Check each detected text region for color match
+        for i in range(len(data['text'])):
+            if int(data['conf'][i]) > 30:  # Only consider confident detections
+                text = data['text'][i].strip()
+                if text:  # Non-empty text
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    
+                    # Ensure coordinates are within image bounds
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    x2 = max(0, min(x + w, width - 1))
+                    y2 = max(0, min(y + h, height - 1))
+                    
+                    if x2 > x and y2 > y:
+                        # Extract text region
+                        text_region = img_array[y:y2, x:x2]
                         
-                        # Ensure coordinates are within image bounds
-                        x = max(0, min(x, width - 1))
-                        y = max(0, min(y, height - 1))
-                        x2 = max(0, min(x + w, width - 1))
-                        y2 = max(0, min(y + h, height - 1))
-                        
-                        if x2 > x and y2 > y:
-                            # Extract text region
-                            text_region = img_array[y:y2, x:x2]
+                        # Sample center area of text region (avoid edges)
+                        if text_region.size > 0:
+                            center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
+                            sample_size = min(3, center_y, center_x)
                             
-                            # Sample center area of text region (avoid edges)
-                            if text_region.size > 0:
-                                center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
-                                sample_size = min(3, center_y, center_x)
+                            if sample_size > 0:
+                                sample_area = text_region[center_y-sample_size:center_y+sample_size, 
+                                                            center_x-sample_size:center_x+sample_size]
                                 
-                                if sample_size > 0:
-                                    sample_area = text_region[center_y-sample_size:center_y+sample_size, 
-                                                              center_x-sample_size:center_x+sample_size]
-                                    
-                                    # Get average color of sample area
-                                    avg_color = np.mean(sample_area, axis=(0, 1))
-                                    
-                                    # Check if color matches target within tolerance
-                                    if self.color_matches(avg_color, target_rgb, tolerance):
-                                        matching_text.append(text)
-            
-            # Return combined text or None if no matches
-            return ' '.join(matching_text) if matching_text else None
-        except Exception as e:
-            print(f"Error getting text of color: {e}")
-            return None
+                                # Get average color of sample area
+                                avg_color = np.mean(sample_area, axis=(0, 1))
+                                
+                                # Check if color matches target within tolerance
+                                if self.color_matches(avg_color, target_rgb, tolerance):
+                                    matching_text.append(text)
+        
+        # Return combined text or None if no matches
+        return ' '.join(matching_text) if matching_text else None
+    except Exception as e:
+        print(f"Error getting text of color: {e}")
+        return None
 
-    def color_matches(self, color1, color2, tolerance):
-        "Check if two colors match within tolerance"
-        try:
-            diff = abs(int(color1[0]) - int(color2[0])) + \
-                   abs(int(color1[1]) - int(color2[1])) + \
-                   abs(int(color1[2]) - int(color2[2]))
-            return diff <= tolerance * 3  # Multiply by 3 for RGB channels
-        except:
-            return False
+def color_matches(self, color1, color2, tolerance):
+    "Check if two colors match within tolerance"
+    try:
+        diff = abs(int(color1[0]) - int(color2[0])) + \
+                abs(int(color1[1]) - int(color2[1])) + \
+                abs(int(color1[2]) - int(color2[2]))
+        return diff <= tolerance * 3  # Multiply by 3 for RGB channels
+    except:
+        return False
 
     
