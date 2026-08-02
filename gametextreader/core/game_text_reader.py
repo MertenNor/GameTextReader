@@ -16548,7 +16548,7 @@ class GameTextReader:
                     # Set preprocessing and voice settings
                     preprocess_var.set(auto_read_info.get("preprocess", False))
                     # Load voice (same logic as regular areas)
-                    if hasattr(self, 'voices') and self.voices:
+                    if hasattr(self, 'voices'):
                         try:
                             saved_voice = auto_read_info.get("voice")
                             if saved_voice and saved_voice != "Select Voice":
@@ -16689,7 +16689,7 @@ class GameTextReader:
                 # Set preprocessing and voice settings
                 preprocess_var.set(area_info.get("preprocess", False))
                 # Check if the saved voice exists in current SAPI voices and convert to display name
-                if hasattr(self, 'voices') and self.voices:
+                if hasattr(self, 'voices'):
                     try:
                         saved_voice = area_info.get("voice")
                         if saved_voice and saved_voice != "Select Voice":
