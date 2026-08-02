@@ -10173,41 +10173,13 @@ class GameTextReader:
                 
                 # Fall back to normal BitBlt method if PrintWindow didn't work or wasn't requested
                 if not use_printwindow or screenshot_image is None:
-                    # Use win32api method to capture entire virtual screen (all monitors)
-                    hwin = win32gui.GetDesktopWindow()
-                    hwindc = win32gui.GetWindowDC(hwin)
-                    memdc = None
-                    bmp = None
-                    try:
-                        srcdc = win32ui.CreateDCFromHandle(hwindc)
-                        memdc = srcdc.CreateCompatibleDC()
-                        
-                        # Create bitmap for entire virtual screen
-                        bmp = win32ui.CreateBitmap()
-                        bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
-                        memdc.SelectObject(bmp)
-                        
-                        # Copy entire virtual screen into bitmap
-                        memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
-                        
-                        # Convert bitmap to PIL Image
-                        bmpinfo = bmp.GetInfo()
-                        bmpstr = bmp.GetBitmapBits(True)
-                        screenshot_image = Image.frombuffer(
-                            'RGB',
-                            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                            bmpstr, 'raw', 'BGRX', 0, 1
-                        )
-                    finally:
-                        # Always clean up resources
-                        try:
-                            if memdc:
-                                memdc.DeleteDC()
-                            if bmp:
-                                win32gui.DeleteObject(bmp.GetHandle())
-                            win32gui.ReleaseDC(hwin, hwindc)
-                        except Exception:
-                            pass
+                    screenshot_image = capture_screen_area(
+                        min_x,
+                        min_y,
+                        min_x + virtual_width,
+                        min_y + virtual_height,
+                        use_printwindow=False,
+                    )
                     
                     print(f"Screenshot captured using BitBlt: {screenshot_image.size}")
                     
@@ -10672,43 +10644,13 @@ class GameTextReader:
         if self.edit_area_screenshot_bg:
             try:
                 print(f"Taking screenshot of all monitors for edit view background: {virtual_width}x{virtual_height} at ({min_x}, {min_y})")
-                
-                # Use win32api method to capture entire virtual screen (all monitors)
-                # This handles negative coordinates properly
-                hwin = win32gui.GetDesktopWindow()
-                hwindc = win32gui.GetWindowDC(hwin)
-                memdc = None
-                bmp = None
-                try:
-                    srcdc = win32ui.CreateDCFromHandle(hwindc)
-                    memdc = srcdc.CreateCompatibleDC()
-                    
-                    # Create bitmap for entire virtual screen
-                    bmp = win32ui.CreateBitmap()
-                    bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
-                    memdc.SelectObject(bmp)
-                    
-                    # Copy entire virtual screen into bitmap
-                    memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
-                    
-                    # Convert bitmap to PIL Image
-                    bmpinfo = bmp.GetInfo()
-                    bmpstr = bmp.GetBitmapBits(True)
-                    screenshot_image = Image.frombuffer(
-                        'RGB',
-                        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                        bmpstr, 'raw', 'BGRX', 0, 1
-                    )
-                finally:
-                    # Always clean up resources
-                    try:
-                        if memdc:
-                            memdc.DeleteDC()
-                        if bmp:
-                            win32gui.DeleteObject(bmp.GetHandle())
-                        win32gui.ReleaseDC(hwin, hwindc)
-                    except Exception:
-                        pass
+                screenshot_image = capture_screen_area(
+                    min_x,
+                    min_y,
+                    min_x + virtual_width,
+                    min_y + virtual_height,
+                    use_printwindow=False,
+                )
                 
                 print(f"Screenshot captured successfully: {screenshot_image.size}")
             except Exception as e:
@@ -16187,12 +16129,13 @@ class GameTextReader:
             # 1. Load Program Volume
             saved_volume = layout.get("volume", "100")
             self.volume.set(saved_volume)
-            try:
-                self.speaker.Volume = int(saved_volume)
-            except ValueError:
-                print("Invalid volume in save file, defaulting to 100%")
-                self.volume.set("100")
-                self.speaker.Volume = 100
+            if sys.platform.startswith('win'):
+                try:
+                    self.speaker.Volume = int(saved_volume)
+                except ValueError:
+                    print("Invalid volume in save file, defaulting to 100%")
+                    self.volume.set("100")
+                    self.speaker.Volume = 100
             
             # 2. Load Ignore Word list
             self.bad_word_list.set(layout.get("bad_word_list", ""))
@@ -20741,44 +20684,30 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
             print(f"Error in PrintWindow capture: {e}")
             # Fall through to normal BitBlt method
 
-    # Normal BitBlt method (fallback or default)
-    # Get DC from entire virtual screen
-    hwin = win32gui.GetDesktopWindow()
-    hwindc = win32gui.GetWindowDC(hwin)
-    memdc = None
-    bmp = None
+    # Try PyAutoGUI first to avoid relying on DesktopWindow for standard captures.
     try:
-        srcdc = win32ui.CreateDCFromHandle(hwindc)
-        memdc = srcdc.CreateCompatibleDC()
+        import pyautogui
+        img = pyautogui.screenshot(region=(int(x1), int(y1), int(width), int(height)))
+        if img and img.mode != 'RGB':
+            img = img.convert('RGB')
+        if img:
+            return img
+    except Exception as e:
+        print(f"PyAutoGUI capture failed, falling back to Win32 capture: {e}")
 
-        # Create bitmap for capture area
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(srcdc, width, height)
-        memdc.SelectObject(bmp)
-
-        # Copy screen into bitmap
-        memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
-
-        # Convert bitmap to PIL Image
-        bmpinfo = bmp.GetInfo()
-        bmpstr = bmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1
+    try:
+        img = ImageGrab.grab(
+            bbox=(int(x1), int(y1), int(x2), int(y2)),
+            all_screens=True
         )
-
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
         return img
-    finally:
-        # Always clean up resources
-        try:
-            if memdc:
-                memdc.DeleteDC()
-            if bmp:
-                win32gui.DeleteObject(bmp.GetHandle())
-            win32gui.ReleaseDC(hwin, hwindc)
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"ImageGrab fallback capture failed: {e}")
+
+    # Final safety fallback
+    return Image.new('RGB', (max(1, width), max(1, height)))
 
     def get_text_of_color(self, image, target_color, tolerance=30):
         "Extract text of specific color from image using OCR"
