@@ -241,6 +241,11 @@ class ImageProcessingWindow:
             'color_mask_preserve_edges': self.color_mask_preserve_edges_var.get(),
             'color_mask_enhance_contrast': self.color_mask_enhance_contrast_var.get()
         }
+
+        # Render the preview through the loaded settings immediately, instead of
+        # showing the raw unprocessed image until the user touches a slider.
+        self.update_image()
+
         self.window.deiconify()
 
     def create_scrollable_frame(self):
@@ -349,12 +354,11 @@ class ImageProcessingWindow:
         title_label = ttk.Label(label_frame, text=label, font=('TkDefaultFont', 7, 'bold'))  # Even smaller font
         title_label.pack(pady=(1, 1))  # Minimal padding
 
-        entry_var = tk.StringVar(value=f'{initial:.2f}')
+        entry_var = tk.StringVar(value=f'{variable.get():.2f}')
         # Add trace to variable to update entry field
         variable.trace_add('write', lambda *args: entry_var.set(f'{variable.get():.2f}'))
 
         slider = ttk.Scale(label_frame, from_=from_, to=to, orient='horizontal', variable=variable, command=self.debounced_update_image)
-        slider.set(initial)
         slider.pack(fill='x', padx=2)  # Minimal padding
 
         # Create a frame for entry and reset button side by side
