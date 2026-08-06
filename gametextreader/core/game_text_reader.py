@@ -2523,6 +2523,7 @@ class GameTextReader:
             preview_path = temp_path
 
         self.stop_speaking()
+        self._piper_stop_requested = False
 
         if voice_full_name.startswith('[Piper]:'):
             def _run_preview():
@@ -2877,10 +2878,7 @@ class GameTextReader:
         self._pygame_queue.put(req)
 
         while not done.wait(0.05):
-            if self._piper_stop_requested:
-                cancel.set()
-                self._stop_pygame_now()
-                break
+            pass
 
         if req['error']:
             print(f"[WARN] pygame playback failed: {req['error']}")
