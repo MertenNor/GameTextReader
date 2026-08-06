@@ -24,6 +24,12 @@ As a person with dyslexia, I wanted a program to read text in video games aloud.
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) must be installed and properly configured on your system.
 - Note! When the program opens for the first time, it will guide you through how to install this.
 
+### Optional OCR Backend (SteamOS/Linux)
+- You can now switch OCR engine in Additional Options -> OCR Settings from `tesseract` to `rapidocr`.
+- This avoids relying on Tesseract AppImage launching from Steam.
+- Install RapidOCR in your Python environment:
+	- `pip install rapidocr`
+
 ## 🗣️ Adding More High-Quality Voices
 Use the built-in Voice Manager to add different AI Voices.
 
