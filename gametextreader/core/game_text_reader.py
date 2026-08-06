@@ -16867,6 +16867,7 @@ class GameTextReader:
 
         self._is_loading_layout = True
         self.root.withdraw()  # Hide the main window during loading to prevent flicker
+        self._show_status_banner(f"Loading layout from: {os.path.basename(file_path)}...")
         try:
             # Set loading flag to prevent trace callbacks from marking changes
             self._is_loading_layout = True

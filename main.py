@@ -761,7 +761,10 @@ def main():
     try:
         icon_path = os.path.join(os.path.dirname(__file__), 'Assets', 'icon.ico')
         if os.path.exists(icon_path):
-            root.iconbitmap(icon_path)
+            # root.iconbitmap(icon_path) only works on Windows, so use PNG for cross-platform support
+            icon_photo = ImageTk.PhotoImage(file=icon_path)
+            root.iconphoto(True, icon_photo)
+
             print(f"Set window icon to: {icon_path}")
             # Register the AUMID in the registry so Windows shows the correct
             # display name and icon in the taskbar jump list instead of "Python".
