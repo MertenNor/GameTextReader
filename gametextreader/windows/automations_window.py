@@ -3507,8 +3507,12 @@ class AutomationsWindow:
     def has_text_in_area(self, image, target_color=None, color_tolerance=30):
         """Check if text exists in the image using OCR, optionally filtering by color"""
         try:
-            # Use basic OCR to detect text
-            text = pytesseract.image_to_string(image, config='--psm 6')
+            # Use the app's configured OCR backend when available.
+            if hasattr(self.game_text_reader, 'extract_text_from_image'):
+                text = self.game_text_reader.extract_text_from_image(image, psm_value="6")
+            else:
+                text = pytesseract.image_to_string(image, config='--psm 6')
+
             # Remove whitespace and check if any text remains
             text = text.strip()
             
@@ -3518,6 +3522,11 @@ class AutomationsWindow:
             
             # If target color is specified, check if text of that color exists
             if len(text) > 0:
+                if hasattr(self.game_text_reader, 'get_selected_ocr_backend'):
+                    if self.game_text_reader.get_selected_ocr_backend() in ('rapidocr', 'clipboard'):
+                        # RapidOCR/clipboard paths currently don't provide per-word boxes in this helper,
+                        # so we treat detected text as enough for text-present checks.
+                        return True
                 return self.has_text_of_color(image, target_color, color_tolerance)
             
             return False

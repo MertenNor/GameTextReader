@@ -139,6 +139,7 @@ from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_
 from ..window_geometry import apply_window_geometry
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
+from .ocr_backends import RapidOCRBackend
 from .tesseract_manager import TesseractManager
 from ..translation.translation_manager import TranslationManager
 from ..windows.console_window import ConsoleWindow
@@ -567,10 +568,13 @@ class GameTextReader:
         
         # Initialize Tesseract manager
         self.tesseract_manager = TesseractManager(APP_DOCUMENTS_DIR)
+        self.rapid_ocr_backend = RapidOCRBackend()
+        self.ocr_backend_var = tk.StringVar(value="tesseract")
         self.tesseract_language_var = tk.StringVar(value="eng") # Default to English
         
         # Auto-save Tesseract language on change
         self.tesseract_language_var.trace('w', lambda *args: self.save_global_settings())
+        self.ocr_backend_var.trace('w', lambda *args: self.save_global_settings())
 
         
         # Apply translation performance settings on startup
@@ -2703,6 +2707,98 @@ class GameTextReader:
                 except Exception:
                     # swallow and continue
                     pass
+
+    def get_selected_ocr_backend(self):
+        """Return normalized OCR backend id."""
+        try:
+            backend = self.ocr_backend_var.get().strip().lower()
+        except Exception:
+            backend = "tesseract"
+        return backend if backend in ("tesseract", "rapidocr", "clipboard") else "tesseract"
+
+    def _get_selected_ocr_lang_code(self):
+        """Return selected OCR language code from combobox value."""
+        lang_code = ""
+        try:
+            lang_code = self.tesseract_language_var.get()
+        except Exception:
+            pass
+
+        if " " in lang_code:
+            lang_code = lang_code.split(" ")[0]
+        lang_code = (lang_code or "").strip()
+
+        backend = self.get_selected_ocr_backend()
+        if not lang_code:
+            if backend == "rapidocr":
+                return "auto"
+            if backend == "clipboard":
+                return "clipboard"
+            return "eng"
+        return lang_code
+
+    def get_text_from_clipboard(self):
+        """Return current clipboard text for clipboard OCR mode."""
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except Exception as e:
+            print(f"[ERROR] Clipboard OCR: Could not read clipboard text: {e}")
+            return ""
+
+        return clipboard_text.strip() if isinstance(clipboard_text, str) else ""
+
+    def check_selected_ocr_backend_installed(self):
+        """Check that whichever OCR backend is selected is usable."""
+        backend = self.get_selected_ocr_backend()
+        if backend == "clipboard":
+            return True, "Clipboard OCR - Ready"
+        if backend == "rapidocr":
+            if self.rapid_ocr_backend.is_available():
+                return True, "RapidOCR - Installed"
+            return False, "RapidOCR not installed"
+        return self.check_tesseract_installed()
+
+    def extract_text_from_image(self, image, psm_value="3"):
+        """Run OCR on a PIL image using the selected backend."""
+        backend = self.get_selected_ocr_backend()
+        lang_code = self._get_selected_ocr_lang_code()
+
+        if backend == "clipboard":
+            return self.get_text_from_clipboard()
+
+        if backend == "rapidocr":
+            if not self.rapid_ocr_backend.is_available():
+                print("[ERROR] OCR (rapidocr): RapidOCR is not installed.")
+                return ""
+
+            try:
+                return self.rapid_ocr_backend.image_to_string(image, lang=lang_code)
+            except Exception as e:
+                print(f"[ERROR] OCR (rapidocr/{lang_code}): {e}")
+                if lang_code != "auto":
+                    print("[NOTE] OCR: Falling back to RapidOCR auto mode.")
+                    try:
+                        return self.rapid_ocr_backend.image_to_string(image, lang="auto")
+                    except Exception:
+                        return ""
+                return ""
+
+        config_str = f'--psm {psm_value}'
+        if self.tesseract_manager.is_custom_language(lang_code):
+            tessdata_config = self.tesseract_manager.get_tessdata_dir_param()
+            config_str = f'{tessdata_config} --psm {psm_value}'
+
+        try:
+            return pytesseract.image_to_string(image, lang=lang_code, config=config_str)
+        except Exception as e:
+            print(f"[ERROR] OCR ({lang_code}): {e}")
+            if lang_code != 'eng':
+                print("[NOTE] OCR: Falling back to English.")
+                try:
+                    return pytesseract.image_to_string(image, lang='eng', config=f'--psm {psm_value}')
+                except Exception:
+                    return ""
+            return ""
             
     def check_tesseract_installed(self):
         """Check if Tesseract OCR is properly installed and accessible."""
@@ -3855,6 +3951,12 @@ class GameTextReader:
                 saved_tesseract_lang = settings.get('tesseract_language')
                 if saved_tesseract_lang:
                     self.tesseract_language_var.set(saved_tesseract_lang)
+
+                saved_ocr_backend = settings.get('ocr_backend')
+                if saved_ocr_backend and hasattr(self, 'ocr_backend_var'):
+                    if saved_ocr_backend == "paddleocr":
+                        saved_ocr_backend = "rapidocr"
+                    self.ocr_backend_var.set(saved_ocr_backend)
                 
                 # Load Translation settings
                 if 'translation_enabled' in settings and hasattr(self, 'translation_enabled_var'):
@@ -3874,6 +3976,28 @@ class GameTextReader:
             import traceback
             traceback.print_exc()
         finally:
+            try:
+                ocr_ready, _ = self.check_selected_ocr_backend_installed()
+                if hasattr(self, 'status_label'):
+                    if not ocr_ready:
+                        selected_backend = self.get_selected_ocr_backend()
+                        if selected_backend == "rapidocr":
+                            self.status_label.config(
+                                text="→ RapidOCR missing. install rapidocr in your Python environment. ←",
+                                fg="red",
+                                font=("Helvetica", 10, "bold")
+                            )
+                        else:
+                            self.status_label.config(
+                                text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                                fg="red",
+                                font=("Helvetica", 10, "bold")
+                            )
+                    else:
+                        self.status_label.config(text="", fg="black", font=("Helvetica", 10))
+            except Exception:
+                pass
+
             # Only clear it if we were the ones who set it
             if not already_loading:
                 self._loading_settings = False
@@ -3979,6 +4103,27 @@ class GameTextReader:
         self._kokoro_update_available = None
         threading.Thread(target=_run, daemon=True).start()
 
+    def save_tesseract_settings(self):
+        """Save OCR-related settings to the global settings file."""
+        try:
+            temp_path = APP_SETTINGS_PATH
+
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except Exception:
+                    settings = {}
+
+            settings['tesseract_language'] = self.tesseract_language_var.get()
+            settings['ocr_backend'] = self.ocr_backend_var.get()
+
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving OCR settings: {e}")
+
     def save_global_settings(self):
         """Save global settings (master hotkey, sound, banner, etc.) to JSON."""
         # Don't save if we are currently loading settings or layout
@@ -4035,6 +4180,8 @@ class GameTextReader:
             # Update Tesseract settings
             if hasattr(self, 'tesseract_language_var'):
                 settings['tesseract_language'] = self.tesseract_language_var.get()
+            if hasattr(self, 'ocr_backend_var'):
+                settings['ocr_backend'] = self.ocr_backend_var.get()
                 
             # Save back to file
             with open(temp_path, 'w', encoding='utf-8') as f:
@@ -4780,11 +4927,17 @@ class GameTextReader:
         
         print("GUI setup complete.")
         
-        # Check Tesseract installation and update status label if not installed
-        tesseract_installed, tesseract_message = self.check_tesseract_installed()
-        if not tesseract_installed:
+        # Check selected OCR backend and update status if it's unavailable.
+        ocr_ready, _ = self.check_selected_ocr_backend_installed()
+        if not ocr_ready:
+            selected_backend = self.get_selected_ocr_backend()
+            if selected_backend == "rapidocr":
+                status_text = "→ RapidOCR missing. install rapidocr in your Python environment. ←"
+            else:
+                status_text = "→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←"
+
             self.status_label.config(
-                text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                text=status_text,
                 fg="red",
                 font=("Helvetica", 10, "bold")
             )
@@ -5070,16 +5223,28 @@ class GameTextReader:
         right_col = tk.Frame(columns)
         right_col.pack(side='left', fill='both', expand=True)
 
-        # --- Tesseract Settings Section ---
+        # --- OCR Settings Section ---
         tesseract_frame = tk.Frame(left_col)
         tesseract_frame.pack(fill='x', pady=(10, 0))
-        tk.Label(tesseract_frame, text="Tesseract OCR Settings:", font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(0, 2))
+        tk.Label(tesseract_frame, text="OCR Settings:", font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(0, 2))
         
         # Plain english description for Tesseract
         tk.Label(tesseract_frame, 
-                 text="Select the language intended to be detected/scanned on screen for better text recognition.", 
+                 text="Select OCR engine and language used for screen text recognition.", 
                  justify="left", fg="#555555", font=("Helvetica", 8)).pack(anchor="w", pady=(0, 5))
         
+        engine_row = tk.Frame(tesseract_frame)
+        engine_row.pack(fill='x', padx=20, pady=(0, 3))
+        tk.Label(engine_row, text="OCR Engine:", font=("Helvetica", 9)).pack(side='left')
+        ocr_backend_combo = ttk.Combobox(
+            engine_row,
+            textvariable=self.ocr_backend_var,
+            values=("tesseract", "rapidocr", "clipboard"),
+            width=30,
+            state="readonly"
+        )
+        ocr_backend_combo.pack(side='left', padx=(5, 15))
+
         tess_controls_frame = tk.Frame(tesseract_frame)
         tess_controls_frame.pack(fill='x', padx=20)
         
@@ -5088,60 +5253,105 @@ class GameTextReader:
         tess_lang_combo = ttk.Combobox(tess_controls_frame, textvariable=self.tesseract_language_var, width=30, state="readonly")
         tess_lang_combo.pack(side='left', padx=(5, 15))
         
-        # Function to populate Tesseract languages
+        manage_languages_button = tk.Button(
+            tess_controls_frame,
+            text="Manage Languages",
+            command=self.open_tesseract_manager_window,
+            font=("Helvetica", 9)
+        )
+        manage_languages_button.pack(side='left')
+
+        # Function to populate OCR languages based on selected backend.
         def update_tess_langs(event=None):
+            backend = self.get_selected_ocr_backend()
+            current = self.tesseract_language_var.get()
+
+            if backend == "clipboard":
+                lang_list = ["clipboard (Clipboard text)"]
+                tess_lang_combo['values'] = lang_list
+                manage_languages_button.config(state=tk.DISABLED)
+                if current != "clipboard (Clipboard text)":
+                    self.tesseract_language_var.set("clipboard (Clipboard text)")
+                return
+
+            if backend == "rapidocr":
+                langs = self.rapid_ocr_backend.get_available_languages()
+                lang_list = sorted([f"{code} ({name})" for code, name in langs.items()])
+                tess_lang_combo['values'] = lang_list
+                manage_languages_button.config(state=tk.DISABLED)
+
+                current_code = current.split(" ")[0] if current else ""
+                if current_code not in langs:
+                    self.tesseract_language_var.set("auto (Auto)")
+                return
+
             langs = self.tesseract_manager.get_installed_languages()
-            # Sort: Default first, then alphabetical
             lang_list = []
             default_entry = ""
             other_entries = []
-            
+
             for code, name in langs.items():
-                # Skip OSD
                 if code == 'osd':
                     continue
-                    
+
                 entry = f"{code} ({name})"
                 if "(Default)" in entry:
                     default_entry = entry
                 else:
                     other_entries.append(entry)
-            
+
             other_entries.sort()
             if default_entry:
                 lang_list = [default_entry] + other_entries
             else:
                 lang_list = other_entries
-                
+
             tess_lang_combo['values'] = lang_list
-            
-            # Ensure current value is valid
-            current = self.tesseract_language_var.get()
-            
-            # If empty, try to set default
+            manage_languages_button.config(state=tk.NORMAL)
+
             if not current and default_entry:
                 self.tesseract_language_var.set(default_entry)
                 return
 
-            # If current value is just a code (e.g. "eng"), match it to full entry
             if current and " (" not in current:
-                 for entry in lang_list:
-                     if f"({current})" in entry or f" {current}" in entry or entry.startswith(f"{current} ("):
-                         self.tesseract_language_var.set(entry)
-                         return
+                for entry in lang_list:
+                    if entry.startswith(f"{current} ("):
+                        self.tesseract_language_var.set(entry)
+                        return
 
         update_tess_langs()
         
         # Save on change immediately
         def on_tess_change(event):
             self.save_tesseract_settings()
+            self.save_global_settings()
+
+        def on_ocr_backend_change(event=None):
+            update_tess_langs()
+            self.save_global_settings()
+
+            ocr_ready, _ = self.check_selected_ocr_backend_installed()
+            if not ocr_ready:
+                selected_backend = self.get_selected_ocr_backend()
+                if selected_backend == "rapidocr":
+                    self.status_label.config(
+                        text="→ RapidOCR missing. install rapidocr in your Python environment. ←",
+                        fg="red",
+                        font=("Helvetica", 10, "bold")
+                    )
+                else:
+                    self.status_label.config(
+                        text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                        fg="red",
+                        font=("Helvetica", 10, "bold")
+                    )
+            else:
+                self.status_label.config(text="", fg="black", font=("Helvetica", 10))
             
         tess_lang_combo.bind("<<ComboboxSelected>>", on_tess_change)
         tess_lang_combo.bind("<FocusIn>", update_tess_langs)
+        ocr_backend_combo.bind("<<ComboboxSelected>>", on_ocr_backend_change)
         
-        # Download Manager Button
-        tk.Button(tess_controls_frame, text="Manage Languages", command=self.open_tesseract_manager_window, font=("Helvetica", 9)).pack(side='left')
-
         # Separator
         ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=5)
 
@@ -15294,6 +15504,7 @@ class GameTextReader:
             "translation_target": self.translation_target_var.get(),
             "standalone_numbers": getattr(self, 'standalone_numbers_var', tk.BooleanVar(value=False)).get(),
             "letters_only_numbers": getattr(self, 'letters_only_numbers_var', tk.BooleanVar(value=False)).get(),
+            "ocr_backend": getattr(self, 'ocr_backend_var', tk.StringVar(value="tesseract")).get(),
             "tesseract_language": getattr(self, 'tesseract_language_var', tk.StringVar(value="eng")).get(),
             "master_hotkey_sound_enabled": getattr(self, 'master_hotkey_sound_var', tk.BooleanVar(value=True)).get(),
             "master_hotkey_banner_enabled": getattr(self, 'master_hotkey_banner_var', tk.BooleanVar(value=True)).get(),
@@ -15468,6 +15679,7 @@ class GameTextReader:
             "translation_target": self.translation_target_var.get(),
             "standalone_numbers": getattr(self, 'standalone_numbers_var', tk.BooleanVar(value=False)).get(),
             "letters_only_numbers": getattr(self, 'letters_only_numbers_var', tk.BooleanVar(value=False)).get(),
+            "ocr_backend": getattr(self, 'ocr_backend_var', tk.StringVar(value="tesseract")).get(),
             "tesseract_language": getattr(self, 'tesseract_language_var', tk.StringVar(value="eng")).get(),
             "master_hotkey_sound_enabled": getattr(self, 'master_hotkey_sound_var', tk.BooleanVar(value=True)).get(),
             "master_hotkey_banner_enabled": getattr(self, 'master_hotkey_banner_var', tk.BooleanVar(value=True)).get(),
@@ -16249,6 +16461,12 @@ class GameTextReader:
                 self.standalone_numbers_var.set(layout.get("standalone_numbers", False))
             if hasattr(self, 'letters_only_numbers_var'):
                 self.letters_only_numbers_var.set(layout.get("letters_only_numbers", False))
+
+            saved_ocr_backend = layout.get("ocr_backend")
+            if saved_ocr_backend and hasattr(self, 'ocr_backend_var'):
+                if saved_ocr_backend == "paddleocr":
+                    saved_ocr_backend = "rapidocr"
+                self.ocr_backend_var.set(saved_ocr_backend)
             
             # Load Tesseract language from layout
             saved_tesseract_lang = layout.get("tesseract_language")
@@ -18718,7 +18936,7 @@ class GameTextReader:
             print(f"Warning: Attempted to read removed area, ignoring")
             return
 
-        if not hasattr(area_frame, 'area_coords'):
+        if self.get_selected_ocr_backend() != "clipboard" and not hasattr(area_frame, 'area_coords'):
             # Suppress error for Auto Read area
             area_info = None
             for area in self.areas:
@@ -18772,258 +18990,177 @@ class GameTextReader:
         # Show processing feedback
         self.show_processing_feedback(area_name)
 
-        # Capture screenshot
-        x1, y1, x2, y2 = area_frame.area_coords
-        
-        # Apply fullscreen mode refresh if enabled (for forcing screen refresh in fullscreen apps)
-        # Only apply if we're not using a frozen screenshot
-        # Save the game window handle for use in PrintWindow capture
-        game_window_handle = None
-        if fullscreen_mode_enabled and not (hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None):
-            try:
-                # For fullscreen apps, we need to force a screen buffer refresh
-                # The most effective method is to briefly switch focus away and back
-                foreground_hwnd = win32gui.GetForegroundWindow()
-                root_hwnd = self.root.winfo_id()
-                
-                if foreground_hwnd and foreground_hwnd != root_hwnd:
-                    # Save the game window handle BEFORE tabbing out - we'll use this for PrintWindow
-                    game_window_handle = foreground_hwnd
-                    
-                    # Method 1: Briefly bring GameReader to foreground, then restore original
-                    # This forces Windows to update the screen buffer
-                    try:
-                        # Save current foreground window
-                        original_foreground = foreground_hwnd
-                        
-                        # Step 1: Tab out - bring GameReader to foreground
-                        if root_hwnd and self.root.winfo_viewable():
-                            # Make sure window is not minimized
-                            if win32gui.IsIconic(root_hwnd):
-                                win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
-                            
-                            # Bring to foreground
-                            win32gui.SetForegroundWindow(root_hwnd)
-                            self.root.update()
-                            time.sleep(0.02)  # 20ms - minimal delay for tab out
-                            
-                            # Step 2: Tab back in - restore game to foreground
-                            if win32gui.IsWindow(original_foreground):
-                                # Restore if minimized
-                                if win32gui.IsIconic(original_foreground):
-                                    win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
-                                    time.sleep(0.05)  # Wait for restore
-                                
-                                # Bring to foreground
-                                win32gui.SetForegroundWindow(original_foreground)
-                                time.sleep(0.1)  # 100ms - initial delay after setting foreground
-                                
-                                # Step 3: Wait for game to be fully active before screenshot
-                                # Poll to ensure the game window is actually in foreground
-                                max_wait = 30  # Maximum 30 attempts (300ms)
-                                wait_count = 0
-                                while wait_count < max_wait:
-                                    current_foreground = win32gui.GetForegroundWindow()
-                                    if current_foreground == original_foreground:
-                                        # Game is in foreground, wait a bit more to ensure it's fully rendered
-                                        time.sleep(0.15)  # 150ms delay for game to fully render
-                                        # Verify one more time that game is still in foreground
-                                        final_check = win32gui.GetForegroundWindow()
-                                        if final_check == original_foreground:
-                                            print("Fullscreen mode: Game confirmed active and ready for capture")
-                                            break
-                                    time.sleep(0.01)  # 10ms between checks
-                                    wait_count += 1
-                                
-                                # Additional delay to ensure game is fully rendered and screen buffer is updated
-                                time.sleep(0.2)  # 200ms delay for game to fully restore and render
-                    except Exception as e:
-                        print(f"Error in focus switching: {e}")
-                
-                # Method 2: Invalidate desktop and foreground window
-                try:
-                    desktop_hwnd = win32gui.GetDesktopWindow()
-                    if desktop_hwnd:
-                        ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
-                    
-                    if foreground_hwnd and foreground_hwnd != root_hwnd:
-                        ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
-                        win32gui.UpdateWindow(foreground_hwnd)
-                except (OSError, AttributeError, Exception):
-                    # Window handle may be invalid or window may be closed
-                    pass
-                
-                # Final verification delay - ensure everything is ready
-                # Don't add extra delay here since we already waited above
-                print("Fullscreen mode: Screen refresh triggered, ready for capture")
-            except Exception as e:
-                print(f"Error in fullscreen mode screen refresh: {e}")
-                import traceback
-                traceback.print_exc()
-                # Continue with normal capture even if refresh fails
-        
-        # Track if we already processed the frozen screenshot
-        frozen_screenshot_already_processed = False
-        
-        # Check if we have a frozen screenshot to use instead of capturing from live screen
-        if hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None:
-            try:
-                print(f"Using frozen screenshot instead of live screen capture")
-                frozen_img = area_frame.frozen_screenshot
-                frozen_min_x, frozen_min_y, frozen_width, frozen_height = area_frame.frozen_screenshot_bounds
-                
-                # Check if frozen screenshot was already processed during capture
-                # If process_freeze_screen_var is enabled, the screenshot was already processed when captured
-                process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
-                                                self.process_freeze_screen_var.get())
-                
-                if process_freeze_screen_enabled:
-                    # Screenshot was already processed during capture, so it's already processed
-                    frozen_screenshot_already_processed = True
-                    print("Using already-processed frozen screenshot (processed during capture).")
-                elif preprocess and area_name in self.processing_settings:
-                    # Process now if preprocess is enabled but process_freeze_screen_var is not
-                    # (for backward compatibility with old behavior)
-                    settings = self.processing_settings[area_name]
-                    frozen_img = preprocess_image(
-                        frozen_img,
-                        brightness=settings.get('brightness', 1.0),
-                        contrast=settings.get('contrast', 1.0),
-                        saturation=settings.get('saturation', 1.0),
-                        sharpness=settings.get('sharpness', 1.0),
-                        blur=settings.get('blur', 0.0),
-                        threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
-                        hue=settings.get('hue', 0.0),
-                        exposure=settings.get('exposure', 1.0),
-                        color_mask_enabled=settings.get('color_mask_enabled', False),
-                        color_mask_color=settings.get('color_mask_color', '#FF0000'),
-                        color_mask_tolerance=settings.get('color_mask_tolerance', 30),
-                        color_mask_background=settings.get('color_mask_background', 'black'),
-                        color_mask_position=settings.get('color_mask_position', 'after')
-                    )
-                    frozen_screenshot_already_processed = True
-                    print("Image processing applied to frozen screenshot (during read).")
-                
-                # Convert screen coordinates to coordinates relative to the frozen screenshot
-                # The frozen screenshot starts at (frozen_min_x, frozen_min_y)
-                rel_x1 = x1 - frozen_min_x
-                rel_y1 = y1 - frozen_min_y
-                rel_x2 = x2 - frozen_min_x
-                rel_y2 = y2 - frozen_min_y
-                
-                # Ensure coordinates are within bounds
-                rel_x1 = max(0, min(frozen_width, rel_x1))
-                rel_y1 = max(0, min(frozen_height, rel_y1))
-                rel_x2 = max(0, min(frozen_width, rel_x2))
-                rel_y2 = max(0, min(frozen_height, rel_y2))
-                
-                # Ensure valid area
-                crop_x1, crop_x2 = min(rel_x1, rel_x2), max(rel_x1, rel_x2)
-                crop_y1, crop_y2 = min(rel_y1, rel_y2), max(rel_y1, rel_y2)
-                
-                # Extract the region from the frozen screenshot (or processed frozen screenshot)
-                if crop_x2 > crop_x1 and crop_y2 > crop_y1:
-                    screenshot = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                    print(f"Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
-                else:
-                    # Fallback to live capture if crop area is invalid
-                    print(f"Invalid crop area, falling back to live screen capture")
-                    # Use the saved game window handle (captured before tabbing out)
-                    target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-                    screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-                
-                # Clear the frozen screenshot after use
-                delattr(area_frame, 'frozen_screenshot')
-                if hasattr(area_frame, 'frozen_screenshot_bounds'):
-                    delattr(area_frame, 'frozen_screenshot_bounds')
-            except Exception as e:
-                print(f"Error using frozen screenshot: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback to live capture
-                # Use the saved game window handle (captured before tabbing out)
-                target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-                screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-                # Clear frozen screenshot on error
-                if hasattr(area_frame, 'frozen_screenshot'):
-                    delattr(area_frame, 'frozen_screenshot')
-                if hasattr(area_frame, 'frozen_screenshot_bounds'):
-                    delattr(area_frame, 'frozen_screenshot_bounds')
-        else:
-            # Normal capture from live screen
-            # Use the saved game window handle (captured before tabbing out)
-            # If we didn't capture it (no fullscreen mode), get current foreground window
-            if not game_window_handle and fullscreen_mode_enabled:
-                game_window_handle = win32gui.GetForegroundWindow()
-            target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-            screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-        
-        # Store original or processed image based on settings
-        # Skip processing if we already processed the frozen screenshot
-        if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
-            # Store the original unprocessed image first
-            self._store_image_with_bounds(area_name, screenshot, is_original=True)
-            
-            # Then apply processing for OCR use
-            settings = self.processing_settings[area_name]
-            processed_image = preprocess_image(
-                screenshot,
-                brightness=settings.get('brightness', 1.0),
-                contrast=settings.get('contrast', 1.0),
-                saturation=settings.get('saturation', 1.0),
-                sharpness=settings.get('sharpness', 1.0),
-                blur=settings.get('blur', 0.0),
-                threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
-                hue=settings.get('hue', 0.0),
-                exposure=settings.get('exposure', 1.0),
-                color_mask_enabled=settings.get('color_mask_enabled', False),
-                color_mask_color=settings.get('color_mask_color', '#FF0000'),
-                color_mask_tolerance=settings.get('color_mask_tolerance', 30),
-                color_mask_background=settings.get('color_mask_background', 'black'),
-                color_mask_position=settings.get('color_mask_position', 'after')
-            )
-            # Use processed image for OCR
-            screenshot = processed_image
-            # Store the processed image in latest_images (this is what the image processing window should show)
-            self._store_image_with_bounds(area_name, screenshot, is_original=False)
-        else:
-            # Store with bounds checking to prevent memory leak (no preprocessing)
-            self._store_image_with_bounds(area_name, screenshot, is_original=True)
-        
         # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
         psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
+
+        if self.get_selected_ocr_backend() == "clipboard":
+            text = self.extract_text_from_image(None, psm_value=psm_value)
+        else:
+            # Capture screenshot
+            x1, y1, x2, y2 = area_frame.area_coords
         
-        # Get Tesseract language and config
-        lang_code = self.tesseract_language_var.get()
-        if " " in lang_code:
-             lang_code = lang_code.split(" ")[0]
-        
-        if not lang_code or not lang_code.strip():
-            lang_code = "eng"
-             
-        config_str = f'--psm {psm_value}'
-        
-        # Check if we have custom tessdata to include (if using a downloaded language)
-        if self.tesseract_manager.is_custom_language(lang_code):
-             tessdata_config = self.tesseract_manager.get_tessdata_dir_param()
-             config_str = f'{tessdata_config} --psm {psm_value}'
-        
-        pass
-        try:
-            text = pytesseract.image_to_string(screenshot, lang=lang_code, config=config_str)
-            pass
-        except Exception as e:
-            print(f"[ERROR] OCR ({lang_code}): {e}")
-            # Fallback to English if specific language fails
-            if lang_code != 'eng':
-                print("[NOTE] OCR: Falling back to English.")
+            # Apply fullscreen mode refresh if enabled (for forcing screen refresh in fullscreen apps)
+            # Only apply if we're not using a frozen screenshot
+            # Save the game window handle for use in PrintWindow capture
+            game_window_handle = None
+            if fullscreen_mode_enabled and not (hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None):
                 try:
-                    text = pytesseract.image_to_string(screenshot, lang='eng', config=f'--psm {psm_value}')
-                except:
-                    text = ""
+                    foreground_hwnd = win32gui.GetForegroundWindow()
+                    root_hwnd = self.root.winfo_id()
+                    
+                    if foreground_hwnd and foreground_hwnd != root_hwnd:
+                        game_window_handle = foreground_hwnd
+                        try:
+                            original_foreground = foreground_hwnd
+                            if root_hwnd and self.root.winfo_viewable():
+                                if win32gui.IsIconic(root_hwnd):
+                                    win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
+                                win32gui.SetForegroundWindow(root_hwnd)
+                                self.root.update()
+                                time.sleep(0.02)
+
+                                if win32gui.IsWindow(original_foreground):
+                                    if win32gui.IsIconic(original_foreground):
+                                        win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
+                                        time.sleep(0.05)
+
+                                    win32gui.SetForegroundWindow(original_foreground)
+                                    time.sleep(0.1)
+
+                                    max_wait = 30
+                                    wait_count = 0
+                                    while wait_count < max_wait:
+                                        current_foreground = win32gui.GetForegroundWindow()
+                                        if current_foreground == original_foreground:
+                                            time.sleep(0.15)
+                                            final_check = win32gui.GetForegroundWindow()
+                                            if final_check == original_foreground:
+                                                print("Fullscreen mode: Game confirmed active and ready for capture")
+                                                break
+                                        time.sleep(0.01)
+                                        wait_count += 1
+
+                                    time.sleep(0.2)
+                        except Exception as e:
+                            print(f"Error in focus switching: {e}")
+
+                    try:
+                        desktop_hwnd = win32gui.GetDesktopWindow()
+                        if desktop_hwnd:
+                            ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
+
+                        if foreground_hwnd and foreground_hwnd != root_hwnd:
+                            ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
+                            win32gui.UpdateWindow(foreground_hwnd)
+                    except (OSError, AttributeError, Exception):
+                        pass
+
+                    print("Fullscreen mode: Screen refresh triggered, ready for capture")
+                except Exception as e:
+                    print(f"Error in fullscreen mode screen refresh: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            frozen_screenshot_already_processed = False
+
+            if hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None:
+                try:
+                    print(f"Using frozen screenshot instead of live screen capture")
+                    frozen_img = area_frame.frozen_screenshot
+                    frozen_min_x, frozen_min_y, frozen_width, frozen_height = area_frame.frozen_screenshot_bounds
+
+                    process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
+                                                    self.process_freeze_screen_var.get())
+
+                    if process_freeze_screen_enabled:
+                        frozen_screenshot_already_processed = True
+                        print("Using already-processed frozen screenshot (processed during capture).")
+                    elif preprocess and area_name in self.processing_settings:
+                        settings = self.processing_settings[area_name]
+                        frozen_img = preprocess_image(
+                            frozen_img,
+                            brightness=settings.get('brightness', 1.0),
+                            contrast=settings.get('contrast', 1.0),
+                            saturation=settings.get('saturation', 1.0),
+                            sharpness=settings.get('sharpness', 1.0),
+                            blur=settings.get('blur', 0.0),
+                            threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                            hue=settings.get('hue', 0.0),
+                            exposure=settings.get('exposure', 1.0),
+                            color_mask_enabled=settings.get('color_mask_enabled', False),
+                            color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                            color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                            color_mask_background=settings.get('color_mask_background', 'black'),
+                            color_mask_position=settings.get('color_mask_position', 'after')
+                        )
+                        frozen_screenshot_already_processed = True
+                        print("Image processing applied to frozen screenshot (during read).")
+
+                    rel_x1 = x1 - frozen_min_x
+                    rel_y1 = y1 - frozen_min_y
+                    rel_x2 = x2 - frozen_min_x
+                    rel_y2 = y2 - frozen_min_y
+
+                    rel_x1 = max(0, min(frozen_width, rel_x1))
+                    rel_y1 = max(0, min(frozen_height, rel_y1))
+                    rel_x2 = max(0, min(frozen_width, rel_x2))
+                    rel_y2 = max(0, min(frozen_height, rel_y2))
+
+                    crop_x1, crop_x2 = min(rel_x1, rel_x2), max(rel_x1, rel_x2)
+                    crop_y1, crop_y2 = min(rel_y1, rel_y2), max(rel_y1, rel_y2)
+
+                    if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                        screenshot = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+                        print(f"Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
+                    else:
+                        print(f"Invalid crop area, falling back to live screen capture")
+                        target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                        screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+
+                    delattr(area_frame, 'frozen_screenshot')
+                    if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                        delattr(area_frame, 'frozen_screenshot_bounds')
+                except Exception as e:
+                    print(f"Error using frozen screenshot: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                    screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+                    if hasattr(area_frame, 'frozen_screenshot'):
+                        delattr(area_frame, 'frozen_screenshot')
+                    if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                        delattr(area_frame, 'frozen_screenshot_bounds')
             else:
-                text = ""
-        pass
+                if not game_window_handle and fullscreen_mode_enabled:
+                    game_window_handle = win32gui.GetForegroundWindow()
+                target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+
+            if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
+                self._store_image_with_bounds(area_name, screenshot, is_original=True)
+                settings = self.processing_settings[area_name]
+                processed_image = preprocess_image(
+                    screenshot,
+                    brightness=settings.get('brightness', 1.0),
+                    contrast=settings.get('contrast', 1.0),
+                    saturation=settings.get('saturation', 1.0),
+                    sharpness=settings.get('sharpness', 1.0),
+                    blur=settings.get('blur', 0.0),
+                    threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                    hue=settings.get('hue', 0.0),
+                    exposure=settings.get('exposure', 1.0),
+                    color_mask_enabled=settings.get('color_mask_enabled', False),
+                    color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                    color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                    color_mask_background=settings.get('color_mask_background', 'black'),
+                    color_mask_position=settings.get('color_mask_position', 'after')
+                )
+                screenshot = processed_image
+                self._store_image_with_bounds(area_name, screenshot, is_original=False)
+            else:
+                self._store_image_with_bounds(area_name, screenshot, is_original=True)
+
+            text = self.extract_text_from_image(screenshot, psm_value=psm_value)
 
         import re
         
@@ -20831,6 +20968,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         )
         if img.mode != 'RGB':
             img = img.convert('RGB')
+            img.save("debug_screenshot_rgb.png")  # Save for debugging
         return img
     except Exception as e:
         print(f"ImageGrab fallback capture failed: {e}")
