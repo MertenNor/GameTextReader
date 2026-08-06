@@ -16864,8 +16864,9 @@ class GameTextReader:
         """Internal function to load and process layout data from a file."""
         if not self._is_loading_layout:
             print("Loading settings...")
-            
+
         self._is_loading_layout = True
+        self.root.withdraw()  # Hide the main window during loading to prevent flicker
         try:
             # Set loading flag to prevent trace callbacks from marking changes
             self._is_loading_layout = True
@@ -17696,6 +17697,7 @@ class GameTextReader:
         finally:
             # Always clear the loading flag, even if an error occurred
             self._is_loading_layout = False
+            self.root.deiconify()
 
     def validate_speed_key(self, event, speed_var):
         """Additional validation for speed entry key presses"""
