@@ -16,6 +16,7 @@ import threading
 import time
 import webbrowser
 import ssl
+import wave
 import pygame
 
 # Monkeypatch SSL to fix certificate verification errors in compiled app
@@ -377,6 +378,7 @@ class GameTextReader:
         self.piper_streaming_var      = tk.IntVar(value=0)  # 0=standard, 1=sentence-by-sentence
         self.kokoro_split_mode_var    = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
         self.piper_split_mode_var     = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
+        self.voice_preview_auto_var   = tk.BooleanVar(value=False)
 
         # Hotkey management
         self.hotkey_scancodes = {}  # Dictionary to store scan codes for hotkeys
@@ -2319,6 +2321,394 @@ class GameTextReader:
         voice_name = data.get('base_voice', '')
         pitch = float(data.get('pitch', 0.0))
         self._speak_with_sapi_pitched(text, voice_name, pitch, speed_var, _on_synth_done)
+
+    def _extract_preview_name(self, voice_label=None, voice_full_name=None):
+        """Extract the preview name from the end of a voice label/id."""
+        # Prefer backend-specific IDs when they carry a canonical voice token.
+        if isinstance(voice_full_name, str):
+            if voice_full_name.startswith('[Piper]:'):
+                key = voice_full_name.split(':', 1)[1]
+                if key.startswith('preset:'):
+                    key = key[7:]
+                parts = [p for p in key.split('-') if p]
+                if len(parts) >= 3:
+                    raw = parts[-2]
+                elif len(parts) >= 2:
+                    raw = parts[-1]
+                else:
+                    raw = key
+                raw = raw.replace('_', ' ').strip()
+                if raw:
+                    return raw.split()[-1]
+            if voice_full_name.startswith('[Kokoro]:'):
+                voice_id = voice_full_name.split(':', 1)[1]
+                if voice_id.startswith('custom:'):
+                    voice_id = voice_id[7:]
+                tokens = [t for t in re.split(r'[\s_\-]+', voice_id) if t]
+                if tokens:
+                    return tokens[-1]
+
+        # Fallback to display label shown in dropdown.
+        label = str(voice_label or '').strip()
+        label = re.sub(r'^\d+\.\s*', '', label)
+        label = re.sub(r'\s*\[[^\]]+\]\s*', ' ', label)
+        label = re.sub(r'\s*\([^\)]*\)\s*$', '', label)
+        label = re.sub(r'\s+', ' ', label).strip()
+        tokens = [t for t in re.split(r'[\s_\-]+', label) if t]
+        if tokens:
+            return tokens[-1]
+        return 'MYNAME'
+
+    def _build_preview_text(self, voice_label=None, voice_full_name=None):
+        """Return preview prompt with a per-voice name token."""
+        preview_name = self._extract_preview_name(voice_label, voice_full_name)
+        return f"Hello my name is {preview_name}, nice to meet you!"
+
+    def _save_preview_wav(self, preview_text, preview_path, voice_full_name):
+        """Generate a preview WAV for any supported backend voice and save it to disk."""
+        if not preview_path:
+            return None
+        try:
+            if voice_full_name.startswith('[Piper]:'):
+                model_key = voice_full_name.split(':', 1)[1]
+                length_scale = 1.0
+                noise_scale = 0.667
+                noise_w_scale = 0.8
+
+                if model_key.startswith('preset:'):
+                    preset_name = model_key[7:]
+                    preset_path = os.path.join(APP_PIPER_PRESETS_DIR, f"{preset_name}.json")
+                    if not os.path.exists(preset_path):
+                        return None
+                    try:
+                        with open(preset_path, 'r', encoding='utf-8') as f:
+                            preset_data = json.load(f)
+                        model_key = preset_data.get('base_voice', '')
+                        length_scale = float(preset_data.get('length_scale', length_scale))
+                        noise_scale = float(preset_data.get('noise_scale', noise_scale))
+                        noise_w_scale = float(preset_data.get('noise_w_scale', noise_w_scale))
+                    except Exception:
+                        return None
+
+                onnx_path = os.path.join(APP_PIPER_VOICES_DIR, f"{model_key}.onnx")
+                if not os.path.exists(onnx_path):
+                    return None
+                from piper import PiperVoice, SynthesisConfig
+                voice = PiperVoice.load(onnx_path)
+                syn_config = SynthesisConfig(
+                    length_scale=length_scale,
+                    noise_scale=noise_scale,
+                    noise_w_scale=noise_w_scale
+                )
+                with wave.open(preview_path, 'wb') as wf:
+                    voice.synthesize_wav(preview_text, wf, syn_config=syn_config)
+                return preview_path
+
+            if voice_full_name.startswith('[Kokoro]:'):
+                voice_id = voice_full_name.split(':', 1)[1]
+                model_path = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
+                voices_path = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+                if not os.path.exists(model_path) or not os.path.exists(voices_path):
+                    return None
+                import numpy as np
+                from kokoro_onnx import Kokoro as KokoroTTS
+                kokoro = getattr(self, '_kokoro_instance', None) or KokoroTTS(model_path, voices_path)
+                voice_arg = voice_id
+                if voice_id.startswith('custom:'):
+                    custom_name = voice_id[7:]
+                    custom_path = os.path.join(APP_KOKORO_CUSTOM_DIR, f"{custom_name}.npy")
+                    if not os.path.exists(custom_path):
+                        return None
+                    voice_arg = np.load(custom_path)
+
+                lang = 'en-us'
+                try:
+                    all_voices = _kokoro_load_voices(voices_path)
+                    if not voice_id.startswith('custom:'):
+                        lang = all_voices.get(voice_id, ('', 'en-us'))[1]
+                except Exception:
+                    pass
+
+                samples, sample_rate = kokoro.create(preview_text, voice=voice_arg, speed=1.0, lang=lang)
+                pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                with wave.open(preview_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm.tobytes())
+                return preview_path
+
+            is_sapi_preset = isinstance(voice_full_name, str) and voice_full_name.startswith('[SAPI]:preset:')
+            is_sapi_voice = isinstance(voice_full_name, str) and not voice_full_name.startswith('[')
+            if is_sapi_preset or is_sapi_voice:
+                if not sys.platform.startswith('win'):
+                    return None
+                import win32com.client
+
+                speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                target_voice_name = voice_full_name
+                pitch = 0.0
+
+                if is_sapi_preset:
+                    preset_name = voice_full_name[14:]
+                    preset_path = os.path.join(APP_SAPI_PRESETS_DIR, f"{preset_name}.json")
+                    if not os.path.exists(preset_path):
+                        return None
+                    with open(preset_path, 'r', encoding='utf-8') as f:
+                        preset_data = json.load(f)
+                    target_voice_name = preset_data.get('base_voice', '')
+                    pitch = float(preset_data.get('pitch', 0.0))
+
+                if target_voice_name:
+                    try:
+                        for voice in speaker.GetVoices():
+                            if voice.GetDescription() == target_voice_name:
+                                speaker.Voice = voice
+                                break
+                    except Exception:
+                        pass
+
+                stream = win32com.client.Dispatch("SAPI.SpFileStream")
+                ssfm_create_for_write = 3
+                stream.Open(preview_path, ssfm_create_for_write)
+                speaker.AudioOutputStream = stream
+
+                speak_text = preview_text
+                speak_flags = 0
+                if pitch:
+                    sapi_pitch = max(-10, min(10, int(round(pitch * 10 / 12))))
+                    if sapi_pitch != 0:
+                        speak_text = f'<Pitch Middle="{sapi_pitch:+d}"/>{preview_text}'
+                        speak_flags = 8  # SVSFIsXML
+
+                speaker.Speak(speak_text, speak_flags)
+                stream.Close()
+                return preview_path if os.path.exists(preview_path) else None
+        except Exception as e:
+            print(f"[WARNING] Could not save preview WAV: {e}")
+        return None
+
+    def _play_preview_audio(self, preview_path):
+        """Play a generated preview WAV if possible."""
+        if not preview_path or not os.path.exists(preview_path):
+            return
+        try:
+            if sys.platform.startswith('win'):
+                import ctypes
+                _winmm = ctypes.windll.winmm
+                _alias = 'gtrprev'
+                _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                ret = _winmm.mciSendStringW(f'open "{preview_path}" type waveaudio alias {_alias}', None, 0, None)
+                if ret == 0:
+                    _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
+                    return
+            pygame.mixer.init()
+            sound = pygame.mixer.Sound(preview_path)
+            sound.play()
+            while pygame.mixer.get_busy():
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"[WARNING] Could not play preview WAV: {e}")
+
+    def _play_voice_preview(self, voice_full_name, voice_display=None, save_preview=False):
+        """Play a short preview for the selected voice and optionally save a WAV file."""
+        if not voice_full_name or str(voice_full_name).strip() in {'', 'No voices available'}:
+            return
+        preview_text = self._build_preview_text(voice_display or voice_full_name, voice_full_name)
+        preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
+        os.makedirs(preview_dir, exist_ok=True)
+        safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(voice_display or voice_full_name or 'voice')).strip('_') or 'voice'
+        preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav") if save_preview else None
+        temp_path = None
+        if not preview_path:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False, dir=preview_dir) as tmp:
+                temp_path = tmp.name
+            preview_path = temp_path
+
+        self.stop_speaking()
+
+        if voice_full_name.startswith('[Piper]:'):
+            def _run_preview():
+                try:
+                    self._save_preview_wav(preview_text, preview_path, voice_full_name)
+                    if os.path.exists(preview_path):
+                        self._play_preview_audio(preview_path)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            threading.Thread(target=_run_preview, daemon=True).start()
+            return
+
+        if voice_full_name.startswith('[Kokoro]:'):
+            def _run_preview():
+                try:
+                    self._save_preview_wav(preview_text, preview_path, voice_full_name)
+                    if os.path.exists(preview_path):
+                        self._play_preview_audio(preview_path)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            threading.Thread(target=_run_preview, daemon=True).start()
+            return
+
+        if voice_full_name.startswith('[SAPI]:preset:'):
+            preset_name = voice_full_name[14:]
+            threading.Thread(target=self._speak_with_sapi_preset, args=(preview_text, preset_name, None), daemon=True).start()
+            return
+
+        try:
+            if hasattr(self, 'speaker') and self.speaker:
+                voices = self.speaker.GetVoices()
+                selected_voice = None
+                for voice in voices:
+                    if getattr(voice, 'GetDescription', None) and voice.GetDescription() == voice_full_name:
+                        selected_voice = voice
+                        break
+                if selected_voice is not None:
+                    self.speaker.Voice = selected_voice
+                self._ensure_speech_ready()
+                self.current_speech_text = preview_text
+                self.is_speaking = True
+                self.speaker.Speak(preview_text, 1)
+                self._start_speech_monitor()
+        except Exception as e:
+            print(f"[WARNING] Could not preview SAPI voice: {e}")
+
+    def _schedule_menu_highlight_preview(self, voice_full_name, voice_display):
+        """Debounce voice previews while hovering over dropdown menu entries."""
+        if not getattr(self, 'voice_preview_auto_var', None) or not self.voice_preview_auto_var.get():
+            return
+        if not voice_full_name or str(voice_full_name).strip() in {'', 'No voices available'}:
+            return
+
+        key = (voice_full_name, voice_display)
+        now = time.time()
+        last_key = getattr(self, '_last_hover_preview_key', None)
+        last_ts = getattr(self, '_last_hover_preview_ts', 0.0)
+        if key == last_key and (now - last_ts) < 0.8:
+            return
+
+        job = getattr(self, '_hover_preview_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+
+        def _run_preview():
+            self._hover_preview_job = None
+            self._last_hover_preview_key = key
+            self._last_hover_preview_ts = time.time()
+            self._play_voice_preview(voice_full_name, voice_display)
+
+        self._hover_preview_job = self.root.after(120, _run_preview)
+
+    def _bind_voice_menu_hover_preview(self, area_frame, voice_menu):
+        """Bind hover events on a voice OptionMenu so highlighted entries preview automatically."""
+        menu = voice_menu['menu']
+        if getattr(menu, '_preview_hover_bound', False):
+            return
+
+        def _on_menu_map(_event=None, tk_menu=menu):
+            # Menu was just opened; skip the first highlight event so opening
+            # the dropdown doesn't immediately play a preview.
+            tk_menu._skip_first_preview_event = True
+
+        def _on_menu_select(_event=None, frame=area_frame, tk_menu=menu):
+            if not getattr(self, 'voice_preview_auto_var', None) or not self.voice_preview_auto_var.get():
+                return
+            if getattr(tk_menu, '_skip_first_preview_event', False):
+                tk_menu._skip_first_preview_event = False
+                return
+            try:
+                active_index = tk_menu.index('active')
+            except Exception:
+                return
+            if active_index is None:
+                return
+            try:
+                display_name = tk_menu.entrycget(active_index, 'label')
+            except Exception:
+                return
+            full_names = getattr(frame, 'voice_full_names', {}) or {}
+            self._schedule_menu_highlight_preview(full_names.get(display_name, display_name), display_name)
+
+        menu.bind('<Map>', _on_menu_map, add='+')
+        menu.bind('<<MenuSelect>>', _on_menu_select, add='+')
+        menu._preview_hover_bound = True
+
+    def generate_previews_for_all_voices(self):
+        """Generate and save preview WAV files for all currently available voices."""
+        if getattr(self, '_preview_generation_running', False):
+            self.status_label.config(text='Preview generation already running...', fg='orange')
+            return
+
+        display_names, full_names = self._build_voice_lists()
+        voices_to_generate = []
+        seen_full = set()
+        for display_name in display_names:
+            full_name = full_names.get(display_name, display_name)
+            if full_name in seen_full:
+                continue
+            seen_full.add(full_name)
+            voices_to_generate.append((display_name, full_name))
+
+        total = len(voices_to_generate)
+        if total == 0:
+            self.status_label.config(text='No voices available for preview generation', fg='orange')
+            return
+
+        self._preview_generation_running = True
+        if hasattr(self, 'generate_previews_button'):
+            self.generate_previews_button.config(state=tk.DISABLED, text='Generating...')
+        if hasattr(self, 'preview_generation_progress'):
+            self.preview_generation_progress.config(mode='determinate', maximum=total, value=0)
+        self.status_label.config(text=f'Generating previews: 0/{total}', fg='black')
+
+        def _update_progress(done_count):
+            if hasattr(self, 'preview_generation_progress'):
+                self.preview_generation_progress.config(value=done_count)
+            self.status_label.config(text=f'Generating previews: {done_count}/{total}', fg='black')
+
+        def _finish(saved, failed):
+            self._preview_generation_running = False
+            if hasattr(self, 'generate_previews_button'):
+                self.generate_previews_button.config(state=tk.NORMAL, text='Generate Previews')
+            if saved:
+                msg = f'Generated {saved}/{total} preview file(s)'
+                if failed:
+                    msg += f' ({failed} failed)'
+                self.status_label.config(text=msg, fg='black')
+            else:
+                self.status_label.config(text='No preview files were generated', fg='orange')
+
+        def _worker():
+            saved = 0
+            failed = 0
+            preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
+            os.makedirs(preview_dir, exist_ok=True)
+
+            for idx, (display_name, full_name) in enumerate(voices_to_generate, start=1):
+                preview_text = self._build_preview_text(display_name, full_name)
+                safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(display_name or full_name or 'voice')).strip('_') or 'voice'
+                preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav")
+
+                if self._save_preview_wav(preview_text, preview_path, full_name):
+                    saved += 1
+                else:
+                    failed += 1
+
+                self.root.after(0, lambda count=idx: _update_progress(count))
+
+            self.root.after(0, lambda: _finish(saved, failed))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _mci_play(self, wav_path, duration_sec):
         """Play a WAV via Windows MCI — stoppable and pauseable from any thread."""
@@ -4575,6 +4965,27 @@ class GameTextReader:
                   command=self.open_ai_voice_manager_window,
                   font=("Helvetica", 9)).pack(side='left', padx=(10, 0))
 
+        self.generate_previews_button = tk.Button(
+            volume_frame,
+            text="Generate Previews",
+            command=self.generate_previews_for_all_voices,
+            font=("Helvetica", 9)
+        )
+        self.generate_previews_button.pack(side='left', padx=(8, 0))
+
+        tk.Checkbutton(volume_frame, text="Selection Previews",
+                   variable=self.voice_preview_auto_var).pack(side='left', padx=(8, 0))
+
+        self.preview_generation_progress = ttk.Progressbar(
+            volume_frame,
+            orient=tk.HORIZONTAL,
+            mode='determinate',
+            length=120,
+            maximum=100,
+            value=0
+        )
+        self.preview_generation_progress.pack(side='left', padx=(8, 0))
+
         # Hotkey status/Area notification label (moved here from left side, right of volume)
         self.hotkey_status_label = tk.Label(volume_frame, text="", font=("Helvetica", 10, "bold"), fg="red")
         self.hotkey_status_label.pack(side='left', padx=(10, 0))
@@ -5008,6 +5419,8 @@ class GameTextReader:
                         vv._full_name = fn.get(n, n)
                         area_name = area[3].get()
                         self._set_unsaved_changes('area_settings', area_name)
+                        if getattr(self, 'voice_preview_auto_var', None) and self.voice_preview_auto_var.get():
+                            self._play_voice_preview(fn.get(n, n), n)
                     menu.add_command(label=name, command=_cmd)
 
                 # Update the stored full_names map on the frame
@@ -9192,6 +9605,8 @@ class GameTextReader:
             # Mark as unsaved when voice changes
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
+            if getattr(self, 'voice_preview_auto_var', None) and self.voice_preview_auto_var.get():
+                self._play_voice_preview(getattr(voice_var, '_full_name', selected_display), selected_display)
 
         # Set the full name for the default voice
         if default_voice in voice_full_names:
@@ -9217,6 +9632,8 @@ class GameTextReader:
         area_frame.voice_full_names = voice_full_names
         
         voice_menu.pack(side="left")
+
+        self._bind_voice_menu_hover_preview(area_frame, voice_menu)
         
 
 
