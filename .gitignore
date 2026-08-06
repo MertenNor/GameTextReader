@@ -1,1 +1,8 @@
 *.pyc
+pyenv
+squashfs-root
+*.wav
+*.AppImage
+*.onnx*
+*.cache*
+*.png
