@@ -1123,6 +1123,17 @@ class GameTextReader:
         self._piper_playing = False
         self._piper_stop_requested = False
         self._pause_requested = False
+        self._pygame_lock = threading.Lock()
+        self._pygame_queue = queue.Queue()
+        self._pygame_current_request = None
+        self._pygame_request_seq = 0
+        self._pygame_mixer_warmed = False
+        self._pygame_worker_thread = threading.Thread(
+            target=self._pygame_playback_worker,
+            name="gtr-pygame-audio",
+            daemon=True,
+        )
+        self._pygame_worker_thread.start()
         self._mci_command = None
         self._piper_wav_path = None
         self._status_anim_running = False
@@ -1477,7 +1488,8 @@ class GameTextReader:
     def _speak_with_kokoro(self, text, voice_id, speed_var=None, _on_synth_done=None, area_id=None):
         """Speak text using Kokoro TTS."""
         if self.is_speaking:
-            return
+            self.stop_speaking()
+            time.sleep(0.02)
         import sys, wave
 
         model_path  = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
@@ -1523,11 +1535,7 @@ class GameTextReader:
                         self._piper_playing = True
                         self._piper_wav_path = _cf
                         # self._mci_play(_cf, _dur)
-                        pygame.mixer.init()
-                        sound_prompt = pygame.mixer.Sound(_cf)
-                        sound_prompt.play()
-                        while pygame.mixer.get_busy():
-                            time.sleep(0.05)
+                        self._pygame_play_sync(_cf)
                         while self._pause_requested and not self._piper_stop_requested:
                             time.sleep(0.05)
                 finally:
@@ -1733,11 +1741,7 @@ class GameTextReader:
                     self._piper_wav_path = _current_chunk
                     print(f"[Kokoro] Playing chunk {play_idx+1}")
                     # self._mci_play(_current_chunk, len(samples) / float(sample_rate))
-                    pygame.mixer.init()
-                    sound_prompt = pygame.mixer.Sound(_current_chunk)
-                    sound_prompt.play()
-                    while pygame.mixer.get_busy():
-                        time.sleep(0.05)
+                    self._pygame_play_sync(_current_chunk)
                     _played_chunks.append(_current_chunk)
                     _current_chunk = None
                     while self._pause_requested and not self._piper_stop_requested:
@@ -1816,9 +1820,7 @@ class GameTextReader:
                 self._piper_wav_path = wav_path
                 _dur = len(samples) / float(sample_rate)
                 # self._mci_play(wav_path, _dur)
-                pygame.mixer.init()
-                sound_prompt = pygame.mixer.Sound(wav_path)
-                sound_prompt.play()
+                self._pygame_play_sync(wav_path)
                 print("[Kokoro] Playback complete")
 
                 # Store in cache if not stopped
@@ -1942,7 +1944,8 @@ class GameTextReader:
     def _speak_with_piper(self, text, model_key, speed_var=None, _on_synth_done=None, pitch_override=None, area_id=None):
         """Speak text using the bundled piper-tts Python package."""
         if self.is_speaking:
-            return
+            self.stop_speaking()
+            time.sleep(0.02)
         # Resolve custom preset → base voice + override settings
         preset_overrides = None
         if model_key.startswith('preset:'):
@@ -2187,9 +2190,7 @@ class GameTextReader:
                 self._piper_playing = True
                 self._piper_wav_path = wav_path
                 # self._mci_play(wav_path, _dur)
-                pygame.mixer.init()
-                sound_prompt = pygame.mixer.Sound(wav_path)
-                sound_prompt.play()
+                self._pygame_play_sync(wav_path)
                 print(f"[AI Voice] Playback complete")
 
                 # Store in cache if not stopped
@@ -2502,11 +2503,7 @@ class GameTextReader:
                 if ret == 0:
                     _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
                     return
-            pygame.mixer.init()
-            sound = pygame.mixer.Sound(preview_path)
-            sound.play()
-            while pygame.mixer.get_busy():
-                time.sleep(0.05)
+            self._pygame_play_sync(preview_path)
         except Exception as e:
             print(f"[WARNING] Could not play preview WAV: {e}")
 
@@ -2749,6 +2746,146 @@ class GameTextReader:
         self._mci_alias = None
         self._mci_command = None
 
+    def _ensure_pygame_mixer(self):
+        """Initialize pygame mixer once with a smaller buffer to reduce startup delay."""
+        just_initialized = False
+        if not pygame.mixer.get_init():
+            try:
+                pygame.mixer.init(buffer=512)
+            except Exception:
+                pygame.mixer.init()
+            just_initialized = True
+
+        # Some backends need a short settle period after init before first play.
+        if just_initialized and not self._pygame_mixer_warmed:
+            time.sleep(0.03)
+            self._pygame_mixer_warmed = True
+
+    def _stop_pygame_now(self):
+        """Best-effort immediate stop of current pygame playback."""
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.stop()
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def _cancel_current_pygame_request(self):
+        with self._pygame_lock:
+            req = self._pygame_current_request
+            if req:
+                req['cancel'].set()
+        self._stop_pygame_now()
+
+    def _pygame_playback_worker(self):
+        """Serialize pygame playback and support preemption."""
+        while True:
+            req = self._pygame_queue.get()
+            if req is None:
+                self._pygame_queue.task_done()
+                break
+
+            try:
+                with self._pygame_lock:
+                    is_current = self._pygame_current_request is req
+                if not is_current:
+                    req['ok'] = False
+                    continue
+
+                self._ensure_pygame_mixer()
+                sound = pygame.mixer.Sound(req['wav_path'])
+                duration = max(0.0, float(sound.get_length()))
+                channel = sound.play()
+                if channel is None:
+                    req['ok'] = False
+                else:
+                    start_t = time.monotonic()
+                    saw_busy = False
+                    while channel.get_busy():
+                        if req['cancel'].is_set():
+                            channel.stop()
+                            break
+                        saw_busy = True
+                        time.sleep(0.01)
+
+                    # If busy never flipped true (rare race right after play),
+                    # fall back to duration-based waiting before reporting done.
+                    if not saw_busy and not req['cancel'].is_set():
+                        grace_end = start_t + duration + 0.05 if duration > 0 else start_t + 0.2
+                        while time.monotonic() < grace_end:
+                            if req['cancel'].is_set():
+                                channel.stop()
+                                break
+                            if channel.get_busy():
+                                saw_busy = True
+                                break
+                            time.sleep(0.01)
+
+                        if saw_busy and not req['cancel'].is_set():
+                            while channel.get_busy():
+                                if req['cancel'].is_set():
+                                    channel.stop()
+                                    break
+                                time.sleep(0.01)
+
+                    req['ok'] = not req['cancel'].is_set()
+            except Exception as e:
+                req['ok'] = False
+                req['error'] = e
+            finally:
+                req['done'].set()
+                with self._pygame_lock:
+                    if self._pygame_current_request is req:
+                        self._pygame_current_request = None
+                self._pygame_queue.task_done()
+
+    def _pygame_play_sync(self, wav_path):
+        """Play a WAV on the pygame worker and block until complete or canceled."""
+        done = threading.Event()
+        cancel = threading.Event()
+        req = {
+            'id': None,
+            'wav_path': wav_path,
+            'done': done,
+            'cancel': cancel,
+            'ok': False,
+            'error': None,
+        }
+
+        # Preempt active or queued playback so the newest request starts next.
+        self._cancel_current_pygame_request()
+        while True:
+            try:
+                stale = self._pygame_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if stale is not None:
+                    stale['cancel'].set()
+                    stale['ok'] = False
+                    stale['done'].set()
+            except Exception:
+                pass
+            finally:
+                self._pygame_queue.task_done()
+
+        with self._pygame_lock:
+            self._pygame_request_seq += 1
+            req['id'] = self._pygame_request_seq
+            self._pygame_current_request = req
+
+        self._pygame_queue.put(req)
+
+        while not done.wait(0.05):
+            if self._piper_stop_requested:
+                cancel.set()
+                self._stop_pygame_now()
+                break
+
+        if req['error']:
+            print(f"[WARN] pygame playback failed: {req['error']}")
+        return bool(req['ok'])
+
     def stop_speaking(self):
         """Stop the ongoing speech immediately."""
         # Stop both SAPI and UWP playback
@@ -2763,6 +2900,7 @@ class GameTextReader:
             self._piper_stop_requested = True
             self._pause_requested = False
             self._mci_command = None
+            self._cancel_current_pygame_request()
             try:
                 import ctypes
                 _alias = getattr(self, '_mci_alias', None) or 'gtrsnd'
