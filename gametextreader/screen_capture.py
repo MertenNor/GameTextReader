@@ -4,7 +4,7 @@ Screen capture functions for capturing game text areas
 import ctypes
 import sys
 import pyautogui
-from PIL import Image
+from PIL import Image, ImageGrab
 if sys.platform.startswith('win'):
     import win32con
     import win32gui
@@ -278,43 +278,68 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         except Exception as e:
             print(f"Error in PrintWindow capture: {e}")
             # Fall through to normal BitBlt method
-
-    # Normal BitBlt method (fallback or default)
-    # Get DC from entire virtual screen
-    hwin = win32gui.GetDesktopWindow()
-    hwindc = win32gui.GetWindowDC(hwin)
-    memdc = None
-    bmp = None
-    try:
-        srcdc = win32ui.CreateDCFromHandle(hwindc)
-        memdc = srcdc.CreateCompatibleDC()
-
-        # Create bitmap for capture area
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(srcdc, width, height)
-        memdc.SelectObject(bmp)
-
-        # Copy screen into bitmap
-        memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
-
-        # Convert bitmap to PIL Image
-        bmpinfo = bmp.GetInfo()
-        bmpstr = bmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1
-        )
-
-        return img
-    finally:
-        # Always clean up resources
+    if sys.platform.startswith('win'):
+        # Normal BitBlt method (fallback or default)
+        # Get DC from entire virtual screen
+        hwin = win32gui.GetDesktopWindow()
+        hwindc = win32gui.GetWindowDC(hwin)
+        memdc = None
+        bmp = None
         try:
-            if memdc:
-                memdc.DeleteDC()
-            if bmp:
-                win32gui.DeleteObject(bmp.GetHandle())
-            win32gui.ReleaseDC(hwin, hwindc)
-        except Exception:
-            pass
+            srcdc = win32ui.CreateDCFromHandle(hwindc)
+            memdc = srcdc.CreateCompatibleDC()
 
+            # Create bitmap for capture area
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(srcdc, width, height)
+            memdc.SelectObject(bmp)
+
+            # Copy screen into bitmap
+            memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
+
+            # Convert bitmap to PIL Image
+            bmpinfo = bmp.GetInfo()
+            bmpstr = bmp.GetBitmapBits(True)
+            img = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1
+            )
+
+            return img
+        finally:
+            # Always clean up resources
+            try:
+                if memdc:
+                    memdc.DeleteDC()
+                if bmp:
+                    win32gui.DeleteObject(bmp.GetHandle())
+                win32gui.ReleaseDC(hwin, hwindc)
+            except Exception:
+                pass
+
+    # This doesn't work right now due to a bug in PyAutoGUI PIL dependency checks
+    # try:
+    #     import pyautogui
+    #     img = pyautogui.screenshot(region=(int(x1), int(y1), int(width), int(height)))
+    #     if img and img.mode != 'RGB':
+    #         img = img.convert('RGB')
+    #     if img:
+    #         return img
+    # except Exception as e:
+    #     print(f"PyAutoGUI capture failed, falling back to Win32 capture: {e}")
+
+    try:
+        img = ImageGrab.grab(
+            bbox=(int(x1), int(y1), int(x2), int(y2)),
+            all_screens=True
+        )
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            img.save("debug_screenshot_rgb.png")  # Save for debugging
+        return img
+    except Exception as e:
+        print(f"ImageGrab fallback capture failed: {e}")
+
+    # Final safety fallback
+    return Image.new('RGB', (max(1, width), max(1, height)))
