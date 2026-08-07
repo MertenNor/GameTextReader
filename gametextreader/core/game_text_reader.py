@@ -312,6 +312,11 @@ class GameTextReader:
         self.pause_hotkey_button = type('Button', (), {})()
         self.pause_hotkey_button.mock_button = None  # Will be created when hotkey is set
         self.pause_hotkey_button.config = lambda **kwargs: None  # Dummy config method
+
+        # Prevent nested resize handler re-entry from <Configure> cascades.
+        self._resize_window_in_progress = False
+        self._resize_window_pending = False
+        self._resize_window_pending_force = False
         
         # Don't set initial geometry here - let it be calculated after GUI setup
         # self.root.geometry("1115x260")  # Initial window size (height reduced for less vertical tallness)
@@ -10062,283 +10067,300 @@ class GameTextReader:
     def resize_window(self, force: bool = False):
         """Resize the window based on current content.
         If force is True, actively set the window geometry to fit the content (used after loading a layout)."""
-        # Ensure positions/sizes are current
-        self.root.update_idletasks()
+        # resize_window() is called from many <Configure> bindings. The body also
+        # changes widget/canvas sizes, which can trigger more <Configure> events.
+        # Guard against re-entrant calls to avoid unbounded recursive callback stacks.
+        if self._resize_window_in_progress:
+            self._resize_window_pending = True
+            self._resize_window_pending_force = self._resize_window_pending_force or force
+            return
 
-        # Dynamically compute the non-scrollable portion height (everything above the areas canvas)
-        # This includes the Auto Read section, so we need to account for it separately
+        self._resize_window_in_progress = True
         try:
-            base_top = self.area_canvas.winfo_rooty() - self.root.winfo_rooty()
-            # Ensure base_top is not negative (can happen during initialization)
-            if base_top < 0:
-                base_top = 210  # Use safe default
-        except Exception:
-            base_top = 210
-        # base_height represents the Y position of area_canvas, which includes Auto Read section above it
-        # We'll calculate the actual base (non-Auto Read) height separately
-        base_height = max(150, base_top + 20)  # add small bottom margin
-        min_width = 850
-        max_width = 1000
-        area_frame_height = 0
-        if len(self.areas) > 0:
-            self.area_frame.update_idletasks()
-            area_frame_height = self.area_frame.winfo_height()
-        # Determine total height needed for all current areas
-        area_row_height = 60  # Approx row height (for fallback)
-        # Count only non-Auto Read areas for the scroll field calculation
-        num_scroll_areas = 0
-        for area in self.areas:
-            if len(area) >= 9:
-                area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
-            else:
-                area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
-            area_name = area_name_var.get()
-            if not area_name.startswith("Auto Read"):
-                num_scroll_areas += 1
-        content_height = area_frame_height if area_frame_height > 0 else num_scroll_areas * area_row_height
-        
-        # Calculate Auto Read canvas height to include in total window height
-        # This will be recalculated and applied later in the Auto Read scrolling section
-        auto_read_canvas_height = 0
-        auto_read_count = 0
-        auto_read_frame_height = 0
-        auto_read_row_height = 60  # Approx row height for Auto Read areas
-        
-        if hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+        # Ensure positions/sizes are current
+            self.root.update_idletasks()
+
+            # Dynamically compute the non-scrollable portion height (everything above the areas canvas)
+            # This includes the Auto Read section, so we need to account for it separately
             try:
-                # Count Auto Read areas
-                for area in self.areas:
-                    if len(area) >= 9:
-                        area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
-                    else:
-                        area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
-                    area_name = area_name_var.get()
-                    if area_name.startswith("Auto Read"):
-                        auto_read_count += 1
+                base_top = self.area_canvas.winfo_rooty() - self.root.winfo_rooty()
+                # Ensure base_top is not negative (can happen during initialization)
+                if base_top < 0:
+                    base_top = 210  # Use safe default
+            except Exception:
+                base_top = 210
+            # base_height represents the Y position of area_canvas, which includes Auto Read section above it
+            # We'll calculate the actual base (non-Auto Read) height separately
+            base_height = max(150, base_top + 20)  # add small bottom margin
+            min_width = 850
+            max_width = 1000
+            area_frame_height = 0
+            if len(self.areas) > 0:
+                self.area_frame.update_idletasks()
+                area_frame_height = self.area_frame.winfo_height()
+            # Determine total height needed for all current areas
+            area_row_height = 60  # Approx row height (for fallback)
+            # Count only non-Auto Read areas for the scroll field calculation
+            num_scroll_areas = 0
+            for area in self.areas:
+                if len(area) >= 9:
+                    area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                else:
+                    area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                area_name = area_name_var.get()
+                if not area_name.startswith("Auto Read"):
+                    num_scroll_areas += 1
+            content_height = area_frame_height if area_frame_height > 0 else num_scroll_areas * area_row_height
+        
+            # Calculate Auto Read canvas height to include in total window height
+            # This will be recalculated and applied later in the Auto Read scrolling section
+            auto_read_canvas_height = 0
+            auto_read_count = 0
+            auto_read_frame_height = 0
+            auto_read_row_height = 60  # Approx row height for Auto Read areas
+        
+            if hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+                try:
+                    # Count Auto Read areas
+                    for area in self.areas:
+                        if len(area) >= 9:
+                            area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                        else:
+                            area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                        area_name = area_name_var.get()
+                        if area_name.startswith("Auto Read"):
+                            auto_read_count += 1
                 
-                # Get frame height after ensuring it's updated
+                    # Get frame height after ensuring it's updated
+                    self.auto_read_frame.update_idletasks()
+                    auto_read_frame_height = self.auto_read_frame.winfo_height()
+                
+                    auto_read_show_scroll = auto_read_count >= 4
+                
+                    if auto_read_show_scroll:
+                        # Show exactly 4 rows when scrolling is active
+                        # Use actual measured height per row if available, otherwise use estimate
+                        if auto_read_frame_height > 0 and auto_read_count > 0:
+                            # Calculate actual height per row
+                            actual_row_height = auto_read_frame_height / auto_read_count
+                            # Use 4 rows
+                            auto_read_canvas_height = int(4 * actual_row_height)
+                        else:
+                            # Fallback: use 4 rows estimate
+                            auto_read_canvas_height = 4 * auto_read_row_height
+                    else:
+                        # All Auto Read content fits
+                        if auto_read_frame_height > 0:
+                            auto_read_canvas_height = max(auto_read_frame_height, auto_read_row_height)
+                        else:
+                            auto_read_canvas_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+                except Exception:
+                    auto_read_canvas_height = 0
+        
+            # base_top is the Y position of area_canvas, which already accounts for everything above it
+            # including the Auto Read section. base_height = base_top + 20 (with minimum of 150).
+            # We need to ensure the window is tall enough for:
+            # - Everything up to area_canvas (base_height, which includes Auto Read section)
+            # - The regular areas content (content_height)
+            # But we also need to verify the Auto Read section has enough space.
+        
+            # Calculate total height: base_height already includes space up to area_canvas
+            # However, base_height might not account for the actual Auto Read canvas height if it grew,
+            # so we need to ensure we have enough space for Auto Read + regular areas
+        
+            # Get the actual position of area_canvas to calculate properly
+            # base_height = max(150, base_top + 20) ensures minimum, but base_top should reflect Auto Read growth
+            # If Auto Read canvas exists and has height, ensure we account for it
+            if hasattr(self, 'auto_read_canvas') and auto_read_canvas_height > 0:
+                # Get position of Auto Read section
+                try:
+                    auto_read_top = self.auto_read_outer_frame.winfo_rooty() - self.root.winfo_rooty()
+                except Exception:
+                    auto_read_top = 0
+            
+                if auto_read_top > 0:
+                    # Calculate: space to Auto Read + Auto Read height + space to regular areas + regular areas
+                    # space_to_regular = base_top - (auto_read_top + auto_read_canvas_height)
+                    # But base_top might not be accurate yet, so use base_height as fallback
+                    # Total = auto_read_top + auto_read_canvas_height + space_between + content_height + margin
+                    # Where space_between includes separator and button
+                    auto_read_bottom = auto_read_top + auto_read_canvas_height
+                    if base_top > auto_read_bottom:
+                        space_between = base_top - auto_read_bottom
+                    else:
+                        # base_top might not be updated yet, use a reasonable estimate
+                        space_between = 30  # separator + button area
+                    space_between = max(30, space_between)  # Ensure minimum space
+                    total_height_unconstrained = auto_read_top + auto_read_canvas_height + space_between + content_height + 20
+                else:
+                    # Fallback: use base_height which should account for Auto Read
+                    total_height_unconstrained = base_height + content_height
+            else:
+                # No Auto Read or no height yet, use base_height
+                total_height_unconstrained = base_height + content_height
+        
+            # Add separator height to total (separator is after area_outer_frame)
+            separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+            total_height_unconstrained += separator_height_estimate
+        
+            # Ensure total_height is always positive and reasonable
+            # If calculation resulted in invalid value, use safe fallback
+            if total_height_unconstrained < 250:
+                # Something went wrong with the calculation, use safe defaults
+                total_height = max(base_height + content_height + auto_read_canvas_height + 20, 250)
+            else:
+                total_height = total_height_unconstrained
+            # Screen-constrained maximum height
+            try:
+                screen_h = self.root.winfo_screenheight()
+            except Exception:
+                screen_h = 1000
+            vertical_margin = 140  # Keep some space from screen edges
+            max_allowed_height = max(300, screen_h - vertical_margin)
+            # Decide if scrollbar should be shown either due to screen limit or explicit row limit (>9)
+            show_scroll_due_to_count = num_scroll_areas > 5
+            show_scroll_due_to_screen = total_height_unconstrained > max_allowed_height
+            show_scroll = show_scroll_due_to_count or show_scroll_due_to_screen
+
+            # Compute target height of the window
+            # Note: separator height is already included in total_height_unconstrained
+            if show_scroll_due_to_count:
+                # Cap visible rows to 5 when there are more than 9 areas
+                visible_rows = 5
+                # Do not grow the window further when crossing the threshold; keep current height or smaller cap
+                cur_h_for_cap = self.root.winfo_height()
+                # Include separator height estimate in the calculation
+                separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+                desired_height_cap = min(base_height + visible_rows * area_row_height + separator_height_estimate, max_allowed_height)
+                target_height = min(cur_h_for_cap, desired_height_cap)
+            else:
+                # Otherwise try to fit all content within the screen
+                # total_height_unconstrained already includes separator height
+                target_height = min(total_height_unconstrained, max_allowed_height)
+        
+            # Determine the widest area
+            widest = min_width
+            for area in self.areas:
+                frame = area[0]
+                frame.update_idletasks()
+                frame_left = frame.winfo_rootx()
+                farthest_right = frame_left
+                for child in frame.winfo_children():
+                    child.update_idletasks()
+                    child_right = child.winfo_rootx() + child.winfo_width()
+                    if child_right > farthest_right:
+                        farthest_right = child_right
+                area_width = farthest_right - frame_left
+                if area_width > widest:
+                    widest = area_width
+            widest += 60
+                                                                        
+                 
+            window_width = max(min_width, min(max_width, widest))        
+        
+            # Apply scrollbar logic based on whether all content fits vertically
+            if hasattr(self, 'area_scrollbar') and hasattr(self, 'area_canvas'):
+                if show_scroll:
+                    # Need scrolling
+                    self.area_scrollbar.pack(side='right', fill='y')
+                    self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
+                    if show_scroll_due_to_count:
+                        canvas_height = max(100, min(target_height - base_height, 5 * area_row_height))
+                    else:
+                        canvas_height = max(100, target_height - base_height)
+                    self.area_canvas.config(height=canvas_height)
+                    # Add extra height to ensure separator is visible when scrollbar appears
+                    if hasattr(self, 'area_separator'):
+                        self.area_separator.lift()
+                        # Increase target_height by 10px to ensure separator is visible
+                        target_height = min(target_height + 5, max_allowed_height)
+                else:
+                    # All content fits; no scrollbar
+                    self.area_scrollbar.pack_forget()
+                    # Expand canvas to show all content when it fits
+                    self.area_canvas.config(height=area_frame_height)
+                    # Ensure separator is visible
+                    if hasattr(self, 'area_separator'):
+                        self.area_separator.lift()
+        
+            # Handle Auto Read area scrolling - show scrollbar when there are more than 4 Auto Read areas
+            # Reuse the values calculated above to ensure consistency
+            if hasattr(self, 'auto_read_scrollbar') and hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+                # Recalculate frame height to ensure it's current
                 self.auto_read_frame.update_idletasks()
                 auto_read_frame_height = self.auto_read_frame.winfo_height()
-                
+            
+                # Recalculate scroll status and canvas height
                 auto_read_show_scroll = auto_read_count >= 4
-                
+            
                 if auto_read_show_scroll:
+                    # Need scrolling for Auto Read areas
+                    self.auto_read_scrollbar.pack(side='right', fill='y')
+                    self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
                     # Show exactly 4 rows when scrolling is active
-                    # Use actual measured height per row if available, otherwise use estimate
                     if auto_read_frame_height > 0 and auto_read_count > 0:
                         # Calculate actual height per row
                         actual_row_height = auto_read_frame_height / auto_read_count
                         # Use 4 rows
-                        auto_read_canvas_height = int(4 * actual_row_height)
+                        calculated_height = int(4 * actual_row_height)
                     else:
                         # Fallback: use 4 rows estimate
-                        auto_read_canvas_height = 4 * auto_read_row_height
+                        calculated_height = 4 * auto_read_row_height
+                    self.auto_read_canvas.config(height=calculated_height)
+                    auto_read_canvas_height = calculated_height  # Update for consistency
+                    # Update scroll region and ensure inner frame width matches canvas
+                    self.root.update_idletasks()
+                    canvas_width = self.auto_read_canvas.winfo_width()
+                    if canvas_width > 1:
+                        self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                    self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
                 else:
-                    # All Auto Read content fits
+                    # All Auto Read content fits; no scrollbar
+                    self.auto_read_scrollbar.pack_forget()
+                    # Expand canvas to show all content when it fits
+                    # Use the same calculated height from above for consistency
                     if auto_read_frame_height > 0:
-                        auto_read_canvas_height = max(auto_read_frame_height, auto_read_row_height)
+                        calculated_height = max(auto_read_frame_height, auto_read_row_height)
                     else:
-                        auto_read_canvas_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
-            except Exception:
-                auto_read_canvas_height = 0
+                        calculated_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+                    self.auto_read_canvas.config(height=calculated_height)
+                    auto_read_canvas_height = calculated_height  # Update for consistency
+                    # Update scroll region and ensure inner frame width matches canvas
+                    self.root.update_idletasks()
+                    canvas_width = self.auto_read_canvas.winfo_width()
+                    if canvas_width > 1:
+                        self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                    self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
         
-        # base_top is the Y position of area_canvas, which already accounts for everything above it
-        # including the Auto Read section. base_height = base_top + 20 (with minimum of 150).
-        # We need to ensure the window is tall enough for:
-        # - Everything up to area_canvas (base_height, which includes Auto Read section)
-        # - The regular areas content (content_height)
-        # But we also need to verify the Auto Read section has enough space.
+            # Set minimums (use a constant min width so user can resize horizontally).
+            # Ensure minimum width is sufficient to keep the single-line options from truncating.
+            min_required_width = max(min_width, 1155) #Main Window Size
+            self.root.minsize(min_required_width, 290)
         
-        # Calculate total height: base_height already includes space up to area_canvas
-        # However, base_height might not account for the actual Auto Read canvas height if it grew,
-        # so we need to ensure we have enough space for Auto Read + regular areas
-        
-        # Get the actual position of area_canvas to calculate properly
-        # base_height = max(150, base_top + 20) ensures minimum, but base_top should reflect Auto Read growth
-        # If Auto Read canvas exists and has height, ensure we account for it
-        if hasattr(self, 'auto_read_canvas') and auto_read_canvas_height > 0:
-            # Get position of Auto Read section
-            try:
-                auto_read_top = self.auto_read_outer_frame.winfo_rooty() - self.root.winfo_rooty()
-            except Exception:
-                auto_read_top = 0
-            
-            if auto_read_top > 0:
-                # Calculate: space to Auto Read + Auto Read height + space to regular areas + regular areas
-                # space_to_regular = base_top - (auto_read_top + auto_read_canvas_height)
-                # But base_top might not be accurate yet, so use base_height as fallback
-                # Total = auto_read_top + auto_read_canvas_height + space_between + content_height + margin
-                # Where space_between includes separator and button
-                auto_read_bottom = auto_read_top + auto_read_canvas_height
-                if base_top > auto_read_bottom:
-                    space_between = base_top - auto_read_bottom
-                else:
-                    # base_top might not be updated yet, use a reasonable estimate
-                    space_between = 30  # separator + button area
-                space_between = max(30, space_between)  # Ensure minimum space
-                total_height_unconstrained = auto_read_top + auto_read_canvas_height + space_between + content_height + 20
-            else:
-                # Fallback: use base_height which should account for Auto Read
-                total_height_unconstrained = base_height + content_height
-        else:
-            # No Auto Read or no height yet, use base_height
-            total_height_unconstrained = base_height + content_height
-        
-        # Add separator height to total (separator is after area_outer_frame)
-        separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
-        total_height_unconstrained += separator_height_estimate
-        
-        # Ensure total_height is always positive and reasonable
-        # If calculation resulted in invalid value, use safe fallback
-        if total_height_unconstrained < 250:
-            # Something went wrong with the calculation, use safe defaults
-            total_height = max(base_height + content_height + auto_read_canvas_height + 20, 250)
-        else:
-            total_height = total_height_unconstrained
-        # Screen-constrained maximum height
-        try:
-            screen_h = self.root.winfo_screenheight()
-        except Exception:
-            screen_h = 1000
-        vertical_margin = 140  # Keep some space from screen edges
-        max_allowed_height = max(300, screen_h - vertical_margin)
-        # Decide if scrollbar should be shown either due to screen limit or explicit row limit (>9)
-        show_scroll_due_to_count = num_scroll_areas > 5
-        show_scroll_due_to_screen = total_height_unconstrained > max_allowed_height
-        show_scroll = show_scroll_due_to_count or show_scroll_due_to_screen
-
-        # Compute target height of the window
-        # Note: separator height is already included in total_height_unconstrained
-        if show_scroll_due_to_count:
-            # Cap visible rows to 5 when there are more than 9 areas
-            visible_rows = 5
-            # Do not grow the window further when crossing the threshold; keep current height or smaller cap
-            cur_h_for_cap = self.root.winfo_height()
-            # Include separator height estimate in the calculation
-            separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
-            desired_height_cap = min(base_height + visible_rows * area_row_height + separator_height_estimate, max_allowed_height)
-            target_height = min(cur_h_for_cap, desired_height_cap)
-        else:
-            # Otherwise try to fit all content within the screen
-            # total_height_unconstrained already includes separator height
-            target_height = min(total_height_unconstrained, max_allowed_height)
-        
-        # Determine the widest area
-        widest = min_width
-        for area in self.areas:
-            frame = area[0]
-            frame.update_idletasks()
-            frame_left = frame.winfo_rootx()
-            farthest_right = frame_left
-            for child in frame.winfo_children():
-                child.update_idletasks()
-                child_right = child.winfo_rootx() + child.winfo_width()
-                if child_right > farthest_right:
-                    farthest_right = child_right
-            area_width = farthest_right - frame_left
-            if area_width > widest:
-                widest = area_width
-        widest += 60
-                                                                        
-                 
-        window_width = max(min_width, min(max_width, widest))        
-        
-        # Apply scrollbar logic based on whether all content fits vertically
-        if hasattr(self, 'area_scrollbar') and hasattr(self, 'area_canvas'):
-            if show_scroll:
-                # Need scrolling
-                self.area_scrollbar.pack(side='right', fill='y')
-                self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
-                if show_scroll_due_to_count:
-                    canvas_height = max(100, min(target_height - base_height, 5 * area_row_height))
-                else:
-                    canvas_height = max(100, target_height - base_height)
-                self.area_canvas.config(height=canvas_height)
-                # Add extra height to ensure separator is visible when scrollbar appears
-                if hasattr(self, 'area_separator'):
-                    self.area_separator.lift()
-                    # Increase target_height by 10px to ensure separator is visible
-                    target_height = min(target_height + 5, max_allowed_height)
-            else:
-                # All content fits; no scrollbar
-                self.area_scrollbar.pack_forget()
-                # Expand canvas to show all content when it fits
-                self.area_canvas.config(height=area_frame_height)
-                # Ensure separator is visible
-                if hasattr(self, 'area_separator'):
-                    self.area_separator.lift()
-        
-        # Handle Auto Read area scrolling - show scrollbar when there are more than 4 Auto Read areas
-        # Reuse the values calculated above to ensure consistency
-        if hasattr(self, 'auto_read_scrollbar') and hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
-            # Recalculate frame height to ensure it's current
-            self.auto_read_frame.update_idletasks()
-            auto_read_frame_height = self.auto_read_frame.winfo_height()
-            
-            # Recalculate scroll status and canvas height
-            auto_read_show_scroll = auto_read_count >= 4
-            
-            if auto_read_show_scroll:
-                # Need scrolling for Auto Read areas
-                self.auto_read_scrollbar.pack(side='right', fill='y')
-                self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
-                # Show exactly 4 rows when scrolling is active
-                if auto_read_frame_height > 0 and auto_read_count > 0:
-                    # Calculate actual height per row
-                    actual_row_height = auto_read_frame_height / auto_read_count
-                    # Use 4 rows
-                    calculated_height = int(4 * actual_row_height)
-                else:
-                    # Fallback: use 4 rows estimate
-                    calculated_height = 4 * auto_read_row_height
-                self.auto_read_canvas.config(height=calculated_height)
-                auto_read_canvas_height = calculated_height  # Update for consistency
-                # Update scroll region and ensure inner frame width matches canvas
+            # Optionally force window geometry (used when loading a layout)
+            cur_width = self.root.winfo_width()
+            cur_height = self.root.winfo_height()
+            if force:
+                # To ensure Tk applies the new size reliably even when shrinking, call geometry twice
+                self.root.geometry(f"{window_width}x{target_height}")
                 self.root.update_idletasks()
-                canvas_width = self.auto_read_canvas.winfo_width()
-                if canvas_width > 1:
-                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
-                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
-            else:
-                # All Auto Read content fits; no scrollbar
-                self.auto_read_scrollbar.pack_forget()
-                # Expand canvas to show all content when it fits
-                # Use the same calculated height from above for consistency
-                if auto_read_frame_height > 0:
-                    calculated_height = max(auto_read_frame_height, auto_read_row_height)
-                else:
-                    calculated_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
-                self.auto_read_canvas.config(height=calculated_height)
-                auto_read_canvas_height = calculated_height  # Update for consistency
-                # Update scroll region and ensure inner frame width matches canvas
-                self.root.update_idletasks()
-                canvas_width = self.auto_read_canvas.winfo_width()
-                if canvas_width > 1:
-                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
-                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
-        
-        # Set minimums (use a constant min width so user can resize horizontally).
-        # Ensure minimum width is sufficient to keep the single-line options from truncating.
-        min_required_width = max(min_width, 1155) #Main Window Size
-        self.root.minsize(min_required_width, 290)
-        
-        # Optionally force window geometry (used when loading a layout)
-        cur_width = self.root.winfo_width()
-        cur_height = self.root.winfo_height()
-        if force:
-            # To ensure Tk applies the new size reliably even when shrinking, call geometry twice
-            self.root.geometry(f"{window_width}x{target_height}")
-            self.root.update_idletasks()
-            self.root.geometry(f"{window_width}x{target_height}")
+                self.root.geometry(f"{window_width}x{target_height}")
 
-        self.root.update_idletasks()  # Ensure geometry is applied
+            self.root.update_idletasks()  # Ensure geometry is applied
         
-        # Ensure separator is always visible on top
-        if hasattr(self, 'area_separator'):
-            self.area_separator.lift()
+            # Ensure separator is always visible on top
+            if hasattr(self, 'area_separator'):
+                self.area_separator.lift()
         
-        # Ensure window position keeps buttons visible after resize
-        self._ensure_window_position()
+            # Ensure window position keeps buttons visible after resize
+            self._ensure_window_position()
+        finally:
+            self._resize_window_in_progress = False
+            if self._resize_window_pending:
+                pending_force = self._resize_window_pending_force
+                self._resize_window_pending = False
+                self._resize_window_pending_force = False
+                self.root.after_idle(lambda: self.resize_window(force=pending_force))
 
     def edit_areas(self):
         """Open the edit areas screen. Finds the first non-Auto Read area to use for the edit screen."""
