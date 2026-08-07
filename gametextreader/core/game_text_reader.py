@@ -5189,12 +5189,6 @@ class GameTextReader:
         banner_check = tk.Checkbutton(options_frame, text="Banner", variable=self.master_hotkey_banner_var)
         banner_check.pack(side='top', anchor='w', pady=0)
         
-        save_button = tk.Button(buttons_frame, text="💾 Save Layout", command=self.save_layout)
-        save_button.pack(side='left', padx=5)
-        
-        load_button = tk.Button(buttons_frame, text="📁 Load Layout..", command=self.load_layout)
-        load_button.pack(side='left', padx=5)
-        
         program_saves_button = tk.Button(buttons_frame, text="📁 Datafolder", 
                                        command=self.open_game_reader_folder)
         program_saves_button.pack(side='left', padx=5)
@@ -5239,6 +5233,12 @@ class GameTextReader:
             # Fallback for older Tk versions
             self.layout_file.trace('w', _refresh_layout_label)
         _refresh_layout_label()
+
+        save_button = tk.Button(layout_frame, text="💾 Save Layout", command=self.save_layout)
+        save_button.pack(side='left', padx=5)
+        
+        load_button = tk.Button(layout_frame, text="📁 Load Layout..", command=self.load_layout)
+        load_button.pack(side='left', padx=5)
         
         # Additional Options button
         additional_options_button = tk.Button(buttons_right_frame, text="⚙ Additional Options", 
@@ -9654,7 +9654,7 @@ class GameTextReader:
         area_frame = tk.Frame(parent_container)
         area_frame.pack(pady=(4, 0), anchor='center')
         area_name_var = tk.StringVar(value=area_name)
-        area_name_label = tk.Label(area_frame, textvariable=area_name_var)
+        area_name_label = tk.Label(area_frame, textvariable=area_name_var, width=16, relief="solid", borderwidth=2)
         area_name_label.pack(side="left")
         
         # Add separator after area name
@@ -9664,7 +9664,7 @@ class GameTextReader:
         freeze_screen_var = None
         if is_auto_read:
             freeze_screen_var = tk.BooleanVar(value=False)
-            freeze_screen_checkbox = tk.Checkbutton(area_frame, text="Freez\nScreen", variable=freeze_screen_var)
+            freeze_screen_checkbox = tk.Checkbutton(area_frame, text="Freeze\nScreen", variable=freeze_screen_var)
             freeze_screen_checkbox.pack(side="left")
             # Track freeze screen checkbox changes to mark as unsaved
             def on_freeze_screen_change(*args):
@@ -9702,26 +9702,10 @@ class GameTextReader:
         set_area_button = None
 
         # Always add hotkey button for all areas, including Auto Read
-        hotkey_button = tk.Button(area_frame, text="Set Hotkey")
+        hotkey_button = tk.Button(area_frame, text="Set Hotkey", width=12)
         hotkey_button.config(command=lambda: self.set_hotkey(hotkey_button, area_frame))
         hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(hotkey_button, area_frame, e))
         hotkey_button.pack(side="left")
-        
-        # Add separator
-        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
-        
-        # Add Img. Processing button with checkbox
-        customize_button = tk.Button(area_frame, text="Img. Processing...", command=partial(self.customize_processing, area_name_var))
-        customize_button.pack(side="left")
-        tk.Label(area_frame, text=" Enable:").pack(side="left")  # Label for the checkbox
-        preprocess_var = tk.BooleanVar()
-        preprocess_checkbox = tk.Checkbutton(area_frame, variable=preprocess_var)
-        preprocess_checkbox.pack(side="left")
-        # Track preprocess checkbox changes to mark as unsaved
-        def on_preprocess_change(*args):
-            area_name = area_name_var.get()
-            self._set_unsaved_changes('area_settings', area_name)
-        preprocess_var.trace('w', on_preprocess_change)
         
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
@@ -9762,7 +9746,7 @@ class GameTextReader:
         )
         # Set a fixed width to prevent layout issues when voice names change
         # This ensures the dropdown doesn't change size and push other elements around
-        voice_menu.config(width=40)  # Fixed width that can accommodate most voice names
+        voice_menu.config(width=35)  # Fixed width that can accommodate most voice names
 
         # Configure the OptionMenu to display text left-aligned instead of centered
         # This prevents long names from being cut off on the sides
@@ -9775,27 +9759,51 @@ class GameTextReader:
         voice_menu.pack(side="left")
 
         self._bind_voice_menu_hover_preview(area_frame, voice_menu)
-        
 
-
-        
-
-        
-
-        
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
         speed_var = tk.StringVar(value="100")
-        tk.Label(area_frame, text="Reading Speed % :").pack(side="left")
+        tk.Label(area_frame, text="Speed(%):").pack(side="left")
         vcmd = (self.root.register(lambda P: self.validate_numeric_input(P, is_speed=True)), '%P')
-        speed_entry = tk.Entry(area_frame, textvariable=speed_var, width=5, validate='all', validatecommand=vcmd)
+        speed_entry = tk.Spinbox(area_frame,
+            textvariable=speed_var,
+            width=4,
+            from_=10,
+            to=500,
+            increment=5,
+            validate='all',
+            validatecommand=vcmd)
         speed_entry.pack(side="left")
         # Track speed changes to mark as unsaved
         def on_speed_change(*args):
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
         speed_var.trace('w', on_speed_change)
+
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+        
+        # Add Img. Processing button with checkbox
+        customize_button = tk.Button(area_frame, text="OCR Pre-Processing", command=partial(self.customize_processing, area_name_var))
+        customize_button.pack(side="left")
+
+        # Button to toggle preprocessing on/off
+        preprocess_var = tk.BooleanVar()
+        preprocess_checkbox = tk.Checkbutton(area_frame,
+            text="Enable",
+            variable=preprocess_var,
+            selectcolor="#4CAF50",
+            width=7,
+            indicatoron=False)
+        preprocess_checkbox.pack(side="left")
+
+        # Track preprocess checkbox changes to mark as unsaved
+        def on_preprocess_change(*args):
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        preprocess_var.trace('w', on_preprocess_change)
+
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
         
@@ -9834,17 +9842,26 @@ class GameTextReader:
             command=on_psm_selection
         )
         # Set a fixed width to prevent layout issues
-        psm_menu.config(width=8)
+        psm_menu.config(width=20)
         # Configure the OptionMenu to display text left-aligned instead of centered
         psm_menu.config(anchor="w")  # "w" = west (left-aligned)
+        # Disable PSM menu if not using Tesseract
+        if self.ocr_backend_var.get() != "Tesseract":
+            psm_menu.config(state="disabled")
         psm_menu.pack(side="left")
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
         if removable or is_auto_read:
             # Add Remove Area button for all removable areas (including Auto Read areas)
-            remove_area_button = tk.Button(area_frame, text="Remove Area", command=lambda: self.remove_area(area_frame, area_name_var.get()))
-            remove_area_button.pack(side="left")
+            remove_area_button = tk.Button(
+                area_frame,
+                text="❌ Remove",
+                command=lambda: self.remove_area(area_frame, area_name_var.get()),
+                font=("Helvetica", 9),
+                fg="red"
+            )
+            remove_area_button.pack(side='left')
             # Add separator
             tk.Label(area_frame, text="").pack(side="left")  # No symbol for last separator; empty label
         else:
