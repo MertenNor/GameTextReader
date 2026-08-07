@@ -2667,11 +2667,24 @@ class GameTextReader:
             self.status_label.config(text='No voices available for preview generation', fg='orange')
             return
 
+        previous_auto_preview = False
+        if getattr(self, 'voice_preview_auto_var', None):
+            try:
+                previous_auto_preview = bool(self.voice_preview_auto_var.get())
+            except Exception:
+                previous_auto_preview = False
+
         self._preview_generation_running = True
         if hasattr(self, 'generate_previews_button'):
             self.generate_previews_button.config(state=tk.DISABLED, text='Generating...')
+        if hasattr(self, 'selection_previews_checkbutton'):
+            self.selection_previews_checkbutton.config(state=tk.DISABLED)
+            self.selection_previews_checkbutton.pack_forget()
+        if getattr(self, 'voice_preview_auto_var', None):
+            self.voice_preview_auto_var.set(False)
         if hasattr(self, 'preview_generation_progress'):
             self.preview_generation_progress.config(mode='determinate', maximum=total, value=0)
+            self.preview_generation_progress.pack(side='left', padx=(8, 0), before=self.hotkey_status_label)
         self.status_label.config(text=f'Generating previews: 0/{total}', fg='black')
 
         def _update_progress(done_count):
@@ -2683,6 +2696,13 @@ class GameTextReader:
             self._preview_generation_running = False
             if hasattr(self, 'generate_previews_button'):
                 self.generate_previews_button.config(state=tk.NORMAL, text='Generate Previews')
+            if hasattr(self, 'preview_generation_progress'):
+                self.preview_generation_progress.pack_forget()
+            if getattr(self, 'voice_preview_auto_var', None):
+                self.voice_preview_auto_var.set(previous_auto_preview)
+            if hasattr(self, 'selection_previews_checkbutton'):
+                self.selection_previews_checkbutton.pack(side='left', padx=(8, 0), before=self.hotkey_status_label)
+                self.selection_previews_checkbutton.config(state=tk.NORMAL)
             if saved:
                 msg = f'Generated {saved}/{total} preview file(s)'
                 if failed:
@@ -2694,22 +2714,25 @@ class GameTextReader:
         def _worker():
             saved = 0
             failed = 0
-            preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
-            os.makedirs(preview_dir, exist_ok=True)
+            try:
+                preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
+                os.makedirs(preview_dir, exist_ok=True)
 
-            for idx, (display_name, full_name) in enumerate(voices_to_generate, start=1):
-                preview_text = self._build_preview_text(display_name, full_name)
-                safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(display_name or full_name or 'voice')).strip('_') or 'voice'
-                preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav")
+                for idx, (display_name, full_name) in enumerate(voices_to_generate, start=1):
+                    preview_text = self._build_preview_text(display_name, full_name)
+                    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(display_name or full_name or 'voice')).strip('_') or 'voice'
+                    preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav")
 
-                if self._save_preview_wav(preview_text, preview_path, full_name):
-                    saved += 1
-                else:
-                    failed += 1
+                    if self._save_preview_wav(preview_text, preview_path, full_name):
+                        saved += 1
+                    else:
+                        failed += 1
 
-                self.root.after(0, lambda count=idx: _update_progress(count))
-
-            self.root.after(0, lambda: _finish(saved, failed))
+                    self.root.after(0, lambda count=idx: _update_progress(count))
+            except Exception as e:
+                print(f"[WARNING] Preview generation failed: {e}")
+            finally:
+                self.root.after(0, lambda: _finish(saved, failed))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -5114,8 +5137,12 @@ class GameTextReader:
         )
         self.generate_previews_button.pack(side='left', padx=(8, 0))
 
-        tk.Checkbutton(volume_frame, text="Selection Previews",
-                   variable=self.voice_preview_auto_var).pack(side='left', padx=(8, 0))
+        self.selection_previews_checkbutton = tk.Checkbutton(
+            volume_frame,
+            text="Selection Previews",
+            variable=self.voice_preview_auto_var
+        )
+        self.selection_previews_checkbutton.pack(side='left', padx=(8, 0))
 
         self.preview_generation_progress = ttk.Progressbar(
             volume_frame,
@@ -5126,6 +5153,7 @@ class GameTextReader:
             value=0
         )
         self.preview_generation_progress.pack(side='left', padx=(8, 0))
+        self.preview_generation_progress.pack_forget()
 
         # Hotkey status/Area notification label (moved here from left side, right of volume)
         self.hotkey_status_label = tk.Label(volume_frame, text="", font=("Helvetica", 10, "bold"), fg="red")
