@@ -15632,236 +15632,243 @@ class GameTextReader:
         except:
             print("Automations window is invalid - cannot load automations")
             return
+
+        # Suppress unsaved-change callbacks while restoring automation state.
+        # Tk variable traces fire during .set(...) and UI construction.
+        # Without this guard, save_layout_auto can run before load is complete.
+        automation_window._suspend_unsaved_tracking = True
+        try:
         
-        # Load top-level settings (freeze screen and hotkey) from layout file
-        top_level_settings = automations_data.get("top_level_settings", {})
-        if top_level_settings:
-            # Restore freeze screen checkbox
-            if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
-                automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
-            
-            # Restore detection area hotkey
-            if 'detection_area_hotkey' in top_level_settings:
-                detection_hotkey = top_level_settings['detection_area_hotkey']
-                
-                # Create a temporary frame for compatibility with hotkey system
-                temp_frame = tk.Frame()
-                temp_frame._is_automation_area_hotkey = True
-                temp_frame._automation_window = automation_window
-                
-                # Create callback for when hotkey is pressed
-                def hotkey_callback():
-                    if hasattr(automation_window.game_text_reader, 'area_selection_in_progress') and automation_window.game_text_reader.area_selection_in_progress:
-                        return
-                    automation_window.start_area_selection_for_automations()
+            # Load top-level settings (freeze screen and hotkey) from layout file
+            top_level_settings = automations_data.get("top_level_settings", {})
+            if top_level_settings:
+                # Restore freeze screen checkbox
+                if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
+                    automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
+
+                # Restore detection area hotkey
+                if 'detection_area_hotkey' in top_level_settings:
+                    detection_hotkey = top_level_settings['detection_area_hotkey']
+
+                    # Create a temporary frame for compatibility with hotkey system
+                    temp_frame = tk.Frame()
+                    temp_frame._is_automation_area_hotkey = True
+                    temp_frame._automation_window = automation_window
+
+                    # Create callback for when hotkey is pressed
+                    def hotkey_callback():
+                        if hasattr(automation_window.game_text_reader, 'area_selection_in_progress') and automation_window.game_text_reader.area_selection_in_progress:
+                            return
+                        automation_window.start_area_selection_for_automations()
+                        if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                            automation_window.set_hotkey_button._automation_callback = hotkey_callback
+
+                    # Store callback on button
                     if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                        automation_window.set_hotkey_button.hotkey = detection_hotkey
                         automation_window.set_hotkey_button._automation_callback = hotkey_callback
-                
-                # Store callback on button
-                if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
-                    automation_window.set_hotkey_button.hotkey = detection_hotkey
-                    automation_window.set_hotkey_button._automation_callback = hotkey_callback
-                    automation_window.set_hotkey_button._automation_temp_frame = temp_frame
-                    automation_window._area_selection_hotkey_callback = hotkey_callback
-                    automation_window._area_selection_hotkey_button = automation_window.set_hotkey_button
-                    
-                    # Update button display
-                    display_name = detection_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
-                    automation_window.set_hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                    
+                        automation_window.set_hotkey_button._automation_temp_frame = temp_frame
+                        automation_window._area_selection_hotkey_callback = hotkey_callback
+                        automation_window._area_selection_hotkey_button = automation_window.set_hotkey_button
+
+                        # Update button display
+                        display_name = detection_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        automation_window.set_hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+
+                        # Register the hotkey
+                        try:
+                            self.setup_hotkey(automation_window.set_hotkey_button, None)
+                        except Exception:
+                            pass
+
+            # Clear existing automations
+            automation_window.automations = []
+            automation_window.hotkey_combos = []
+
+            # Clear UI - use try/except to handle any widget access errors
+            try:
+                scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
+                if scrollable_frame:
+                    # Get children list first to avoid modification during iteration
+                    children = list(scrollable_frame.winfo_children())
+                    for widget in children:
+                        try:
+                            widget.destroy()
+                        except:
+                            pass  # Widget may already be destroyed
+            except Exception as e:
+                print(f"Error clearing automations UI: {e}")
+                # Continue anyway - we'll recreate the UI
+
+            # Load detection areas
+            detection_areas = automations_data.get("detection_areas", [])
+            for area_data in detection_areas:
+                # Get coordinates from saved data
+                saved_coords = area_data.get('image_area_coords')
+
+                # Create automation with saved data
+                automation = {
+                    'id': area_data.get('id', len(automation_window.automations)),
+                    'name': area_data.get('name', f"Detection Area: {chr(65 + len(automation_window.automations))}"),
+                    'image_area_coords': saved_coords,  # Load coordinates from saved data
+                    'reference_image': None,  # Will load from file
+                    'hotkey': area_data.get('hotkey'),
+                    'hotkey_button': None,
+                    'match_percent': tk.DoubleVar(value=area_data.get('match_percent', 80.0)),
+                    'comparison_method': tk.StringVar(value=area_data.get('comparison_method', 'SSIM')),
+                    'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
+                    'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
+                    'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
+                    'text_color': area_data.get('text_color'),
+                    'color_tolerance': tk.IntVar(value=area_data.get('color_tolerance', 30)),
+                    'timer_active': False,
+                    'timer_start_time': None,
+                    'was_matching': False,
+                    'has_triggered': False,
+                    'frame': None
+                }
+
+                # Load reference image from file
+                if file_path:
+                    layout_name = os.path.splitext(os.path.basename(file_path))[0]
+                    detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
+                    safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
+                    image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
+
+                    if os.path.exists(image_path):
+                        try:
+                            automation['reference_image'] = Image.open(image_path).copy()
+                        except Exception:
+                            pass
+                    else:
+                        pass
+
+                # Debug: Check what was loaded
+                target_area_value = automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else str(automation['target_read_area'])
+
+                automation_window.automations.append(automation)
+                automation_window.create_automation_ui(automation)
+
+                # Update preview if image was loaded
+                if automation.get('reference_image'):
+                    automation_window.update_preview(automation, automation['reference_image'])
+
+                # Update color button if text color was set
+                if automation.get('text_color'):
+                    # Update color button after UI is created
+                    def update_color_button():
+                        if automation.get('color_button'):
+                            automation['color_button'].config(bg=automation['text_color'])
+                    automation_window.root.after(100, update_color_button)
+
+                # Set up hotkey if it exists
+                if automation.get('hotkey'):
+                    automation_window.update_hotkey_display(automation)
+                    # Register the hotkey so it actually works
+                    # Create a temporary frame for compatibility with hotkey system
+                    temp_frame = tk.Frame()
+                    temp_frame._is_automation_hotkey = True
+                    temp_frame._automation_ref = automation
+                    temp_frame._automation_window = automation_window
+
+                    # Create callback for when hotkey is pressed
+                    def hotkey_callback():
+                        # When hotkey is pressed, trigger area selection for this specific automation
+                        # Use the same approach as set_automation_hotkey - trigger area selection
+                        # This will allow the user to set/update the image area for this automation
+                        automation_window.start_area_selection_for_automations()
+
+                    # Store callback in automation
+                    automation['hotkey_callback'] = hotkey_callback
+
+                    # Store callback in registry for persistence (works even when window is closed)
+                    if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
+                        automation_window.automation_callbacks_by_hotkey[automation['hotkey']] = hotkey_callback
+                    else:
+                        pass
+
+                    # Create a mock button for hotkey registration (automations don't have hotkey buttons in UI)
+                    # We'll use a simple object to hold the hotkey
+                    class MockHotkeyButton:
+                        def __init__(self, hotkey):
+                            self.hotkey = hotkey
+                            self._automation_callback = hotkey_callback
+                            self._automation_temp_frame = temp_frame
+                            self._automation_ref = automation
+
+                    mock_button = MockHotkeyButton(automation['hotkey'])
+                    automation['hotkey_button'] = mock_button
+
                     # Register the hotkey
                     try:
-                        self.setup_hotkey(automation_window.set_hotkey_button, None)
-                    except Exception:
-                        pass
-        
-        # Clear existing automations
-        automation_window.automations = []
-        automation_window.hotkey_combos = []
-        
-        # Clear UI - use try/except to handle any widget access errors
-        try:
-            scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
-            if scrollable_frame:
-                # Get children list first to avoid modification during iteration
-                children = list(scrollable_frame.winfo_children())
-                for widget in children:
-                    try:
-                        widget.destroy()
-                    except:
-                        pass  # Widget may already be destroyed
-        except Exception as e:
-            print(f"Error clearing automations UI: {e}")
-            # Continue anyway - we'll recreate the UI
-        
-        # Load detection areas
-        detection_areas = automations_data.get("detection_areas", [])
-        for area_data in detection_areas:
-            # Get coordinates from saved data
-            saved_coords = area_data.get('image_area_coords')
-            
-            # Create automation with saved data
-            automation = {
-                'id': area_data.get('id', len(automation_window.automations)),
-                'name': area_data.get('name', f"Detection Area: {chr(65 + len(automation_window.automations))}"),
-                'image_area_coords': saved_coords,  # Load coordinates from saved data
-                'reference_image': None,  # Will load from file
-                'hotkey': area_data.get('hotkey'),
-                'hotkey_button': None,
-                'match_percent': tk.DoubleVar(value=area_data.get('match_percent', 80.0)),
-                'comparison_method': tk.StringVar(value=area_data.get('comparison_method', 'SSIM')),
-                'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
-                'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
-                'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
-                'text_color': area_data.get('text_color'),
-                'color_tolerance': tk.IntVar(value=area_data.get('color_tolerance', 30)),
-                'timer_active': False,
-                'timer_start_time': None,
-                'was_matching': False,
-                'has_triggered': False,
-                'frame': None
-            }
-            
-            # Load reference image from file
-            if file_path:
-                layout_name = os.path.splitext(os.path.basename(file_path))[0]
-                detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
-                safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
-                image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
-                
-                if os.path.exists(image_path):
-                    try:
-                        automation['reference_image'] = Image.open(image_path).copy()
+                        self.setup_hotkey(mock_button, None)
                     except Exception:
                         pass
                 else:
                     pass
-            
-            # Debug: Check what was loaded
-            target_area_value = automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else str(automation['target_read_area'])
-            
-            automation_window.automations.append(automation)
-            automation_window.create_automation_ui(automation)
-            
-            # Update preview if image was loaded
-            if automation.get('reference_image'):
-                automation_window.update_preview(automation, automation['reference_image'])
-            
-            # Update color button if text color was set
-            if automation.get('text_color'):
-                # Update color button after UI is created
-                def update_color_button():
-                    if automation.get('color_button'):
-                        automation['color_button'].config(bg=automation['text_color'])
-                automation_window.root.after(100, update_color_button)
-            
-            # Set up hotkey if it exists
-            if automation.get('hotkey'):
-                automation_window.update_hotkey_display(automation)
-                # Register the hotkey so it actually works
-                # Create a temporary frame for compatibility with hotkey system
-                temp_frame = tk.Frame()
-                temp_frame._is_automation_hotkey = True
-                temp_frame._automation_ref = automation
-                temp_frame._automation_window = automation_window
-                
-                # Create callback for when hotkey is pressed
-                def hotkey_callback():
-                    # When hotkey is pressed, trigger area selection for this specific automation
-                    # Use the same approach as set_automation_hotkey - trigger area selection
-                    # This will allow the user to set/update the image area for this automation
-                    automation_window.start_area_selection_for_automations()
-                
-                # Store callback in automation
-                automation['hotkey_callback'] = hotkey_callback
-                
-                # Store callback in registry for persistence (works even when window is closed)
-                if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
-                    automation_window.automation_callbacks_by_hotkey[automation['hotkey']] = hotkey_callback
-                else:
-                    pass
-                
-                # Create a mock button for hotkey registration (automations don't have hotkey buttons in UI)
-                # We'll use a simple object to hold the hotkey
-                class MockHotkeyButton:
-                    def __init__(self, hotkey):
-                        self.hotkey = hotkey
-                        self._automation_callback = hotkey_callback
-                        self._automation_temp_frame = temp_frame
-                        self._automation_ref = automation
-                
-                mock_button = MockHotkeyButton(automation['hotkey'])
-                automation['hotkey_button'] = mock_button
-                
-                # Register the hotkey
-                try:
-                    self.setup_hotkey(mock_button, None)
-                except Exception:
-                    pass
-            else:
-                pass
-        
-        # Load hotkey combos
-        hotkey_combos = automations_data.get("hotkey_combos", [])
-        for combo_data in hotkey_combos:
-            combo = {
-                'id': combo_data.get('id', len(automation_window.hotkey_combos)),
-                'name': combo_data.get('name', f"Area Combo: {chr(65 + len(automation_window.hotkey_combos))}"),
-                'hotkey': combo_data.get('hotkey'),
-                'areas': combo_data.get('areas', []),
-                'frame': None,
-                'is_triggering': False,
-                'current_area_index': 0
-            }
-            
-            automation_window.hotkey_combos.append(combo)
-            automation_window.create_hotkey_combo_ui(combo)
-            
-            # Restore areas for the combo
-            if combo.get('areas'):
-                # Clear the areas list since create_hotkey_combo_ui might have initialized it
-                combo['areas'] = []
-                for saved_area_entry in combo_data.get('areas', []):
-                    # Add area to combo (this creates a new entry)
-                    automation_window.add_area_to_combo(combo)
-                    # Get the last added entry and set its values
-                    if combo['areas']:
-                        area_entry = combo['areas'][-1]
-                        area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
-                        area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
-                        # Ensure delay_before field exists before setting it
-                        if 'delay_before' in area_entry and hasattr(area_entry['delay_before'], 'set'):
-                            area_entry['delay_before'].set(saved_area_entry.get('delay_before', False))
-            
-            # Set hotkey if it exists
-            if combo.get('hotkey'):
-                # Find the hotkey button and set it up
-                hotkey_button = combo.get('hotkey_button')
-                if hotkey_button:
-                    hotkey_button.hotkey = combo['hotkey']
-                    # Update button display
-                    display_name = combo['hotkey'].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
-                    hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                    # Set up the hotkey through the game_text_reader
-                    # Create a temporary frame for compatibility
-                    temp_frame = tk.Frame()
-                    temp_frame._is_hotkey_combo = True
-                    temp_frame._combo_ref = combo
-                    temp_frame._combo_window = automation_window
-                    hotkey_button._combo_temp_frame = temp_frame
-                    # Set up the hotkey callback
-                    def hotkey_callback():
-                        automation_window.trigger_hotkey_combo(combo)
-                    hotkey_button._combo_callback = hotkey_callback
-                    # Register the callback in the registry
-                    automation_window.combo_callbacks_by_hotkey[combo['hotkey']] = hotkey_callback
-                    # Set up the hotkey
-                    self.setup_hotkey(hotkey_button, None)
-        
-                
-        # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
-        if automation_window:
-            automation_window._has_unsaved_changes = False
+
+            # Load hotkey combos
+            hotkey_combos = automations_data.get("hotkey_combos", [])
+            for combo_data in hotkey_combos:
+                combo = {
+                    'id': combo_data.get('id', len(automation_window.hotkey_combos)),
+                    'name': combo_data.get('name', f"Area Combo: {chr(65 + len(automation_window.hotkey_combos))}"),
+                    'hotkey': combo_data.get('hotkey'),
+                    'areas': combo_data.get('areas', []),
+                    'frame': None,
+                    'is_triggering': False,
+                    'current_area_index': 0
+                }
+
+                automation_window.hotkey_combos.append(combo)
+                automation_window.create_hotkey_combo_ui(combo)
+
+                # Restore areas for the combo
+                if combo.get('areas'):
+                    # Clear the areas list since create_hotkey_combo_ui might have initialized it
+                    combo['areas'] = []
+                    for saved_area_entry in combo_data.get('areas', []):
+                        # Add area to combo (this creates a new entry)
+                        automation_window.add_area_to_combo(combo)
+                        # Get the last added entry and set its values
+                        if combo['areas']:
+                            area_entry = combo['areas'][-1]
+                            area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
+                            area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
+                            # Ensure delay_before field exists before setting it
+                            if 'delay_before' in area_entry and hasattr(area_entry['delay_before'], 'set'):
+                                area_entry['delay_before'].set(saved_area_entry.get('delay_before', False))
+
+                # Set hotkey if it exists
+                if combo.get('hotkey'):
+                    # Find the hotkey button and set it up
+                    hotkey_button = combo.get('hotkey_button')
+                    if hotkey_button:
+                        hotkey_button.hotkey = combo['hotkey']
+                        # Update button display
+                        display_name = combo['hotkey'].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                        # Set up the hotkey through the game_text_reader
+                        # Create a temporary frame for compatibility
+                        temp_frame = tk.Frame()
+                        temp_frame._is_hotkey_combo = True
+                        temp_frame._combo_ref = combo
+                        temp_frame._combo_window = automation_window
+                        hotkey_button._combo_temp_frame = temp_frame
+                        # Set up the hotkey callback
+                        def hotkey_callback():
+                            automation_window.trigger_hotkey_combo(combo)
+                        hotkey_button._combo_callback = hotkey_callback
+                        # Register the callback in the registry
+                        automation_window.combo_callbacks_by_hotkey[combo['hotkey']] = hotkey_callback
+                        # Set up the hotkey
+                        self.setup_hotkey(hotkey_button, None)
+
+            # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
+            if automation_window:
+                automation_window._has_unsaved_changes = False
+        finally:
+            automation_window._suspend_unsaved_tracking = False
         
         # Mark as loaded for UI
         self._is_layout_actually_loaded = True

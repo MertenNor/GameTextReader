@@ -150,6 +150,8 @@ class AutomationsWindow:
         # Track unsaved changes
         self._has_unsaved_changes = False
         self._initial_automations_state = None  # Snapshot of state when window opens or after save
+        # Guard to suppress unsaved-change side effects while loading/restoring layout data
+        self._suspend_unsaved_tracking = False
         
         # Set up protocol to handle window closing
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -198,6 +200,11 @@ class AutomationsWindow:
     
     def _mark_unsaved_changes(self):
         """Mark that there are unsaved changes and auto-save if layout is loaded"""
+        # During bulk restore/load operations, ignore trace callbacks that would
+        # otherwise auto-save an incomplete automations state.
+        if getattr(self, '_suspend_unsaved_tracking', False):
+            return
+
         self._has_unsaved_changes = True
         
         # Auto-save if a layout is loaded
