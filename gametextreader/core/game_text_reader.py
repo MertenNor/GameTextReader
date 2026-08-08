@@ -54,17 +54,11 @@ except ImportError:
     TKDND_AVAILABLE = False
     print("[WARNING] System: tkinterdnd2 not available. Drag and drop functionality will be disabled.")
 
-from ..constants import (
-    APP_NAME, APP_VERSION, APP_DOCUMENTS_DIR, APP_LAYOUTS_DIR,
-    APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_BACKUP_FILENAME,
-    GITHUB_REPO, APP_AI_VOICES_DIR
-)
+from ..constants import *
 from ..piper_catalog import PIPER_VOICE_CATALOG
 from ..kokoro_catalog import KOKORO_VOICES, load_voices_from_file as _kokoro_load_voices
-from ..constants import (APP_KOKORO_DIR, APP_KOKORO_CUSTOM_DIR,
-                         APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR, APP_PIPER_BIN_DIR,
-                         APP_SAPI_PRESETS_DIR)
 from ..image_processing import preprocess_image, filter_by_color
+from ..windows.common import set_window_icon
 
 # Maps lang_REGION codes to short readable labels for the voice dropdown
 _PIPER_REGION_LABELS = {
@@ -179,13 +173,7 @@ def show_thinkr_warning(game_reader, area_name):
     apply_window_geometry(win, 'hotkey_conflict_single', 370, 170, parent=game_reader.root)
 
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            win.iconbitmap(icon_path)
-    except Exception as e:
-        pass
-
+    set_window_icon(win)
     # Remove the warning icon (if any)
     for child in win.winfo_children():
         if isinstance(child, tk.Label) and child.cget("image"):
@@ -249,12 +237,7 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
     apply_window_geometry(win, 'hotkey_conflict_combo', 400, 200, parent=game_reader.root)
 
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            win.iconbitmap(icon_path)
-    except Exception as e:
-        pass
+    set_window_icon(win)
 
     # Build the message
     locations_text = "\n".join(conflict_locations)
@@ -5101,7 +5084,7 @@ class GameTextReader:
     def set_master_hotkey(self):
         """Start the hotkey assignment for the master hotkey"""
         self.master_hotkey_button.is_master_hotkey_button = True
-        self.master_hotkey_button.config(text="Press any key...")
+        self.master_hotkey_button.config(text=PRESS_ANY_KEY)
         self.set_hotkey(self.master_hotkey_button, None)
 
     def setup_gui(self):
@@ -5781,12 +5764,7 @@ class GameTextReader:
         original_bad_word_list = self.bad_word_list.get().strip()
         
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                options_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting additional options window icon: {e}")
+        set_window_icon(options_window)
         
         # Create main frame for the options
         main_frame = tk.Frame(options_window)
@@ -6478,13 +6456,8 @@ class GameTextReader:
         apply_window_geometry(credits_window, 'credits', 600, 700, center=False)
         credits_window.resizable(False, False)
         
-        # Set icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                credits_window.iconbitmap(icon_path)
-        except Exception:
-            pass
+        # Set window icon
+        set_window_icon(credits_window)
             
         # Main content
         main_frame = ttk.Frame(credits_window, padding="20 20 20 20")
@@ -6581,13 +6554,8 @@ class GameTextReader:
         info_window.protocol("WM_DELETE_WINDOW", on_info_close)
         info_window.bind('<Escape>', lambda e: on_info_close())
         
-        # Set window icon if available
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                info_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting info window icon: {e}")
+        # Set window icon
+        set_window_icon(info_window)
         
         # Main container with reduced padding
         main_frame = ttk.Frame(info_window, padding="15 10 15 5")
@@ -7510,13 +7478,8 @@ class GameTextReader:
         how_to_use_window.title(f"{APP_NAME} - How to Use")
         apply_window_geometry(how_to_use_window, 'how_to_use', 900, 700)
         
-        # Set window icon if available
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                how_to_use_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting how to use window icon: {e}")
+        # Set window icon
+        set_window_icon(how_to_use_window)
         
         # Main container
         main_frame = ttk.Frame(how_to_use_window, padding="15 10 15 5")
@@ -8320,7 +8283,7 @@ class GameTextReader:
                 finish_hotkey_assignment()
 
         # Set button to indicate we're waiting for input
-        self.stop_hotkey_button.config(text="Press any key or combination...")
+        self.stop_hotkey_button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -8351,9 +8314,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        self.stop_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                        self.stop_hotkey_button.config(text=f"{PRESS_ANY_KEY} [ {preview} + ]")
                     else:
-                        self.stop_hotkey_button.config(text="Press any key or combination...")
+                        self.stop_hotkey_button.config(text=PRESS_ANY_KEY)
                     # Live expand window width if needed
                     self._ensure_window_width()
                 except Exception:
@@ -8786,7 +8749,7 @@ class GameTextReader:
                 return
 
         # Set button to indicate we're waiting for input
-        self.pause_hotkey_button.config(text="Press any key or combination...")
+        self.pause_hotkey_button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -8813,9 +8776,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        self.pause_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                        self.pause_hotkey_button.config(text=f"{PRESS_ANY_KEY} [ {preview} + ]")
                     else:
-                        self.pause_hotkey_button.config(text="Press any key or combination...")
+                        self.pause_hotkey_button.config(text=PRESS_ANY_KEY)
                     self._ensure_window_width()
                 except Exception:
                     pass
@@ -9373,7 +9336,7 @@ class GameTextReader:
             return
 
         # Set button to indicate we're waiting for input
-        button.config(text="Press any key or combination...")
+        button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -9401,9 +9364,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        button.config(text=f"Press any key or combination...\n[ {preview} + ]")
+                        button.config(text=f"{PRESS_ANY_KEY}\n[ {preview} + ]")
                     else:
-                        button.config(text="Press any key or combination...")
+                        button.config(text=PRESS_ANY_KEY)
                     # Live expand window width if needed
                     self._ensure_window_width()
                 except Exception:
@@ -10780,13 +10743,8 @@ class GameTextReader:
         select_area_window.update_idletasks()
         print("GAME_TEXT_READER: Window initialized (withdrawn, alpha=0.0)")
         
-        # Set icon (though overrideredirect means it won't show, set it anyway)
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                select_area_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting selection window icon: {e}")
+        # Set window icon (though overrideredirect means it won't show, set it anyway)
+        set_window_icon(select_area_window)
         
         # Make it transient to prevent root window from being shown/brought to front
         select_area_window.transient(self.root)
@@ -11597,16 +11555,10 @@ class GameTextReader:
         select_area_window.overrideredirect(True)
         select_area_window.withdraw()
         select_area_window.update_idletasks()
-        
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                select_area_window.iconbitmap(icon_path)
-                background_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting selection window icon: {e}")
-            import traceback
-            traceback.print_exc()
+
+        # Set window icons for both windows
+        set_window_icon(select_area_window)
+        set_window_icon(background_window)
         
         select_area_window.transient(self.root)
         select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
@@ -11782,7 +11734,7 @@ class GameTextReader:
                             preview = match.group(1).strip()
                             return preview if preview else "..."
                     elif "Press" in button_text:
-                        # For "Press any key or combination..." or "Press key: [ ... ]"
+                        # For PRESS_ANY_KEY or "Press key: [ ... ]"
                         match = re.search(r'Press key:\s*\[([^\]]*)\]', button_text)
                         if match:
                             preview = match.group(1).strip()
@@ -11983,7 +11935,7 @@ class GameTextReader:
                                 elif "Press key:" in button_text:
                                     hotkey_text = button_text  # "Press key: [ ... ]"
                                 else:
-                                    hotkey_text = "Press any key or combination..."
+                                    hotkey_text = PRESS_ANY_KEY
                             else:
                                 # If no hotkey, show "click to set hotkey" without "Hotkey:" prefix
                                 if hotkey_display == "Click here to set hotkey":
@@ -13416,12 +13368,7 @@ class GameTextReader:
         apply_window_geometry(dialog, 'area_name_dialog', 250, 120, parent=self.root)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                dialog.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting dialog icon: {e}")
+        set_window_icon(dialog)
         
         # Create and pack the label
         label = tk.Label(dialog, text="Enter a name for this area:", pady=10)
@@ -13515,12 +13462,7 @@ class GameTextReader:
         dialog.minsize(int(150 * _dpi_scale), int(120 * _dpi_scale))
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                dialog.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting dialog icon: {e}")
+        set_window_icon(dialog)
         
         # Create and pack the label
         label = tk.Label(dialog, text="Enter new area name:", pady=10)
@@ -14907,7 +14849,7 @@ class GameTextReader:
                 delattr(button, 'mouse_hook')
             except Exception as e:
                 print(f"Error cleaning up mouse hook function: {e}")
-        button.config(text="Press any key or combination...")
+        button.config(text=PRESS_ANY_KEY)
         self.root.update_idletasks()  # Force immediate UI update
         
         # Set flag FIRST so existing hotkeys are suppressed (they check this flag and return early)
@@ -14939,7 +14881,7 @@ class GameTextReader:
                 if preview:
                     button.config(text=f"Press key: [ {preview} + ]")
                 else:
-                    button.config(text="Press any key or combination...")
+                    button.config(text=PRESS_ANY_KEY)
                 # Live expand window width if needed
                 self._ensure_window_width()
             except Exception:

@@ -12,6 +12,7 @@ import pytesseract
 from ..screen_capture import capture_screen_area
 from ..window_geometry import apply_window_geometry
 from ..input_adapter import keyboard, mouse
+from .common import set_window_icon
 
 # Try to import numpy for better image comparison (optional)
 try:
@@ -89,13 +90,8 @@ class AutomationsWindow:
         self.window.resizable(True, True)
         apply_window_geometry(self.window, 'automations', 840, 600)
 
-        # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        # Set window icon
+        set_window_icon(self.window)
         
         # Store automation rules
         self.automations = []  # List of automation dictionaries

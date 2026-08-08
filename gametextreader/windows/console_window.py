@@ -11,6 +11,7 @@ from PIL import Image, ImageTk
 
 from ..screen_capture import get_dpi_scale
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 # Maximum buffer size to prevent memory issues (10MB)
 MAX_LOG_BUFFER_SIZE = 10 * 1024 * 1024
@@ -26,12 +27,7 @@ class ConsoleWindow:
         self._updating_image = False
         
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
         
         self.latest_images = latest_images
         apply_window_geometry(self.window, 'debug_console', 690, 500, center=False)  # Initial size, will adjust based on image

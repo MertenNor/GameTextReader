@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import datetime
 from tkinter import messagebox
-
+from gametextreader.windows.common import set_window_icon
 
 import sys
 import subprocess
@@ -312,12 +312,8 @@ def migrate_legacy_settings_file(root=None, app=None):
             win.resizable(False, False)
             win.transient(root)
             win.grab_set()
-            try:
-                icon_path = os.path.join(os.path.dirname(__file__), 'Assets', 'icon.ico')
-                if os.path.exists(icon_path):
-                    win.iconbitmap(icon_path)
-            except Exception:
-                pass
+
+            set_window_icon(win)
 
             tk.Label(
                 win,
@@ -758,31 +754,7 @@ def main():
     from gametextreader.core.game_text_reader import GameTextReader
     
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            # root.iconbitmap(icon_path) only works on Windows, so use PNG for cross-platform support
-            icon_photo = ImageTk.PhotoImage(file=icon_path)
-            root.iconphoto(True, icon_photo)
-
-            print(f"Set window icon to: {icon_path}")
-            # Register the AUMID in the registry so Windows shows the correct
-            # display name and icon in the taskbar jump list instead of "Python".
-            if sys.platform.startswith('win'):
-                try:
-                    import winreg
-                    key_path = r"Software\Classes\AppUserModelId\GameTextReader.App"
-                    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path,
-                                             0, winreg.KEY_SET_VALUE)
-                    winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "GameTextReader")
-                    winreg.SetValueEx(key, "IconUri",     0, winreg.REG_SZ, icon_path)
-                    winreg.CloseKey(key)
-                except Exception:
-                    pass
-        else:
-            print(f"Icon file not found at: {icon_path}")
-    except Exception as e:
-        print(f"Error setting window icon: {e}")
+    set_window_icon(root, register=True)
     
     app = GameTextReader(root)
     

@@ -6,7 +6,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter import font as tkfont
-
+from .common import set_window_icon
 from ..constants import (APP_AI_VOICES_DIR, APP_PIPER_DIR, APP_PIPER_BIN_DIR,
                           APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR,
                           APP_KOKORO_DIR, APP_KOKORO_CUSTOM_DIR, APP_SETTINGS_PATH,
@@ -232,12 +232,8 @@ class AIVoiceDownloadWindow:
         apply_window_geometry(self.window, 'voice_manager', 1100, 710)
         self.window.minsize(*[int(v * get_dpi_scale()) for v in (400, 300)])
 
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception:
-            pass
+        # Set window icon
+        set_window_icon(self.window)
 
         os.makedirs(APP_AI_VOICES_DIR, exist_ok=True)
         os.makedirs(APP_PIPER_VOICES_DIR, exist_ok=True)

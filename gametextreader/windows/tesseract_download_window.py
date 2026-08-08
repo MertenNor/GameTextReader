@@ -6,6 +6,7 @@ import os
 import webbrowser
 
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 class TesseractDownloadWindow:
     def __init__(self, parent, tesseract_manager):
@@ -18,12 +19,7 @@ class TesseractDownloadWindow:
         apply_window_geometry(self.window, 'tesseract_language_manager', 700, 500)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
         
         # Disable hotkeys in main window while this is open? 
         # Actually proper way is to register it, but we can just make it modal-ish or rely on focus.

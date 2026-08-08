@@ -13,6 +13,7 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 
 from .constants import APP_NAME, APP_VERSION, GITHUB_REPO, UPDATE_SERVER_URL, SHOW_UPDATE_POPUP_FOR_TESTING
+from .windows.common import set_window_icon
 from .screen_capture import get_dpi_scale
 from .window_geometry import apply_window_geometry
 
@@ -35,12 +36,7 @@ def show_update_popup(root, local_version, remote_version, remote_changelog, dow
     popup.minsize(int(400 * _dpi_scale), int(150 * _dpi_scale))
     
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), '..', 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            popup.iconbitmap(icon_path)
-    except Exception as e:
-        print(f"Error setting update popup icon: {e}")
+    set_window_icon(popup)
     
     # Make window resizable
     popup.resizable(True, True)

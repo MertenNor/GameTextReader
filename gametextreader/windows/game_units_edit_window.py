@@ -12,6 +12,7 @@ if sys.platform.startswith('win'):
 
 from ..constants import APP_DOCUMENTS_DIR
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 # Ready-made regex rules for the "Presets" dropdown, so common cases don't
 # require hand-writing a pattern. Each adds a new Regex-mode row prefilled
@@ -59,12 +60,7 @@ class GameUnitsEditWindow:
         self.game_text_reader.register_hotkey_disabling_window("Gamer Units", self.window)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
 
         # Load game units data
         self.game_units = self.game_text_reader.load_game_units()
@@ -607,12 +603,9 @@ class GameUnitsEditWindow:
         # Resizable in height too, since toggling the guide below changes
         # how tall the window needs to be.
         tester.resizable(True, True)
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                tester.iconbitmap(icon_path)
-        except Exception:
-            pass
+
+        # Set window icon
+        set_window_icon(tester)
 
         DIALOG_WRAP = 560
 
