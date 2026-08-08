@@ -17,4 +17,4 @@ pip install rapidocr onnxruntime pytesseract
 pip install argostranslate[no-cuda]
 
 # Install TTS engines
-pip install pyttsx3 piper-tts kokoro_onnx
+pip install pyttsx3 piper-tts kokoro_onnx pedalboard
