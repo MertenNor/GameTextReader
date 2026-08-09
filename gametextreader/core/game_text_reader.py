@@ -3274,14 +3274,16 @@ class GameTextReader:
             return "eng"
         return lang_code
 
-    def get_text_from_clipboard(self):
+    def get_text_from_clipboard(self, verbose=True):
         """Return current clipboard text for clipboard OCR mode."""
         try:
             clipboard_text = self.root.clipboard_get()
         except Exception as e:
-            print(f"[ERROR] Clipboard OCR: Could not read clipboard text: {e}")
+            if verbose:
+                print(f"[ERROR] Clipboard OCR: Could not read clipboard text: {e}")
             return ""
-
+        if verbose:
+            print(f"[INFO] Clipboard OCR: Retrieved text from clipboard: {clipboard_text[:50]}{'...' if len(clipboard_text) > 50 else ''}")
         return clipboard_text.strip() if isinstance(clipboard_text, str) else ""
 
     def check_selected_ocr_backend_installed(self):
@@ -15484,6 +15486,8 @@ class GameTextReader:
         top_level_settings = {}
         if hasattr(automation_window, 'freeze_screen_var'):
             top_level_settings['freeze_screen'] = automation_window.freeze_screen_var.get()
+        if hasattr(automation_window, 'monitor_clipboard_var'):
+            top_level_settings['monitor_clipboard'] = automation_window.monitor_clipboard_var.get()
         if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
             if hasattr(automation_window.set_hotkey_button, 'hotkey') and automation_window.set_hotkey_button.hotkey:
                 top_level_settings['detection_area_hotkey'] = automation_window.set_hotkey_button.hotkey
@@ -15645,6 +15649,8 @@ class GameTextReader:
                 # Restore freeze screen checkbox
                 if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
                     automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
+                if 'monitor_clipboard' in top_level_settings and hasattr(automation_window, 'monitor_clipboard_var'):
+                    automation_window.monitor_clipboard_var.set(top_level_settings['monitor_clipboard'])
 
                 # Restore detection area hotkey
                 if 'detection_area_hotkey' in top_level_settings:
