@@ -3,7 +3,9 @@ Screen capture functions for capturing game text areas
 """
 import ctypes
 import sys
+import time
 import pyautogui
+import pyscreenshot
 from PIL import Image, ImageGrab
 if sys.platform.startswith('win'):
     import win32con
@@ -318,28 +320,33 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
             except Exception:
                 pass
 
-    # This doesn't work right now due to a bug in PyAutoGUI PIL dependency checks
-    # try:
-    #     import pyautogui
-    #     img = pyautogui.screenshot(region=(int(x1), int(y1), int(width), int(height)))
-    #     if img and img.mode != 'RGB':
-    #         img = img.convert('RGB')
-    #     if img:
-    #         return img
-    # except Exception as e:
-    #     print(f"PyAutoGUI capture failed, falling back to Win32 capture: {e}")
-
+    # Attempt cross-platform capture using pyscreenshot
     try:
-        img = ImageGrab.grab(
-            bbox=(int(x1), int(y1), int(x2), int(y2)),
-            all_screens=True
+        img = pyscreenshot.grab(
+            bbox=(int(x1), int(y1), int(x2), int(y2))
         )
         if img.mode != 'RGB':
             img = img.convert('RGB')
-            img.save("debug_screenshot_rgb.png")  # Save for debugging
         return img
     except Exception as e:
-        print(f"ImageGrab fallback capture failed: {e}")
+        print(f"pyscreenshot fallback capture failed: {e}")
+
+    # Fallback to ImageGrab (cross-platform, but slower and less reliable)
+    max_retries = 3
+    while max_retries > 0:
+        try:
+            img = ImageGrab.grab(
+                bbox=(int(x1), int(y1), int(x2), int(y2)),
+                all_screens=True
+            )
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            return img
+        except Exception as e:
+            print(f"ImageGrab fallback capture failed: {e}")
+        max_retries -= 1
+        time.sleep(0.5)
 
     # Final safety fallback
+    print("Warning: Screen capture failed, returning blank image")
     return Image.new('RGB', (max(1, width), max(1, height)))
