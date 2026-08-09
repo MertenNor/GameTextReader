@@ -3167,42 +3167,49 @@ class AutomationsWindow:
                     pass  # Widgets were destroyed
         except Exception as e:
             print(f"Error updating automation status: {e}")
-    
+
+    def check_automation_matching(self, automation):
+        # Capture current screen area
+        x1, y1, x2, y2 = automation['image_area_coords']
+        
+        # TODO: Add freeze screen support here
+        current_image = capture_screen_area(x1, y1, x2, y2)
+        reference_image = automation['reference_image']
+
+        # Compare images using selected method
+        comparison_method = automation['comparison_method'].get()
+        if comparison_method == "Pixel":
+            match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
+        elif comparison_method == "Histogram":
+            match_percent = self.compare_images_histogram(current_image, reference_image)
+        elif comparison_method == "SSIM":
+            match_percent = self.compare_images_ssim(current_image, reference_image)
+        elif comparison_method == "Perceptual":
+            match_percent = self.compare_images_perceptual(current_image, reference_image)
+        elif comparison_method == "Edge":
+            match_percent = self.compare_images_edge(current_image, reference_image)
+        else:
+            # Default to pixel comparison
+            match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
+        
+        threshold = automation['match_percent'].get()
+        is_matching = match_percent >= threshold
+        
+        # Store match percent for status display
+        automation['_last_match_percent'] = match_percent
+        return is_matching, current_image
+
+
     def check_automation(self, automation):
         """Check a single automation rule"""
         try:
             # Skip automation if not configured
             if not automation.get('reference_image') and not automation.get('image_area_coords'):
                 return
-            
-            # Capture current screen area
-            x1, y1, x2, y2 = automation['image_area_coords']
-            
-            # TODO: Add freeze screen support here
-            current_image = capture_screen_area(x1, y1, x2, y2)
-            reference_image = automation['reference_image']
 
-            # Compare images using selected method
-            comparison_method = automation['comparison_method'].get()
-            if comparison_method == "Pixel":
-                match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
-            elif comparison_method == "Histogram":
-                match_percent = self.compare_images_histogram(current_image, reference_image)
-            elif comparison_method == "SSIM":
-                match_percent = self.compare_images_ssim(current_image, reference_image)
-            elif comparison_method == "Perceptual":
-                match_percent = self.compare_images_perceptual(current_image, reference_image)
-            elif comparison_method == "Edge":
-                match_percent = self.compare_images_edge(current_image, reference_image)
-            else:
-                # Default to pixel comparison
-                match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
-            
-            threshold = automation['match_percent'].get()
-            is_matching = match_percent >= threshold
-            
-            # Store match percent for status display
-            automation['_last_match_percent'] = match_percent
+            # Get current match status
+            is_matching, current_image = self.check_automation_matching(automation)
+
             was_matching = automation.get('was_matching', False)
             
             # Check for text only if "Only read if text exists" is enabled OR if text color is set
@@ -3313,9 +3320,12 @@ class AutomationsWindow:
                         # Clipboard is polled on Tk's main thread.
                         # Here we only consume the shared "clipboard changed" signal.
                         if self.monitor_clipboard_var.get() and self._consume_clipboard_change_for_automation(automation):
-                            automation['has_triggered'] = False
-                            automation['timer_active'] = True
-                            automation['timer_start_time'] = time.time()
+                            # Since the clipboard can trigger before match status updates, we need to force one more match check
+                            is_matching, current_image = self.check_automation_matching(automation)
+                            if is_matching:
+                                automation['has_triggered'] = False
+                                automation['timer_active'] = True
+                                automation['timer_start_time'] = time.time()
 
                         if automation['timer_active']:
                             # Timer is counting down - check if it's expired
