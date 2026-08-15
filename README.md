@@ -24,6 +24,13 @@ As a person with dyslexia, I wanted a program to read text in video games aloud.
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) must be installed and properly configured on your system.
 - Note! When the program opens for the first time, it will guide you through how to install this.
 
+### Python Dependencies
+
+Install the required Python packages with:
+
+```bash
+pip install -r requirements.txt
+
 ## 🗣️ Adding More High-Quality Voices
 Use the built-in Voice Manager to add different AI Voices.
 

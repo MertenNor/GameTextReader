@@ -1,0 +1,10 @@
+keyboard
+mouse
+pyttsx3
+pytesseract
+requests
+pywin32
+Pillow
+numpy
+argostranslate
+tkinterdnd2
