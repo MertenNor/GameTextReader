@@ -30,6 +30,13 @@ As a person with dyslexia, I wanted a program to read text in video games aloud.
 - Install RapidOCR in your Python environment:
 	- `pip install rapidocr`
 
+### Running from Source
+Most users should just grab the compiled `.exe` from the Releases page above - Python isn't required. If you're running from source instead (contributing, or on Linux/macOS), install the Python dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## 🗣️ Adding More High-Quality Voices
 Use the built-in Voice Manager to add different AI Voices.
 

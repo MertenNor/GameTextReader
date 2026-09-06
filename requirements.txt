@@ -1,0 +1,39 @@
+# Core UI / capture
+Pillow
+numpy
+requests
+tkinterdnd2
+pyautogui
+pyscreenshot
+pynput
+pygame
+
+# OCR
+pytesseract
+rapidocr
+onnxruntime
+
+# Translation
+argostranslate
+
+# Text-to-speech engines
+pyttsx3
+piper-tts
+kokoro_onnx
+pedalboard
+phonemizer
+scipy
+
+# Controller support
+inputs
+
+# Windows-only
+pywin32; sys_platform == "win32"
+winsdk; sys_platform == "win32"
+
+# Linux-only
+evdev-binary; sys_platform == "linux"
+
+# CPU-only PyTorch (pulled in at runtime by kokoro_onnx / rapidocr)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
