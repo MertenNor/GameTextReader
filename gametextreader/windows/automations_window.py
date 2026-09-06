@@ -11,6 +11,8 @@ import pytesseract
 
 from ..screen_capture import capture_screen_area
 from ..window_geometry import apply_window_geometry
+from ..input_adapter import keyboard, mouse
+from .common import set_window_icon
 
 # Try to import numpy for better image comparison (optional)
 try:
@@ -88,13 +90,8 @@ class AutomationsWindow:
         self.window.resizable(True, True)
         apply_window_geometry(self.window, 'automations', 840, 600)
 
-        # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        # Set window icon
+        set_window_icon(self.window)
         
         # Store automation rules
         self.automations = []  # List of automation dictionaries
@@ -108,6 +105,12 @@ class AutomationsWindow:
         
         # Registry to store automation callbacks by hotkey name for reliable lookup
         self.automation_callbacks_by_hotkey = {}  # {hotkey_name: callback_function}
+
+        self.last_clipboard_update = None
+        self._clipboard_change_version = 0
+        self._clipboard_change_lock = threading.Lock()
+        self._clipboard_watch_after_id = None
+        self._clipboard_watch_interval_ms = 200
         
         # Background polling control
         # Restore polling state from game_text_reader if it exists (persists across window close/reopen)
@@ -153,6 +156,8 @@ class AutomationsWindow:
         # Track unsaved changes
         self._has_unsaved_changes = False
         self._initial_automations_state = None  # Snapshot of state when window opens or after save
+        # Guard to suppress unsaved-change side effects while loading/restoring layout data
+        self._suspend_unsaved_tracking = False
         
         # Set up protocol to handle window closing
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -177,6 +182,10 @@ class AutomationsWindow:
         # Create UI
         self.create_ui()
 
+        # Clipboard reads must run on Tk's main thread.
+        # Expose clipboard changes to automation polling via a version signal.
+        self._start_clipboard_watcher()
+
     def _update_polling_button_state(self):
         """Update the polling button state to match the actual polling state"""
         try:
@@ -198,9 +207,73 @@ class AutomationsWindow:
         except Exception as e:
             print(f"[ERROR] Automations: UI update failed: {e}")
             pass  # Button might not exist yet
+
+    def _start_clipboard_watcher(self):
+        """Start root-loop clipboard watcher used by automation polling threads."""
+        if self._clipboard_watch_after_id is not None:
+            return
+        self._schedule_next_clipboard_watch()
+
+    def _schedule_next_clipboard_watch(self):
+        """Schedule the next clipboard watcher tick on the root Tk loop."""
+        self._clipboard_watch_after_id = self.root.after(
+            self._clipboard_watch_interval_ms,
+            self._poll_clipboard_main_thread
+        )
+
+    def _prime_clipboard_baseline(self):
+        """Capture current clipboard text as baseline without emitting a change event."""
+        try:
+            self.last_clipboard_update = self.game_text_reader.get_text_from_clipboard(verbose=False)
+        except Exception:
+            self.last_clipboard_update = ""
+
+    def _poll_clipboard_main_thread(self):
+        """Read clipboard on Tk main thread and record change versions for worker threads."""
+        self._clipboard_watch_after_id = None
+        try:
+            should_monitor = False
+            if hasattr(self, 'monitor_clipboard_var'):
+                should_monitor = bool(self.monitor_clipboard_var.get())
+
+            if should_monitor:
+                current_text = self.game_text_reader.get_text_from_clipboard(verbose=False)
+                if self.last_clipboard_update is None:
+                    self.last_clipboard_update = current_text
+                elif current_text != self.last_clipboard_update:
+                    self.last_clipboard_update = current_text
+                    with self._clipboard_change_lock:
+                        self._clipboard_change_version += 1
+            elif self.last_clipboard_update is None:
+                # Keep a baseline so enabling monitor doesn't immediately fire.
+                self._prime_clipboard_baseline()
+        except Exception:
+            # Clipboard ownership can briefly fail on some platforms.
+            pass
+        finally:
+            current_window = getattr(self.game_text_reader, '_automations_window', None)
+            if current_window is not None and current_window is not self:
+                return
+            self._schedule_next_clipboard_watch()
+
+    def _consume_clipboard_change_for_automation(self, automation):
+        """Return True once per clipboard change for each automation."""
+        with self._clipboard_change_lock:
+            current_version = self._clipboard_change_version
+
+        last_seen_version = automation.get('_last_seen_clipboard_change_version', 0)
+        if current_version > last_seen_version:
+            automation['_last_seen_clipboard_change_version'] = current_version
+            return True
+        return False
     
     def _mark_unsaved_changes(self):
         """Mark that there are unsaved changes and auto-save if layout is loaded"""
+        # During bulk restore/load operations, ignore trace callbacks that would
+        # otherwise auto-save an incomplete automations state.
+        if getattr(self, '_suspend_unsaved_tracking', False):
+            return
+
         self._has_unsaved_changes = True
         
         # Auto-save if a layout is loaded
@@ -353,20 +426,6 @@ class AutomationsWindow:
         # Store reference to prevent accidental triggering
         self.set_image_area_button = set_image_area_button
         
-        # Freeze Screen checkbox (at top level)
-        self.freeze_screen_var = tk.BooleanVar(value=False)
-        # Track changes to freeze screen checkbox to trigger auto-save
-        def on_freeze_screen_change(*args):
-            self._mark_unsaved_changes()
-        self.freeze_screen_var.trace('w', on_freeze_screen_change)
-        freeze_screen_checkbox = tk.Checkbutton(
-            line1_frame,
-            text="Freeze Screen",
-            variable=self.freeze_screen_var,
-            font=("Helvetica", 10)
-        )
-        freeze_screen_checkbox.pack(side='left', padx=(10, 0))
-        
         # Set Hotkey button (at top level)
         self.set_hotkey_button = tk.Button(
             line1_frame,
@@ -400,7 +459,36 @@ class AutomationsWindow:
             font=("Helvetica", 10)
         )
         add_hotkey_combo_button.pack(side='left')
-        
+
+        # Freeze Screen checkbox (at top level)
+        self.freeze_screen_var = tk.BooleanVar(value=False)
+        # Track changes to freeze screen checkbox to trigger auto-save
+        def on_freeze_screen_change(*args):
+            self._mark_unsaved_changes()
+        self.freeze_screen_var.trace('w', on_freeze_screen_change)
+        freeze_screen_checkbox = tk.Checkbutton(
+            line2_frame,
+            text="Freeze Screen",
+            variable=self.freeze_screen_var,
+            font=("Helvetica", 10)
+        )
+        freeze_screen_checkbox.pack(side='right', padx=(10, 0))
+
+        # Monitor Clipboard checkbox (at top level)
+        self.monitor_clipboard_var = tk.BooleanVar(value=False)
+        # Track changes to monitor clipboard checkbox to trigger auto-save
+        def on_monitor_clipboard_change(*args):
+            if self.monitor_clipboard_var.get():
+                self._prime_clipboard_baseline()
+            self._mark_unsaved_changes()
+        self.monitor_clipboard_var.trace('w', on_monitor_clipboard_change)
+        monitor_clipboard_checkbox = tk.Checkbutton(
+            line2_frame,
+            text="Monitor Clipboard",
+            variable=self.monitor_clipboard_var,
+            font=("Helvetica", 10)
+        )
+        monitor_clipboard_checkbox.pack(side='right', padx=(10, 0))
                 
         # Separator
         ttk.Separator(self.window, orient='horizontal').pack(fill='x', padx=10, pady=5)
@@ -526,6 +614,7 @@ class AutomationsWindow:
             'timer_start_time': None,  # When timer started
             'was_matching': False,  # Previous match state (for toggle behavior)
             'has_triggered': False,  # Whether we've triggered for current match state
+            '_last_seen_clipboard_change_version': 0,
             'text_last_found_time': None,  # When text was last detected (for debouncing OCR misses)
             'frame': None  # UI frame for this automation
         }
@@ -1695,7 +1784,6 @@ class AutomationsWindow:
                     # Clean up any existing hook first to avoid duplicates
                     if hasattr(button, 'keyboard_hook') and button.keyboard_hook:
                         try:
-                            import keyboard
                             if hasattr(button.keyboard_hook, 'remove'):
                                 keyboard.remove_hotkey(button.keyboard_hook)
                             else:
@@ -2014,7 +2102,6 @@ class AutomationsWindow:
         # Clean up hotkey hook if it exists - try multiple methods to ensure it's removed
         if hotkey_button and hasattr(hotkey_button, 'hotkey') and hotkey_button.hotkey:
             try:
-                import keyboard
                 # Method 1: Remove by hotkey name (most reliable for add_hotkey)
                 try:
                     keyboard.remove_hotkey(hotkey_button.hotkey)
@@ -2045,7 +2132,6 @@ class AutomationsWindow:
         # Clean up mouse hook if it exists
         if hotkey_button and hasattr(hotkey_button, 'mouse_hook_id') and hotkey_button.mouse_hook_id:
             try:
-                import mouse
                 mouse.unhook(hotkey_button.mouse_hook_id)
                 pass
             except Exception as e:
@@ -3081,42 +3167,49 @@ class AutomationsWindow:
                     pass  # Widgets were destroyed
         except Exception as e:
             print(f"Error updating automation status: {e}")
-    
+
+    def check_automation_matching(self, automation):
+        # Capture current screen area
+        x1, y1, x2, y2 = automation['image_area_coords']
+        
+        # TODO: Add freeze screen support here
+        current_image = capture_screen_area(x1, y1, x2, y2)
+        reference_image = automation['reference_image']
+
+        # Compare images using selected method
+        comparison_method = automation['comparison_method'].get()
+        if comparison_method == "Pixel":
+            match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
+        elif comparison_method == "Histogram":
+            match_percent = self.compare_images_histogram(current_image, reference_image)
+        elif comparison_method == "SSIM":
+            match_percent = self.compare_images_ssim(current_image, reference_image)
+        elif comparison_method == "Perceptual":
+            match_percent = self.compare_images_perceptual(current_image, reference_image)
+        elif comparison_method == "Edge":
+            match_percent = self.compare_images_edge(current_image, reference_image)
+        else:
+            # Default to pixel comparison
+            match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
+        
+        threshold = automation['match_percent'].get()
+        is_matching = match_percent >= threshold
+        
+        # Store match percent for status display
+        automation['_last_match_percent'] = match_percent
+        return is_matching, current_image
+
+
     def check_automation(self, automation):
         """Check a single automation rule"""
         try:
             # Skip automation if not configured
             if not automation.get('reference_image') and not automation.get('image_area_coords'):
                 return
-            
-            # Capture current screen area
-            x1, y1, x2, y2 = automation['image_area_coords']
-            
-            # TODO: Add freeze screen support here
-            current_image = capture_screen_area(x1, y1, x2, y2)
-            reference_image = automation['reference_image']
-            
-            # Compare images using selected method
-            comparison_method = automation['comparison_method'].get()
-            if comparison_method == "Pixel":
-                match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
-            elif comparison_method == "Histogram":
-                match_percent = self.compare_images_histogram(current_image, reference_image)
-            elif comparison_method == "SSIM":
-                match_percent = self.compare_images_ssim(current_image, reference_image)
-            elif comparison_method == "Perceptual":
-                match_percent = self.compare_images_perceptual(current_image, reference_image)
-            elif comparison_method == "Edge":
-                match_percent = self.compare_images_edge(current_image, reference_image)
-            else:
-                # Default to pixel comparison
-                match_percent = self.compare_images_pixel_by_pixel(current_image, reference_image)
-            
-            threshold = automation['match_percent'].get()
-            is_matching = match_percent >= threshold
-            
-            # Store match percent for status display
-            automation['_last_match_percent'] = match_percent
+
+            # Get current match status
+            is_matching, current_image = self.check_automation_matching(automation)
+
             was_matching = automation.get('was_matching', False)
             
             # Check for text only if "Only read if text exists" is enabled OR if text color is set
@@ -3223,6 +3316,17 @@ class AutomationsWindow:
                     else:
                         # "Only read if text exists" is OFF: Trigger only on image detection (image "green")
                         # No text check needed - just check timer if active
+
+                        # Clipboard is polled on Tk's main thread.
+                        # Here we only consume the shared "clipboard changed" signal.
+                        if self.monitor_clipboard_var.get() and self._consume_clipboard_change_for_automation(automation):
+                            # Since the clipboard can trigger before match status updates, we need to force one more match check
+                            is_matching, current_image = self.check_automation_matching(automation)
+                            if is_matching:
+                                automation['has_triggered'] = False
+                                automation['timer_active'] = True
+                                automation['timer_start_time'] = time.time()
+
                         if automation['timer_active']:
                             # Timer is counting down - check if it's expired
                             timer_elapsed_ms = (time.time() - automation['timer_start_time']) * 1000
@@ -3240,6 +3344,7 @@ class AutomationsWindow:
                     if not automation['timer_active'] and automation['has_triggered']:
                         # Reset and start new cycle
                         automation['has_triggered'] = False
+
                         if automation['only_read_if_text'].get():
                             # "Only read if text exists" is ON: Require BOTH image match AND text found (with leniency for OCR misses)
                             if text_found:
@@ -3253,6 +3358,8 @@ class AutomationsWindow:
                                     # Text was found recently - still allow timer to start
                                     automation['timer_active'] = True
                                     automation['timer_start_time'] = time.time()
+
+
             else:
                 # Image doesn't match - state transition: matching -> not_matching
                 automation['was_matching'] = False
@@ -3262,7 +3369,7 @@ class AutomationsWindow:
                 automation['text_last_found_time'] = None
         except Exception as e:
             print(f"Error checking automation {automation['id']}: {e}")
-    
+
     def compare_images_pixel_by_pixel(self, img1, img2):
         """Compare two images pixel-by-pixel and return match percentage"""
         try:
@@ -3509,8 +3616,12 @@ class AutomationsWindow:
     def has_text_in_area(self, image, target_color=None, color_tolerance=30):
         """Check if text exists in the image using OCR, optionally filtering by color"""
         try:
-            # Use basic OCR to detect text
-            text = pytesseract.image_to_string(image, config='--psm 6')
+            # Use the app's configured OCR backend when available.
+            if hasattr(self.game_text_reader, 'extract_text_from_image'):
+                text = self.game_text_reader.extract_text_from_image(image, psm_value="6")
+            else:
+                text = pytesseract.image_to_string(image, config='--psm 6')
+
             # Remove whitespace and check if any text remains
             text = text.strip()
             
@@ -3520,6 +3631,11 @@ class AutomationsWindow:
             
             # If target color is specified, check if text of that color exists
             if len(text) > 0:
+                if hasattr(self.game_text_reader, 'get_selected_ocr_backend'):
+                    if self.game_text_reader.get_selected_ocr_backend() in ('rapidocr', 'clipboard'):
+                        # RapidOCR/clipboard paths currently don't provide per-word boxes in this helper,
+                        # so we treat detected text as enough for text-present checks.
+                        return True
                 return self.has_text_of_color(image, target_color, color_tolerance)
             
             return False

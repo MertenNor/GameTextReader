@@ -38,6 +38,8 @@ APP_KOKORO_DIR        = os.path.join(APP_AI_VOICES_DIR, 'kokoro')
 APP_KOKORO_CUSTOM_DIR = os.path.join(APP_KOKORO_DIR, 'custom')
 APP_SAPI_PRESETS_DIR  = os.path.join(APP_DOCUMENTS_DIR, 'sapi_presets')
 
+PRESS_ANY_KEY = "Press any key..."
+
 # GitHub repository configuration
 GITHUB_REPO = "MertenNor/GameTextReader"  # Format: "username/repository-name"
 

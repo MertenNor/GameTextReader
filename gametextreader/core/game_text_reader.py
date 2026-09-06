@@ -15,8 +15,9 @@ import tempfile
 import threading
 import time
 import webbrowser
-import winreg
 import ssl
+import wave
+import pygame
 
 # Monkeypatch SSL to fix certificate verification errors in compiled app
 try:
@@ -28,21 +29,21 @@ else:
 from functools import partial
 from tkinter import filedialog, messagebox, simpledialog, ttk, font as tkfont
 
-import keyboard
-import mouse
 import pyttsx3
 import pytesseract
 import requests
 import tkinter as tk
-import win32api
-import win32com.client
-import win32con
-import win32gui
-import win32ui
-import win32process
+if sys.platform.startswith('win'):
+    import win32com.client
+    import win32con
+    import win32gui
+    import win32ui
+    import win32process
+    import winsound
+    import winreg
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageGrab, ImageTk
 import ctypes
-import winsound
+
 import queue
 
 # Try to import tkinterdnd2 for drag and drop functionality
@@ -53,17 +54,11 @@ except ImportError:
     TKDND_AVAILABLE = False
     print("[WARNING] System: tkinterdnd2 not available. Drag and drop functionality will be disabled.")
 
-from ..constants import (
-    APP_NAME, APP_VERSION, APP_DOCUMENTS_DIR, APP_LAYOUTS_DIR,
-    APP_SETTINGS_PATH, APP_AUTO_READ_SETTINGS_PATH, APP_SETTINGS_BACKUP_FILENAME,
-    GITHUB_REPO, APP_AI_VOICES_DIR
-)
+from ..constants import *
 from ..piper_catalog import PIPER_VOICE_CATALOG
 from ..kokoro_catalog import KOKORO_VOICES, load_voices_from_file as _kokoro_load_voices
-from ..constants import (APP_KOKORO_DIR, APP_KOKORO_CUSTOM_DIR,
-                         APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR, APP_PIPER_BIN_DIR,
-                         APP_SAPI_PRESETS_DIR)
 from ..image_processing import preprocess_image, filter_by_color
+from ..windows.common import set_window_icon
 
 # Maps lang_REGION codes to short readable labels for the voice dropdown
 _PIPER_REGION_LABELS = {
@@ -134,10 +129,12 @@ from ..utils import (
     get_current_keyboard_layout, normalize_key_name, detect_ctrl_keys,
     is_special_character, suggest_alternative_key, InputManager
 )
-from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale
+from ..input_adapter import keyboard, mouse
+from ..screen_capture import capture_screen_area, get_primary_monitor_info, get_dpi_scale, get_virtual_screen_bounds
 from ..window_geometry import apply_window_geometry
 from ..update_checker import check_for_update
 from .controller_handler import ControllerHandler, CONTROLLER_AVAILABLE
+from .ocr_backends import RapidOCRBackend
 from .tesseract_manager import TesseractManager
 from ..translation.translation_manager import TranslationManager
 from ..windows.console_window import ConsoleWindow
@@ -176,13 +173,7 @@ def show_thinkr_warning(game_reader, area_name):
     apply_window_geometry(win, 'hotkey_conflict_single', 370, 170, parent=game_reader.root)
 
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            win.iconbitmap(icon_path)
-    except Exception as e:
-        pass
-
+    set_window_icon(win)
     # Remove the warning icon (if any)
     for child in win.winfo_children():
         if isinstance(child, tk.Label) and child.cget("image"):
@@ -246,12 +237,7 @@ def show_hotkey_conflict_warning(game_reader, hotkey, conflict_locations):
     apply_window_geometry(win, 'hotkey_conflict_combo', 400, 200, parent=game_reader.root)
 
     # Set the window icon
-    try:
-        icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-        if os.path.exists(icon_path):
-            win.iconbitmap(icon_path)
-    except Exception as e:
-        pass
+    set_window_icon(win)
 
     # Build the message
     locations_text = "\n".join(conflict_locations)
@@ -309,6 +295,11 @@ class GameTextReader:
         self.pause_hotkey_button = type('Button', (), {})()
         self.pause_hotkey_button.mock_button = None  # Will be created when hotkey is set
         self.pause_hotkey_button.config = lambda **kwargs: None  # Dummy config method
+
+        # Prevent nested resize handler re-entry from <Configure> cascades.
+        self._resize_window_in_progress = False
+        self._resize_window_pending = False
+        self._resize_window_pending_force = False
         
         # Don't set initial geometry here - let it be calculated after GUI setup
         # self.root.geometry("1115x260")  # Initial window size (height reduced for less vertical tallness)
@@ -344,8 +335,9 @@ class GameTextReader:
         self.processing_settings = {}  # Dictionary to store processing settings for each area
         self.processing_settings_widgets = {}  # Dictionary to store processing settings widgets for each area
         self.volume = tk.StringVar(value="100")  # Default volume 100%
-        self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
-        self.speaker.Volume = int(self.volume.get())  # Set initial volume
+        if sys.platform.startswith('win'):
+            self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            self.speaker.Volume = int(self.volume.get())  # Set initial volume
         self.is_speaking = False
         self._speech_monitor_active = False  # Flag to track if speech monitor thread is running
         self._speech_monitor_thread = None  # Thread that monitors speech completion
@@ -374,6 +366,7 @@ class GameTextReader:
         self.piper_streaming_var      = tk.IntVar(value=0)  # 0=standard, 1=sentence-by-sentence
         self.kokoro_split_mode_var    = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
         self.piper_split_mode_var     = tk.IntVar(value=1)  # 0=sentences only, 1=smart split
+        self.voice_preview_auto_var   = tk.BooleanVar(value=False)
 
         # Hotkey management
         self.hotkey_scancodes = {}  # Dictionary to store scan codes for hotkeys
@@ -565,10 +558,13 @@ class GameTextReader:
         
         # Initialize Tesseract manager
         self.tesseract_manager = TesseractManager(APP_DOCUMENTS_DIR)
+        self.rapid_ocr_backend = RapidOCRBackend()
+        self.ocr_backend_var = tk.StringVar(value="tesseract")
         self.tesseract_language_var = tk.StringVar(value="eng") # Default to English
         
         # Auto-save Tesseract language on change
         self.tesseract_language_var.trace('w', lambda *args: self.save_global_settings())
+        self.ocr_backend_var.trace('w', lambda *args: self.save_global_settings())
 
         
         # Apply translation performance settings on startup
@@ -1115,6 +1111,17 @@ class GameTextReader:
         self._piper_playing = False
         self._piper_stop_requested = False
         self._pause_requested = False
+        self._pygame_lock = threading.Lock()
+        self._pygame_queue = queue.Queue()
+        self._pygame_current_request = None
+        self._pygame_request_seq = 0
+        self._pygame_mixer_warmed = False
+        self._pygame_worker_thread = threading.Thread(
+            target=self._pygame_playback_worker,
+            name="gtr-pygame-audio",
+            daemon=True,
+        )
+        self._pygame_worker_thread.start()
         self._mci_command = None
         self._piper_wav_path = None
         self._status_anim_running = False
@@ -1469,7 +1476,8 @@ class GameTextReader:
     def _speak_with_kokoro(self, text, voice_id, speed_var=None, _on_synth_done=None, area_id=None):
         """Speak text using Kokoro TTS."""
         if self.is_speaking:
-            return
+            self.stop_speaking()
+            time.sleep(0.02)
         import sys, wave
 
         model_path  = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
@@ -1514,7 +1522,8 @@ class GameTextReader:
                             text="Kokoro: Playing...", fg="#7700aa"))
                         self._piper_playing = True
                         self._piper_wav_path = _cf
-                        self._mci_play(_cf, _dur)
+                        # self._mci_play(_cf, _dur)
+                        self._pygame_play_sync(_cf)
                         while self._pause_requested and not self._piper_stop_requested:
                             time.sleep(0.05)
                 finally:
@@ -1719,7 +1728,8 @@ class GameTextReader:
                     self._piper_playing = True
                     self._piper_wav_path = _current_chunk
                     print(f"[Kokoro] Playing chunk {play_idx+1}")
-                    self._mci_play(_current_chunk, len(samples) / float(sample_rate))
+                    # self._mci_play(_current_chunk, len(samples) / float(sample_rate))
+                    self._pygame_play_sync(_current_chunk)
                     _played_chunks.append(_current_chunk)
                     _current_chunk = None
                     while self._pause_requested and not self._piper_stop_requested:
@@ -1797,7 +1807,8 @@ class GameTextReader:
                 self._piper_playing = True
                 self._piper_wav_path = wav_path
                 _dur = len(samples) / float(sample_rate)
-                self._mci_play(wav_path, _dur)
+                # self._mci_play(wav_path, _dur)
+                self._pygame_play_sync(wav_path)
                 print("[Kokoro] Playback complete")
 
                 # Store in cache if not stopped
@@ -1921,7 +1932,8 @@ class GameTextReader:
     def _speak_with_piper(self, text, model_key, speed_var=None, _on_synth_done=None, pitch_override=None, area_id=None):
         """Speak text using the bundled piper-tts Python package."""
         if self.is_speaking:
-            return
+            self.stop_speaking()
+            time.sleep(0.02)
         # Resolve custom preset → base voice + override settings
         preset_overrides = None
         if model_key.startswith('preset:'):
@@ -2165,7 +2177,8 @@ class GameTextReader:
                 print(f"[AI Voice] WAV written, playing...")
                 self._piper_playing = True
                 self._piper_wav_path = wav_path
-                self._mci_play(wav_path, _dur)
+                # self._mci_play(wav_path, _dur)
+                self._pygame_play_sync(wav_path)
                 print(f"[AI Voice] Playback complete")
 
                 # Store in cache if not stopped
@@ -2298,6 +2311,414 @@ class GameTextReader:
         pitch = float(data.get('pitch', 0.0))
         self._speak_with_sapi_pitched(text, voice_name, pitch, speed_var, _on_synth_done)
 
+    def _extract_preview_name(self, voice_label=None, voice_full_name=None):
+        """Extract the preview name from the end of a voice label/id."""
+        # Prefer backend-specific IDs when they carry a canonical voice token.
+        if isinstance(voice_full_name, str):
+            if voice_full_name.startswith('[Piper]:'):
+                key = voice_full_name.split(':', 1)[1]
+                if key.startswith('preset:'):
+                    key = key[7:]
+                parts = [p for p in key.split('-') if p]
+                if len(parts) >= 3:
+                    raw = parts[-2]
+                elif len(parts) >= 2:
+                    raw = parts[-1]
+                else:
+                    raw = key
+                raw = raw.replace('_', ' ').strip()
+                if raw:
+                    return raw.split()[-1]
+            if voice_full_name.startswith('[Kokoro]:'):
+                voice_id = voice_full_name.split(':', 1)[1]
+                if voice_id.startswith('custom:'):
+                    voice_id = voice_id[7:]
+                tokens = [t for t in re.split(r'[\s_\-]+', voice_id) if t]
+                if tokens:
+                    return tokens[-1]
+
+        # Fallback to display label shown in dropdown.
+        label = str(voice_label or '').strip()
+        label = re.sub(r'^\d+\.\s*', '', label)
+        label = re.sub(r'\s*\[[^\]]+\]\s*', ' ', label)
+        label = re.sub(r'\s*\([^\)]*\)\s*$', '', label)
+        label = re.sub(r'\s+', ' ', label).strip()
+        tokens = [t for t in re.split(r'[\s_\-]+', label) if t]
+        if tokens:
+            return tokens[-1]
+        return 'MYNAME'
+
+    def _build_preview_text(self, voice_label=None, voice_full_name=None):
+        """Return preview prompt with a per-voice name token."""
+        preview_name = self._extract_preview_name(voice_label, voice_full_name)
+        return f"Hello my name is {preview_name}, nice to meet you!"
+
+    def _save_preview_wav(self, preview_text, preview_path, voice_full_name):
+        """Generate a preview WAV for any supported backend voice and save it to disk."""
+        if not preview_path:
+            return None
+        try:
+            if voice_full_name.startswith('[Piper]:'):
+                model_key = voice_full_name.split(':', 1)[1]
+                length_scale = 1.0
+                noise_scale = 0.667
+                noise_w_scale = 0.8
+
+                if model_key.startswith('preset:'):
+                    preset_name = model_key[7:]
+                    preset_path = os.path.join(APP_PIPER_PRESETS_DIR, f"{preset_name}.json")
+                    if not os.path.exists(preset_path):
+                        return None
+                    try:
+                        with open(preset_path, 'r', encoding='utf-8') as f:
+                            preset_data = json.load(f)
+                        model_key = preset_data.get('base_voice', '')
+                        length_scale = float(preset_data.get('length_scale', length_scale))
+                        noise_scale = float(preset_data.get('noise_scale', noise_scale))
+                        noise_w_scale = float(preset_data.get('noise_w_scale', noise_w_scale))
+                    except Exception:
+                        return None
+
+                onnx_path = os.path.join(APP_PIPER_VOICES_DIR, f"{model_key}.onnx")
+                if not os.path.exists(onnx_path):
+                    return None
+                from piper import PiperVoice, SynthesisConfig
+                voice = PiperVoice.load(onnx_path)
+                syn_config = SynthesisConfig(
+                    length_scale=length_scale,
+                    noise_scale=noise_scale,
+                    noise_w_scale=noise_w_scale
+                )
+                with wave.open(preview_path, 'wb') as wf:
+                    voice.synthesize_wav(preview_text, wf, syn_config=syn_config)
+                return preview_path
+
+            if voice_full_name.startswith('[Kokoro]:'):
+                voice_id = voice_full_name.split(':', 1)[1]
+                model_path = os.path.join(APP_KOKORO_DIR, 'kokoro-v1.0.int8.onnx')
+                voices_path = os.path.join(APP_KOKORO_DIR, 'voices-v1.0.bin')
+                if not os.path.exists(model_path) or not os.path.exists(voices_path):
+                    return None
+                import numpy as np
+                from kokoro_onnx import Kokoro as KokoroTTS
+                kokoro = getattr(self, '_kokoro_instance', None) or KokoroTTS(model_path, voices_path)
+                voice_arg = voice_id
+                if voice_id.startswith('custom:'):
+                    custom_name = voice_id[7:]
+                    custom_path = os.path.join(APP_KOKORO_CUSTOM_DIR, f"{custom_name}.npy")
+                    if not os.path.exists(custom_path):
+                        return None
+                    voice_arg = np.load(custom_path)
+
+                lang = 'en-us'
+                try:
+                    all_voices = _kokoro_load_voices(voices_path)
+                    if not voice_id.startswith('custom:'):
+                        lang = all_voices.get(voice_id, ('', 'en-us'))[1]
+                except Exception:
+                    pass
+
+                samples, sample_rate = kokoro.create(preview_text, voice=voice_arg, speed=1.0, lang=lang)
+                pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+                with wave.open(preview_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm.tobytes())
+                return preview_path
+
+            is_sapi_preset = isinstance(voice_full_name, str) and voice_full_name.startswith('[SAPI]:preset:')
+            is_sapi_voice = isinstance(voice_full_name, str) and not voice_full_name.startswith('[')
+            if is_sapi_preset or is_sapi_voice:
+                if not sys.platform.startswith('win'):
+                    return None
+                import win32com.client
+
+                speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                target_voice_name = voice_full_name
+                pitch = 0.0
+
+                if is_sapi_preset:
+                    preset_name = voice_full_name[14:]
+                    preset_path = os.path.join(APP_SAPI_PRESETS_DIR, f"{preset_name}.json")
+                    if not os.path.exists(preset_path):
+                        return None
+                    with open(preset_path, 'r', encoding='utf-8') as f:
+                        preset_data = json.load(f)
+                    target_voice_name = preset_data.get('base_voice', '')
+                    pitch = float(preset_data.get('pitch', 0.0))
+
+                if target_voice_name:
+                    try:
+                        for voice in speaker.GetVoices():
+                            if voice.GetDescription() == target_voice_name:
+                                speaker.Voice = voice
+                                break
+                    except Exception:
+                        pass
+
+                stream = win32com.client.Dispatch("SAPI.SpFileStream")
+                ssfm_create_for_write = 3
+                stream.Open(preview_path, ssfm_create_for_write)
+                speaker.AudioOutputStream = stream
+
+                speak_text = preview_text
+                speak_flags = 0
+                if pitch:
+                    sapi_pitch = max(-10, min(10, int(round(pitch * 10 / 12))))
+                    if sapi_pitch != 0:
+                        speak_text = f'<Pitch Middle="{sapi_pitch:+d}"/>{preview_text}'
+                        speak_flags = 8  # SVSFIsXML
+
+                speaker.Speak(speak_text, speak_flags)
+                stream.Close()
+                return preview_path if os.path.exists(preview_path) else None
+        except Exception as e:
+            print(f"[WARNING] Could not save preview WAV: {e}")
+        return None
+
+    def _play_preview_audio(self, preview_path):
+        """Play a generated preview WAV if possible."""
+        if not preview_path or not os.path.exists(preview_path):
+            return
+        try:
+            if sys.platform.startswith('win'):
+                import ctypes
+                _winmm = ctypes.windll.winmm
+                _alias = 'gtrprev'
+                _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                ret = _winmm.mciSendStringW(f'open "{preview_path}" type waveaudio alias {_alias}', None, 0, None)
+                if ret == 0:
+                    _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
+                    return
+            self._pygame_play_sync(preview_path)
+        except Exception as e:
+            print(f"[WARNING] Could not play preview WAV: {e}")
+
+    def _play_voice_preview(self, voice_full_name, voice_display=None, save_preview=False):
+        """Play a short preview for the selected voice and optionally save a WAV file."""
+        if not voice_full_name or str(voice_full_name).strip() in {'', 'No voices available'}:
+            return
+        preview_text = self._build_preview_text(voice_display or voice_full_name, voice_full_name)
+        preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
+        os.makedirs(preview_dir, exist_ok=True)
+        safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(voice_display or voice_full_name or 'voice')).strip('_') or 'voice'
+        preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav") if save_preview else None
+        temp_path = None
+        if not preview_path:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False, dir=preview_dir) as tmp:
+                temp_path = tmp.name
+            preview_path = temp_path
+
+        self.stop_speaking()
+        self._piper_stop_requested = False
+
+        if voice_full_name.startswith('[Piper]:'):
+            def _run_preview():
+                try:
+                    self._save_preview_wav(preview_text, preview_path, voice_full_name)
+                    if os.path.exists(preview_path):
+                        self._play_preview_audio(preview_path)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            threading.Thread(target=_run_preview, daemon=True).start()
+            return
+
+        if voice_full_name.startswith('[Kokoro]:'):
+            def _run_preview():
+                try:
+                    self._save_preview_wav(preview_text, preview_path, voice_full_name)
+                    if os.path.exists(preview_path):
+                        self._play_preview_audio(preview_path)
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+            threading.Thread(target=_run_preview, daemon=True).start()
+            return
+
+        if voice_full_name.startswith('[SAPI]:preset:'):
+            preset_name = voice_full_name[14:]
+            threading.Thread(target=self._speak_with_sapi_preset, args=(preview_text, preset_name, None), daemon=True).start()
+            return
+
+        try:
+            if hasattr(self, 'speaker') and self.speaker:
+                voices = self.speaker.GetVoices()
+                selected_voice = None
+                for voice in voices:
+                    if getattr(voice, 'GetDescription', None) and voice.GetDescription() == voice_full_name:
+                        selected_voice = voice
+                        break
+                if selected_voice is not None:
+                    self.speaker.Voice = selected_voice
+                self._ensure_speech_ready()
+                self.current_speech_text = preview_text
+                self.is_speaking = True
+                self.speaker.Speak(preview_text, 1)
+                self._start_speech_monitor()
+        except Exception as e:
+            print(f"[WARNING] Could not preview SAPI voice: {e}")
+
+    def _schedule_menu_highlight_preview(self, voice_full_name, voice_display):
+        """Debounce voice previews while hovering over dropdown menu entries."""
+        if not getattr(self, 'voice_preview_auto_var', None) or not self.voice_preview_auto_var.get():
+            return
+        if not voice_full_name or str(voice_full_name).strip() in {'', 'No voices available'}:
+            return
+
+        key = (voice_full_name, voice_display)
+        now = time.time()
+        last_key = getattr(self, '_last_hover_preview_key', None)
+        last_ts = getattr(self, '_last_hover_preview_ts', 0.0)
+        if key == last_key and (now - last_ts) < 0.8:
+            return
+
+        job = getattr(self, '_hover_preview_job', None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+
+        def _run_preview():
+            self._hover_preview_job = None
+            self._last_hover_preview_key = key
+            self._last_hover_preview_ts = time.time()
+            self._play_voice_preview(voice_full_name, voice_display)
+
+        self._hover_preview_job = self.root.after(120, _run_preview)
+
+    def _bind_voice_menu_hover_preview(self, area_frame, voice_menu):
+        """Bind hover events on a voice OptionMenu so highlighted entries preview automatically."""
+        menu = voice_menu['menu']
+        if getattr(menu, '_preview_hover_bound', False):
+            return
+
+        def _on_menu_map(_event=None, tk_menu=menu):
+            # Menu was just opened; skip the first highlight event so opening
+            # the dropdown doesn't immediately play a preview.
+            tk_menu._skip_first_preview_event = True
+
+        def _on_menu_select(_event=None, frame=area_frame, tk_menu=menu):
+            if not getattr(self, 'voice_preview_auto_var', None) or not self.voice_preview_auto_var.get():
+                return
+            if getattr(tk_menu, '_skip_first_preview_event', False):
+                tk_menu._skip_first_preview_event = False
+                return
+            try:
+                active_index = tk_menu.index('active')
+            except Exception:
+                return
+            if active_index is None:
+                return
+            try:
+                display_name = tk_menu.entrycget(active_index, 'label')
+            except Exception:
+                return
+            full_names = getattr(frame, 'voice_full_names', {}) or {}
+            self._schedule_menu_highlight_preview(full_names.get(display_name, display_name), display_name)
+
+        menu.bind('<Map>', _on_menu_map, add='+')
+        menu.bind('<<MenuSelect>>', _on_menu_select, add='+')
+        menu._preview_hover_bound = True
+
+    def generate_previews_for_all_voices(self):
+        """Generate and save preview WAV files for all currently available voices."""
+        if getattr(self, '_preview_generation_running', False):
+            self.status_label.config(text='Preview generation already running...', fg='orange')
+            return
+
+        display_names, full_names = self._build_voice_lists()
+        voices_to_generate = []
+        seen_full = set()
+        for display_name in display_names:
+            full_name = full_names.get(display_name, display_name)
+            if full_name in seen_full:
+                continue
+            seen_full.add(full_name)
+            voices_to_generate.append((display_name, full_name))
+
+        total = len(voices_to_generate)
+        if total == 0:
+            self.status_label.config(text='No voices available for preview generation', fg='orange')
+            return
+
+        previous_auto_preview = False
+        if getattr(self, 'voice_preview_auto_var', None):
+            try:
+                previous_auto_preview = bool(self.voice_preview_auto_var.get())
+            except Exception:
+                previous_auto_preview = False
+
+        self._preview_generation_running = True
+        if hasattr(self, 'generate_previews_button'):
+            self.generate_previews_button.config(state=tk.DISABLED, text='Generating...')
+        if hasattr(self, 'selection_previews_checkbutton'):
+            self.selection_previews_checkbutton.config(state=tk.DISABLED)
+            self.selection_previews_checkbutton.pack_forget()
+        if getattr(self, 'voice_preview_auto_var', None):
+            self.voice_preview_auto_var.set(False)
+        if hasattr(self, 'preview_generation_progress'):
+            self.preview_generation_progress.config(mode='determinate', maximum=total, value=0)
+            self.preview_generation_progress.pack(side='left', padx=(8, 0), before=self.hotkey_status_label)
+        self.status_label.config(text=f'Generating previews: 0/{total}', fg='black')
+
+        def _update_progress(done_count):
+            if hasattr(self, 'preview_generation_progress'):
+                self.preview_generation_progress.config(value=done_count)
+            self.status_label.config(text=f'Generating previews: {done_count}/{total}', fg='black')
+
+        def _finish(saved, failed):
+            self._preview_generation_running = False
+            if hasattr(self, 'generate_previews_button'):
+                self.generate_previews_button.config(state=tk.NORMAL, text='Generate Previews')
+            if hasattr(self, 'preview_generation_progress'):
+                self.preview_generation_progress.pack_forget()
+            if getattr(self, 'voice_preview_auto_var', None):
+                self.voice_preview_auto_var.set(previous_auto_preview)
+            if hasattr(self, 'selection_previews_checkbutton'):
+                self.selection_previews_checkbutton.pack(side='left', padx=(8, 0), before=self.hotkey_status_label)
+                self.selection_previews_checkbutton.config(state=tk.NORMAL)
+            if saved:
+                msg = f'Generated {saved}/{total} preview file(s)'
+                if failed:
+                    msg += f' ({failed} failed)'
+                self.status_label.config(text=msg, fg='black')
+            else:
+                self.status_label.config(text='No preview files were generated', fg='orange')
+
+        def _worker():
+            saved = 0
+            failed = 0
+            try:
+                preview_dir = os.path.join(APP_AI_VOICES_DIR, 'voice_previews')
+                os.makedirs(preview_dir, exist_ok=True)
+
+                for idx, (display_name, full_name) in enumerate(voices_to_generate, start=1):
+                    preview_text = self._build_preview_text(display_name, full_name)
+                    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(display_name or full_name or 'voice')).strip('_') or 'voice'
+                    preview_path = os.path.join(preview_dir, f"{safe_name[:80]}.wav")
+
+                    if self._save_preview_wav(preview_text, preview_path, full_name):
+                        saved += 1
+                    else:
+                        failed += 1
+
+                    self.root.after(0, lambda count=idx: _update_progress(count))
+            except Exception as e:
+                print(f"[WARNING] Preview generation failed: {e}")
+            finally:
+                self.root.after(0, lambda: _finish(saved, failed))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _mci_play(self, wav_path, duration_sec):
         """Play a WAV via Windows MCI — stoppable and pauseable from any thread."""
         import ctypes
@@ -2337,6 +2758,143 @@ class GameTextReader:
         self._mci_alias = None
         self._mci_command = None
 
+    def _ensure_pygame_mixer(self):
+        """Initialize pygame mixer once with a smaller buffer to reduce startup delay."""
+        just_initialized = False
+        if not pygame.mixer.get_init():
+            try:
+                pygame.mixer.init(buffer=512)
+            except Exception:
+                pygame.mixer.init()
+            just_initialized = True
+
+        # Some backends need a short settle period after init before first play.
+        if just_initialized and not self._pygame_mixer_warmed:
+            time.sleep(0.03)
+            self._pygame_mixer_warmed = True
+
+    def _stop_pygame_now(self):
+        """Best-effort immediate stop of current pygame playback."""
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.stop()
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def _cancel_current_pygame_request(self):
+        with self._pygame_lock:
+            req = self._pygame_current_request
+            if req:
+                req['cancel'].set()
+        self._stop_pygame_now()
+
+    def _pygame_playback_worker(self):
+        """Serialize pygame playback and support preemption."""
+        while True:
+            req = self._pygame_queue.get()
+            if req is None:
+                self._pygame_queue.task_done()
+                break
+
+            try:
+                with self._pygame_lock:
+                    is_current = self._pygame_current_request is req
+                if not is_current:
+                    req['ok'] = False
+                    continue
+
+                self._ensure_pygame_mixer()
+                sound = pygame.mixer.Sound(req['wav_path'])
+                duration = max(0.0, float(sound.get_length()))
+                channel = sound.play()
+                if channel is None:
+                    req['ok'] = False
+                else:
+                    start_t = time.monotonic()
+                    saw_busy = False
+                    while channel.get_busy():
+                        if req['cancel'].is_set():
+                            channel.stop()
+                            break
+                        saw_busy = True
+                        time.sleep(0.01)
+
+                    # If busy never flipped true (rare race right after play),
+                    # fall back to duration-based waiting before reporting done.
+                    if not saw_busy and not req['cancel'].is_set():
+                        grace_end = start_t + duration + 0.05 if duration > 0 else start_t + 0.2
+                        while time.monotonic() < grace_end:
+                            if req['cancel'].is_set():
+                                channel.stop()
+                                break
+                            if channel.get_busy():
+                                saw_busy = True
+                                break
+                            time.sleep(0.01)
+
+                        if saw_busy and not req['cancel'].is_set():
+                            while channel.get_busy():
+                                if req['cancel'].is_set():
+                                    channel.stop()
+                                    break
+                                time.sleep(0.01)
+
+                    req['ok'] = not req['cancel'].is_set()
+            except Exception as e:
+                req['ok'] = False
+                req['error'] = e
+            finally:
+                req['done'].set()
+                with self._pygame_lock:
+                    if self._pygame_current_request is req:
+                        self._pygame_current_request = None
+                self._pygame_queue.task_done()
+
+    def _pygame_play_sync(self, wav_path):
+        """Play a WAV on the pygame worker and block until complete or canceled."""
+        done = threading.Event()
+        cancel = threading.Event()
+        req = {
+            'id': None,
+            'wav_path': wav_path,
+            'done': done,
+            'cancel': cancel,
+            'ok': False,
+            'error': None,
+        }
+
+        # Preempt active or queued playback so the newest request starts next.
+        self._cancel_current_pygame_request()
+        while True:
+            try:
+                stale = self._pygame_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if stale is not None:
+                    stale['cancel'].set()
+                    stale['ok'] = False
+                    stale['done'].set()
+            except Exception:
+                pass
+            finally:
+                self._pygame_queue.task_done()
+
+        with self._pygame_lock:
+            self._pygame_request_seq += 1
+            req['id'] = self._pygame_request_seq
+            self._pygame_current_request = req
+
+        self._pygame_queue.put(req)
+
+        while not done.wait(0.05):
+            pass
+
+        if req['error']:
+            print(f"[WARN] pygame playback failed: {req['error']}")
+        return bool(req['ok'])
+
     def stop_speaking(self):
         """Stop the ongoing speech immediately."""
         # Stop both SAPI and UWP playback
@@ -2351,6 +2909,7 @@ class GameTextReader:
             self._piper_stop_requested = True
             self._pause_requested = False
             self._mci_command = None
+            self._cancel_current_pygame_request()
             try:
                 import ctypes
                 _alias = getattr(self, '_mci_alias', None) or 'gtrsnd'
@@ -2685,6 +3244,100 @@ class GameTextReader:
                 except Exception:
                     # swallow and continue
                     pass
+
+    def get_selected_ocr_backend(self):
+        """Return normalized OCR backend id."""
+        try:
+            backend = self.ocr_backend_var.get().strip().lower()
+        except Exception:
+            backend = "tesseract"
+        return backend if backend in ("tesseract", "rapidocr", "clipboard") else "tesseract"
+
+    def _get_selected_ocr_lang_code(self):
+        """Return selected OCR language code from combobox value."""
+        lang_code = ""
+        try:
+            lang_code = self.tesseract_language_var.get()
+        except Exception:
+            pass
+
+        if " " in lang_code:
+            lang_code = lang_code.split(" ")[0]
+        lang_code = (lang_code or "").strip()
+
+        backend = self.get_selected_ocr_backend()
+        if not lang_code:
+            if backend == "rapidocr":
+                return "auto"
+            if backend == "clipboard":
+                return "clipboard"
+            return "eng"
+        return lang_code
+
+    def get_text_from_clipboard(self, verbose=True):
+        """Return current clipboard text for clipboard OCR mode."""
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except Exception as e:
+            if verbose:
+                print(f"[ERROR] Clipboard OCR: Could not read clipboard text: {e}")
+            return ""
+        if verbose:
+            print(f"[INFO] Clipboard OCR: Retrieved text from clipboard: {clipboard_text[:50]}{'...' if len(clipboard_text) > 50 else ''}")
+        return clipboard_text.strip() if isinstance(clipboard_text, str) else ""
+
+    def check_selected_ocr_backend_installed(self):
+        """Check that whichever OCR backend is selected is usable."""
+        backend = self.get_selected_ocr_backend()
+        if backend == "clipboard":
+            return True, "Clipboard OCR - Ready"
+        if backend == "rapidocr":
+            if self.rapid_ocr_backend.is_available():
+                return True, "RapidOCR - Installed"
+            return False, "RapidOCR not installed"
+        return self.check_tesseract_installed()
+
+    def extract_text_from_image(self, image, psm_value="3"):
+        """Run OCR on a PIL image using the selected backend."""
+        backend = self.get_selected_ocr_backend()
+        lang_code = self._get_selected_ocr_lang_code()
+
+        if backend == "clipboard":
+            return self.get_text_from_clipboard()
+
+        if backend == "rapidocr":
+            if not self.rapid_ocr_backend.is_available():
+                print("[ERROR] OCR (rapidocr): RapidOCR is not installed.")
+                return ""
+
+            try:
+                return self.rapid_ocr_backend.image_to_string(image, lang=lang_code)
+            except Exception as e:
+                print(f"[ERROR] OCR (rapidocr/{lang_code}): {e}")
+                if lang_code != "auto":
+                    print("[NOTE] OCR: Falling back to RapidOCR auto mode.")
+                    try:
+                        return self.rapid_ocr_backend.image_to_string(image, lang="auto")
+                    except Exception:
+                        return ""
+                return ""
+
+        config_str = f'--psm {psm_value}'
+        if self.tesseract_manager.is_custom_language(lang_code):
+            tessdata_config = self.tesseract_manager.get_tessdata_dir_param()
+            config_str = f'{tessdata_config} --psm {psm_value}'
+
+        try:
+            return pytesseract.image_to_string(image, lang=lang_code, config=config_str)
+        except Exception as e:
+            print(f"[ERROR] OCR ({lang_code}): {e}")
+            if lang_code != 'eng':
+                print("[NOTE] OCR: Falling back to English.")
+                try:
+                    return pytesseract.image_to_string(image, lang='eng', config=f'--psm {psm_value}')
+                except Exception:
+                    return ""
+            return ""
             
     def check_tesseract_installed(self):
         """Check if Tesseract OCR is properly installed and accessible."""
@@ -2725,7 +3378,7 @@ class GameTextReader:
             
             if file_path:
                 # Validate that the selected file is actually tesseract.exe
-                if os.path.basename(file_path).lower() == 'tesseract.exe':
+                if True: #os.path.basename(file_path).lower() == 'tesseract.exe':
                     # Test if the selected executable works
                     try:
                         # Temporarily set the path and test
@@ -3837,6 +4490,12 @@ class GameTextReader:
                 saved_tesseract_lang = settings.get('tesseract_language')
                 if saved_tesseract_lang:
                     self.tesseract_language_var.set(saved_tesseract_lang)
+
+                saved_ocr_backend = settings.get('ocr_backend')
+                if saved_ocr_backend and hasattr(self, 'ocr_backend_var'):
+                    if saved_ocr_backend == "paddleocr":
+                        saved_ocr_backend = "rapidocr"
+                    self.ocr_backend_var.set(saved_ocr_backend)
                 
                 # Load Translation settings
                 if 'translation_enabled' in settings and hasattr(self, 'translation_enabled_var'):
@@ -3856,6 +4515,28 @@ class GameTextReader:
             import traceback
             traceback.print_exc()
         finally:
+            try:
+                ocr_ready, _ = self.check_selected_ocr_backend_installed()
+                if hasattr(self, 'status_label'):
+                    if not ocr_ready:
+                        selected_backend = self.get_selected_ocr_backend()
+                        if selected_backend == "rapidocr":
+                            self.status_label.config(
+                                text="→ RapidOCR missing. install rapidocr in your Python environment. ←",
+                                fg="red",
+                                font=("Helvetica", 10, "bold")
+                            )
+                        else:
+                            self.status_label.config(
+                                text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                                fg="red",
+                                font=("Helvetica", 10, "bold")
+                            )
+                    else:
+                        self.status_label.config(text="", fg="black", font=("Helvetica", 10))
+            except Exception:
+                pass
+
             # Only clear it if we were the ones who set it
             if not already_loading:
                 self._loading_settings = False
@@ -3961,6 +4642,27 @@ class GameTextReader:
         self._kokoro_update_available = None
         threading.Thread(target=_run, daemon=True).start()
 
+    def save_tesseract_settings(self):
+        """Save OCR-related settings to the global settings file."""
+        try:
+            temp_path = APP_SETTINGS_PATH
+
+            settings = {}
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                except Exception:
+                    settings = {}
+
+            settings['tesseract_language'] = self.tesseract_language_var.get()
+            settings['ocr_backend'] = self.ocr_backend_var.get()
+
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving OCR settings: {e}")
+
     def save_global_settings(self):
         """Save global settings (master hotkey, sound, banner, etc.) to JSON."""
         # Don't save if we are currently loading settings or layout
@@ -4017,6 +4719,8 @@ class GameTextReader:
             # Update Tesseract settings
             if hasattr(self, 'tesseract_language_var'):
                 settings['tesseract_language'] = self.tesseract_language_var.get()
+            if hasattr(self, 'ocr_backend_var'):
+                settings['ocr_backend'] = self.ocr_backend_var.get()
                 
             # Save back to file
             with open(temp_path, 'w', encoding='utf-8') as f:
@@ -4382,7 +5086,7 @@ class GameTextReader:
     def set_master_hotkey(self):
         """Start the hotkey assignment for the master hotkey"""
         self.master_hotkey_button.is_master_hotkey_button = True
-        self.master_hotkey_button.config(text="Press any key...")
+        self.master_hotkey_button.config(text=PRESS_ANY_KEY)
         self.set_hotkey(self.master_hotkey_button, None)
 
     def setup_gui(self):
@@ -4409,6 +5113,32 @@ class GameTextReader:
         tk.Button(volume_frame, text="Voice Manager",
                   command=self.open_ai_voice_manager_window,
                   font=("Helvetica", 9)).pack(side='left', padx=(10, 0))
+
+        self.generate_previews_button = tk.Button(
+            volume_frame,
+            text="Generate Previews",
+            command=self.generate_previews_for_all_voices,
+            font=("Helvetica", 9)
+        )
+        self.generate_previews_button.pack(side='left', padx=(8, 0))
+
+        self.selection_previews_checkbutton = tk.Checkbutton(
+            volume_frame,
+            text="Selection Previews",
+            variable=self.voice_preview_auto_var
+        )
+        self.selection_previews_checkbutton.pack(side='left', padx=(8, 0))
+
+        self.preview_generation_progress = ttk.Progressbar(
+            volume_frame,
+            orient=tk.HORIZONTAL,
+            mode='determinate',
+            length=120,
+            maximum=100,
+            value=0
+        )
+        self.preview_generation_progress.pack(side='left', padx=(8, 0))
+        self.preview_generation_progress.pack_forget()
 
         # Hotkey status/Area notification label (moved here from left side, right of volume)
         self.hotkey_status_label = tk.Label(volume_frame, text="", font=("Helvetica", 10, "bold"), fg="red")
@@ -4472,12 +5202,6 @@ class GameTextReader:
         banner_check = tk.Checkbutton(options_frame, text="Banner", variable=self.master_hotkey_banner_var)
         banner_check.pack(side='top', anchor='w', pady=0)
         
-        save_button = tk.Button(buttons_frame, text="💾 Save Layout", command=self.save_layout)
-        save_button.pack(side='left', padx=5)
-        
-        load_button = tk.Button(buttons_frame, text="📁 Load Layout..", command=self.load_layout)
-        load_button.pack(side='left', padx=5)
-        
         program_saves_button = tk.Button(buttons_frame, text="📁 Datafolder", 
                                        command=self.open_game_reader_folder)
         program_saves_button.pack(side='left', padx=5)
@@ -4522,6 +5246,12 @@ class GameTextReader:
             # Fallback for older Tk versions
             self.layout_file.trace('w', _refresh_layout_label)
         _refresh_layout_label()
+
+        save_button = tk.Button(layout_frame, text="💾 Save Layout", command=self.save_layout)
+        save_button.pack(side='left', padx=5)
+        
+        load_button = tk.Button(layout_frame, text="📁 Load Layout..", command=self.load_layout)
+        load_button.pack(side='left', padx=5)
         
         # Additional Options button
         additional_options_button = tk.Button(buttons_right_frame, text="⚙ Additional Options", 
@@ -4762,11 +5492,17 @@ class GameTextReader:
         
         print("GUI setup complete.")
         
-        # Check Tesseract installation and update status label if not installed
-        tesseract_installed, tesseract_message = self.check_tesseract_installed()
-        if not tesseract_installed:
+        # Check selected OCR backend and update status if it's unavailable.
+        ocr_ready, _ = self.check_selected_ocr_backend_installed()
+        if not ocr_ready:
+            selected_backend = self.get_selected_ocr_backend()
+            if selected_backend == "rapidocr":
+                status_text = "→ RapidOCR missing. install rapidocr in your Python environment. ←"
+            else:
+                status_text = "→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←"
+
             self.status_label.config(
-                text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                text=status_text,
                 fg="red",
                 font=("Helvetica", 10, "bold")
             )
@@ -4837,6 +5573,8 @@ class GameTextReader:
                         vv._full_name = fn.get(n, n)
                         area_name = area[3].get()
                         self._set_unsaved_changes('area_settings', area_name)
+                        if getattr(self, 'voice_preview_auto_var', None) and self.voice_preview_auto_var.get():
+                            self._play_voice_preview(fn.get(n, n), n)
                     menu.add_command(label=name, command=_cmd)
 
                 # Update the stored full_names map on the frame
@@ -5028,12 +5766,7 @@ class GameTextReader:
         original_bad_word_list = self.bad_word_list.get().strip()
         
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                options_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting additional options window icon: {e}")
+        set_window_icon(options_window)
         
         # Create main frame for the options
         main_frame = tk.Frame(options_window)
@@ -5052,16 +5785,28 @@ class GameTextReader:
         right_col = tk.Frame(columns)
         right_col.pack(side='left', fill='both', expand=True)
 
-        # --- Tesseract Settings Section ---
+        # --- OCR Settings Section ---
         tesseract_frame = tk.Frame(left_col)
         tesseract_frame.pack(fill='x', pady=(10, 0))
-        tk.Label(tesseract_frame, text="Tesseract OCR Settings:", font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(0, 2))
+        tk.Label(tesseract_frame, text="OCR Settings:", font=("Helvetica", 10, "bold")).pack(anchor='w', pady=(0, 2))
         
         # Plain english description for Tesseract
         tk.Label(tesseract_frame, 
-                 text="Select the language intended to be detected/scanned on screen for better text recognition.", 
+                 text="Select OCR engine and language used for screen text recognition.", 
                  justify="left", fg="#555555", font=("Helvetica", 8)).pack(anchor="w", pady=(0, 5))
         
+        engine_row = tk.Frame(tesseract_frame)
+        engine_row.pack(fill='x', padx=20, pady=(0, 3))
+        tk.Label(engine_row, text="OCR Engine:", font=("Helvetica", 9)).pack(side='left')
+        ocr_backend_combo = ttk.Combobox(
+            engine_row,
+            textvariable=self.ocr_backend_var,
+            values=("tesseract", "rapidocr", "clipboard"),
+            width=30,
+            state="readonly"
+        )
+        ocr_backend_combo.pack(side='left', padx=(5, 15))
+
         tess_controls_frame = tk.Frame(tesseract_frame)
         tess_controls_frame.pack(fill='x', padx=20)
         
@@ -5070,60 +5815,105 @@ class GameTextReader:
         tess_lang_combo = ttk.Combobox(tess_controls_frame, textvariable=self.tesseract_language_var, width=30, state="readonly")
         tess_lang_combo.pack(side='left', padx=(5, 15))
         
-        # Function to populate Tesseract languages
+        manage_languages_button = tk.Button(
+            tess_controls_frame,
+            text="Manage Languages",
+            command=self.open_tesseract_manager_window,
+            font=("Helvetica", 9)
+        )
+        manage_languages_button.pack(side='left')
+
+        # Function to populate OCR languages based on selected backend.
         def update_tess_langs(event=None):
+            backend = self.get_selected_ocr_backend()
+            current = self.tesseract_language_var.get()
+
+            if backend == "clipboard":
+                lang_list = ["clipboard (Clipboard text)"]
+                tess_lang_combo['values'] = lang_list
+                manage_languages_button.config(state=tk.DISABLED)
+                if current != "clipboard (Clipboard text)":
+                    self.tesseract_language_var.set("clipboard (Clipboard text)")
+                return
+
+            if backend == "rapidocr":
+                langs = self.rapid_ocr_backend.get_available_languages()
+                lang_list = sorted([f"{code} ({name})" for code, name in langs.items()])
+                tess_lang_combo['values'] = lang_list
+                manage_languages_button.config(state=tk.DISABLED)
+
+                current_code = current.split(" ")[0] if current else ""
+                if current_code not in langs:
+                    self.tesseract_language_var.set("auto (Auto)")
+                return
+
             langs = self.tesseract_manager.get_installed_languages()
-            # Sort: Default first, then alphabetical
             lang_list = []
             default_entry = ""
             other_entries = []
-            
+
             for code, name in langs.items():
-                # Skip OSD
                 if code == 'osd':
                     continue
-                    
+
                 entry = f"{code} ({name})"
                 if "(Default)" in entry:
                     default_entry = entry
                 else:
                     other_entries.append(entry)
-            
+
             other_entries.sort()
             if default_entry:
                 lang_list = [default_entry] + other_entries
             else:
                 lang_list = other_entries
-                
+
             tess_lang_combo['values'] = lang_list
-            
-            # Ensure current value is valid
-            current = self.tesseract_language_var.get()
-            
-            # If empty, try to set default
+            manage_languages_button.config(state=tk.NORMAL)
+
             if not current and default_entry:
                 self.tesseract_language_var.set(default_entry)
                 return
 
-            # If current value is just a code (e.g. "eng"), match it to full entry
             if current and " (" not in current:
-                 for entry in lang_list:
-                     if f"({current})" in entry or f" {current}" in entry or entry.startswith(f"{current} ("):
-                         self.tesseract_language_var.set(entry)
-                         return
+                for entry in lang_list:
+                    if entry.startswith(f"{current} ("):
+                        self.tesseract_language_var.set(entry)
+                        return
 
         update_tess_langs()
         
         # Save on change immediately
         def on_tess_change(event):
             self.save_tesseract_settings()
+            self.save_global_settings()
+
+        def on_ocr_backend_change(event=None):
+            update_tess_langs()
+            self.save_global_settings()
+
+            ocr_ready, _ = self.check_selected_ocr_backend_installed()
+            if not ocr_ready:
+                selected_backend = self.get_selected_ocr_backend()
+                if selected_backend == "rapidocr":
+                    self.status_label.config(
+                        text="→ RapidOCR missing. install rapidocr in your Python environment. ←",
+                        fg="red",
+                        font=("Helvetica", 10, "bold")
+                    )
+                else:
+                    self.status_label.config(
+                        text="→ Tesseract OCR missing. click the [Info/Help] button for instructions. ←",
+                        fg="red",
+                        font=("Helvetica", 10, "bold")
+                    )
+            else:
+                self.status_label.config(text="", fg="black", font=("Helvetica", 10))
             
         tess_lang_combo.bind("<<ComboboxSelected>>", on_tess_change)
         tess_lang_combo.bind("<FocusIn>", update_tess_langs)
+        ocr_backend_combo.bind("<<ComboboxSelected>>", on_ocr_backend_change)
         
-        # Download Manager Button
-        tk.Button(tess_controls_frame, text="Manage Languages", command=self.open_tesseract_manager_window, font=("Helvetica", 9)).pack(side='left')
-
         # Separator
         ttk.Separator(left_col, orient='horizontal').pack(fill='x', pady=5)
 
@@ -5668,13 +6458,8 @@ class GameTextReader:
         apply_window_geometry(credits_window, 'credits', 600, 700, center=False)
         credits_window.resizable(False, False)
         
-        # Set icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                credits_window.iconbitmap(icon_path)
-        except Exception:
-            pass
+        # Set window icon
+        set_window_icon(credits_window)
             
         # Main content
         main_frame = ttk.Frame(credits_window, padding="20 20 20 20")
@@ -5771,13 +6556,8 @@ class GameTextReader:
         info_window.protocol("WM_DELETE_WINDOW", on_info_close)
         info_window.bind('<Escape>', lambda e: on_info_close())
         
-        # Set window icon if available
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                info_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting info window icon: {e}")
+        # Set window icon
+        set_window_icon(info_window)
         
         # Main container with reduced padding
         main_frame = ttk.Frame(info_window, padding="15 10 15 5")
@@ -6700,13 +7480,8 @@ class GameTextReader:
         how_to_use_window.title(f"{APP_NAME} - How to Use")
         apply_window_geometry(how_to_use_window, 'how_to_use', 900, 700)
         
-        # Set window icon if available
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                how_to_use_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting how to use window icon: {e}")
+        # Set window icon
+        set_window_icon(how_to_use_window)
         
         # Main container
         main_frame = ttk.Frame(how_to_use_window, padding="15 10 15 5")
@@ -7510,7 +8285,7 @@ class GameTextReader:
                 finish_hotkey_assignment()
 
         # Set button to indicate we're waiting for input
-        self.stop_hotkey_button.config(text="Press any key or combination...")
+        self.stop_hotkey_button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -7541,9 +8316,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        self.stop_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                        self.stop_hotkey_button.config(text=f"{PRESS_ANY_KEY} [ {preview} + ]")
                     else:
-                        self.stop_hotkey_button.config(text="Press any key or combination...")
+                        self.stop_hotkey_button.config(text=PRESS_ANY_KEY)
                     # Live expand window width if needed
                     self._ensure_window_width()
                 except Exception:
@@ -7976,7 +8751,7 @@ class GameTextReader:
                 return
 
         # Set button to indicate we're waiting for input
-        self.pause_hotkey_button.config(text="Press any key or combination...")
+        self.pause_hotkey_button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -8003,9 +8778,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        self.pause_hotkey_button.config(text=f"Press any key or combination... [ {preview} + ]")
+                        self.pause_hotkey_button.config(text=f"{PRESS_ANY_KEY} [ {preview} + ]")
                     else:
-                        self.pause_hotkey_button.config(text="Press any key or combination...")
+                        self.pause_hotkey_button.config(text=PRESS_ANY_KEY)
                     self._ensure_window_width()
                 except Exception:
                     pass
@@ -8563,7 +9338,7 @@ class GameTextReader:
             return
 
         # Set button to indicate we're waiting for input
-        button.config(text="Press any key or combination...")
+        button.config(text=PRESS_ANY_KEY)
         
         # Set up temporary hooks for key and mouse input
         try:
@@ -8591,9 +9366,9 @@ class GameTextReader:
                         mods.append('WIN')
                     preview = " + ".join(mods)
                     if preview:
-                        button.config(text=f"Press any key or combination...\n[ {preview} + ]")
+                        button.config(text=f"{PRESS_ANY_KEY}\n[ {preview} + ]")
                     else:
-                        button.config(text="Press any key or combination...")
+                        button.config(text=PRESS_ANY_KEY)
                     # Live expand window width if needed
                     self._ensure_window_width()
                 except Exception:
@@ -8872,7 +9647,7 @@ class GameTextReader:
         area_frame = tk.Frame(parent_container)
         area_frame.pack(pady=(4, 0), anchor='center')
         area_name_var = tk.StringVar(value=area_name)
-        area_name_label = tk.Label(area_frame, textvariable=area_name_var)
+        area_name_label = tk.Label(area_frame, textvariable=area_name_var, width=16, relief="solid", borderwidth=2)
         area_name_label.pack(side="left")
         
         # Add separator after area name
@@ -8882,7 +9657,7 @@ class GameTextReader:
         freeze_screen_var = None
         if is_auto_read:
             freeze_screen_var = tk.BooleanVar(value=False)
-            freeze_screen_checkbox = tk.Checkbutton(area_frame, text="Freez\nScreen", variable=freeze_screen_var)
+            freeze_screen_checkbox = tk.Checkbutton(area_frame, text="Freeze\nScreen", variable=freeze_screen_var)
             freeze_screen_checkbox.pack(side="left")
             # Track freeze screen checkbox changes to mark as unsaved
             def on_freeze_screen_change(*args):
@@ -8920,26 +9695,10 @@ class GameTextReader:
         set_area_button = None
 
         # Always add hotkey button for all areas, including Auto Read
-        hotkey_button = tk.Button(area_frame, text="Set Hotkey")
+        hotkey_button = tk.Button(area_frame, text="Set Hotkey", width=12)
         hotkey_button.config(command=lambda: self.set_hotkey(hotkey_button, area_frame))
         hotkey_button.bind("<Button-3>", lambda e: self._show_hotkey_context_menu(hotkey_button, area_frame, e))
         hotkey_button.pack(side="left")
-        
-        # Add separator
-        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
-        
-        # Add Img. Processing button with checkbox
-        customize_button = tk.Button(area_frame, text="Img. Processing...", command=partial(self.customize_processing, area_name_var))
-        customize_button.pack(side="left")
-        tk.Label(area_frame, text=" Enable:").pack(side="left")  # Label for the checkbox
-        preprocess_var = tk.BooleanVar()
-        preprocess_checkbox = tk.Checkbutton(area_frame, variable=preprocess_var)
-        preprocess_checkbox.pack(side="left")
-        # Track preprocess checkbox changes to mark as unsaved
-        def on_preprocess_change(*args):
-            area_name = area_name_var.get()
-            self._set_unsaved_changes('area_settings', area_name)
-        preprocess_var.trace('w', on_preprocess_change)
         
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
@@ -8964,6 +9723,8 @@ class GameTextReader:
             # Mark as unsaved when voice changes
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
+            if getattr(self, 'voice_preview_auto_var', None) and self.voice_preview_auto_var.get():
+                self._play_voice_preview(getattr(voice_var, '_full_name', selected_display), selected_display)
 
         # Set the full name for the default voice
         if default_voice in voice_full_names:
@@ -8978,7 +9739,7 @@ class GameTextReader:
         )
         # Set a fixed width to prevent layout issues when voice names change
         # This ensures the dropdown doesn't change size and push other elements around
-        voice_menu.config(width=40)  # Fixed width that can accommodate most voice names
+        voice_menu.config(width=35)  # Fixed width that can accommodate most voice names
 
         # Configure the OptionMenu to display text left-aligned instead of centered
         # This prevents long names from being cut off on the sides
@@ -8989,27 +9750,53 @@ class GameTextReader:
         area_frame.voice_full_names = voice_full_names
         
         voice_menu.pack(side="left")
-        
 
+        self._bind_voice_menu_hover_preview(area_frame, voice_menu)
 
-        
-
-        
-
-        
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
         speed_var = tk.StringVar(value="100")
-        tk.Label(area_frame, text="Reading Speed % :").pack(side="left")
+        tk.Label(area_frame, text="Speed(%):").pack(side="left")
         vcmd = (self.root.register(lambda P: self.validate_numeric_input(P, is_speed=True)), '%P')
-        speed_entry = tk.Entry(area_frame, textvariable=speed_var, width=5, validate='all', validatecommand=vcmd)
+        speed_entry = tk.Spinbox(area_frame,
+            textvariable=speed_var,
+            width=4,
+            from_=10,
+            to=500,
+            increment=5,
+            validate='all',
+            validatecommand=vcmd)
         speed_entry.pack(side="left")
         # Track speed changes to mark as unsaved
         def on_speed_change(*args):
             area_name = area_name_var.get()
             self._set_unsaved_changes('area_settings', area_name)
         speed_var.trace('w', on_speed_change)
+
+        # Add separator
+        tk.Label(area_frame, text=" ⏐ ").pack(side="left")
+        
+        # Add Img. Processing button with checkbox
+        customize_button = tk.Button(area_frame, text="OCR Pre-Processing", command=partial(self.customize_processing, area_name_var))
+        customize_button.pack(side="left")
+
+        # Button to toggle preprocessing on/off
+        preprocess_var = tk.BooleanVar()
+        preprocess_checkbox = tk.Checkbutton(area_frame,
+            text="Enable",
+            variable=preprocess_var,
+            selectcolor="#4CAF50",
+            width=7,
+            indicatoron=False)
+        preprocess_checkbox.pack(side="left")
+
+        # Track preprocess checkbox changes to mark as unsaved
+        def on_preprocess_change(*args):
+            area_name = area_name_var.get()
+            self._set_unsaved_changes('area_settings', area_name)
+        preprocess_var.trace('w', on_preprocess_change)
+
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
         
@@ -9048,17 +9835,26 @@ class GameTextReader:
             command=on_psm_selection
         )
         # Set a fixed width to prevent layout issues
-        psm_menu.config(width=8)
+        psm_menu.config(width=20)
         # Configure the OptionMenu to display text left-aligned instead of centered
         psm_menu.config(anchor="w")  # "w" = west (left-aligned)
+        # Disable PSM menu if not using Tesseract
+        if self.ocr_backend_var.get() != "Tesseract":
+            psm_menu.config(state="disabled")
         psm_menu.pack(side="left")
         # Add separator
         tk.Label(area_frame, text=" ⏐ ").pack(side="left")
 
         if removable or is_auto_read:
             # Add Remove Area button for all removable areas (including Auto Read areas)
-            remove_area_button = tk.Button(area_frame, text="Remove Area", command=lambda: self.remove_area(area_frame, area_name_var.get()))
-            remove_area_button.pack(side="left")
+            remove_area_button = tk.Button(
+                area_frame,
+                text="❌ Remove",
+                command=lambda: self.remove_area(area_frame, area_name_var.get()),
+                font=("Helvetica", 9),
+                fg="red"
+            )
+            remove_area_button.pack(side='left')
             # Add separator
             tk.Label(area_frame, text="").pack(side="left")  # No symbol for last separator; empty label
         else:
@@ -9281,283 +10077,300 @@ class GameTextReader:
     def resize_window(self, force: bool = False):
         """Resize the window based on current content.
         If force is True, actively set the window geometry to fit the content (used after loading a layout)."""
-        # Ensure positions/sizes are current
-        self.root.update_idletasks()
+        # resize_window() is called from many <Configure> bindings. The body also
+        # changes widget/canvas sizes, which can trigger more <Configure> events.
+        # Guard against re-entrant calls to avoid unbounded recursive callback stacks.
+        if self._resize_window_in_progress:
+            self._resize_window_pending = True
+            self._resize_window_pending_force = self._resize_window_pending_force or force
+            return
 
-        # Dynamically compute the non-scrollable portion height (everything above the areas canvas)
-        # This includes the Auto Read section, so we need to account for it separately
+        self._resize_window_in_progress = True
         try:
-            base_top = self.area_canvas.winfo_rooty() - self.root.winfo_rooty()
-            # Ensure base_top is not negative (can happen during initialization)
-            if base_top < 0:
-                base_top = 210  # Use safe default
-        except Exception:
-            base_top = 210
-        # base_height represents the Y position of area_canvas, which includes Auto Read section above it
-        # We'll calculate the actual base (non-Auto Read) height separately
-        base_height = max(150, base_top + 20)  # add small bottom margin
-        min_width = 850
-        max_width = 1000
-        area_frame_height = 0
-        if len(self.areas) > 0:
-            self.area_frame.update_idletasks()
-            area_frame_height = self.area_frame.winfo_height()
-        # Determine total height needed for all current areas
-        area_row_height = 60  # Approx row height (for fallback)
-        # Count only non-Auto Read areas for the scroll field calculation
-        num_scroll_areas = 0
-        for area in self.areas:
-            if len(area) >= 9:
-                area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
-            else:
-                area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
-            area_name = area_name_var.get()
-            if not area_name.startswith("Auto Read"):
-                num_scroll_areas += 1
-        content_height = area_frame_height if area_frame_height > 0 else num_scroll_areas * area_row_height
-        
-        # Calculate Auto Read canvas height to include in total window height
-        # This will be recalculated and applied later in the Auto Read scrolling section
-        auto_read_canvas_height = 0
-        auto_read_count = 0
-        auto_read_frame_height = 0
-        auto_read_row_height = 60  # Approx row height for Auto Read areas
-        
-        if hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+        # Ensure positions/sizes are current
+            self.root.update_idletasks()
+
+            # Dynamically compute the non-scrollable portion height (everything above the areas canvas)
+            # This includes the Auto Read section, so we need to account for it separately
             try:
-                # Count Auto Read areas
-                for area in self.areas:
-                    if len(area) >= 9:
-                        area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
-                    else:
-                        area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
-                    area_name = area_name_var.get()
-                    if area_name.startswith("Auto Read"):
-                        auto_read_count += 1
+                base_top = self.area_canvas.winfo_rooty() - self.root.winfo_rooty()
+                # Ensure base_top is not negative (can happen during initialization)
+                if base_top < 0:
+                    base_top = 210  # Use safe default
+            except Exception:
+                base_top = 210
+            # base_height represents the Y position of area_canvas, which includes Auto Read section above it
+            # We'll calculate the actual base (non-Auto Read) height separately
+            base_height = max(150, base_top + 20)  # add small bottom margin
+            min_width = 850
+            max_width = 1000
+            area_frame_height = 0
+            if len(self.areas) > 0:
+                self.area_frame.update_idletasks()
+                area_frame_height = self.area_frame.winfo_height()
+            # Determine total height needed for all current areas
+            area_row_height = 60  # Approx row height (for fallback)
+            # Count only non-Auto Read areas for the scroll field calculation
+            num_scroll_areas = 0
+            for area in self.areas:
+                if len(area) >= 9:
+                    area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                else:
+                    area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                area_name = area_name_var.get()
+                if not area_name.startswith("Auto Read"):
+                    num_scroll_areas += 1
+            content_height = area_frame_height if area_frame_height > 0 else num_scroll_areas * area_row_height
+        
+            # Calculate Auto Read canvas height to include in total window height
+            # This will be recalculated and applied later in the Auto Read scrolling section
+            auto_read_canvas_height = 0
+            auto_read_count = 0
+            auto_read_frame_height = 0
+            auto_read_row_height = 60  # Approx row height for Auto Read areas
+        
+            if hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+                try:
+                    # Count Auto Read areas
+                    for area in self.areas:
+                        if len(area) >= 9:
+                            area_frame, _, _, area_name_var, _, _, _, _, _ = area[:9]
+                        else:
+                            area_frame, _, _, area_name_var, _, _, _, _ = area[:8]
+                        area_name = area_name_var.get()
+                        if area_name.startswith("Auto Read"):
+                            auto_read_count += 1
                 
-                # Get frame height after ensuring it's updated
+                    # Get frame height after ensuring it's updated
+                    self.auto_read_frame.update_idletasks()
+                    auto_read_frame_height = self.auto_read_frame.winfo_height()
+                
+                    auto_read_show_scroll = auto_read_count >= 4
+                
+                    if auto_read_show_scroll:
+                        # Show exactly 4 rows when scrolling is active
+                        # Use actual measured height per row if available, otherwise use estimate
+                        if auto_read_frame_height > 0 and auto_read_count > 0:
+                            # Calculate actual height per row
+                            actual_row_height = auto_read_frame_height / auto_read_count
+                            # Use 4 rows
+                            auto_read_canvas_height = int(4 * actual_row_height)
+                        else:
+                            # Fallback: use 4 rows estimate
+                            auto_read_canvas_height = 4 * auto_read_row_height
+                    else:
+                        # All Auto Read content fits
+                        if auto_read_frame_height > 0:
+                            auto_read_canvas_height = max(auto_read_frame_height, auto_read_row_height)
+                        else:
+                            auto_read_canvas_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+                except Exception:
+                    auto_read_canvas_height = 0
+        
+            # base_top is the Y position of area_canvas, which already accounts for everything above it
+            # including the Auto Read section. base_height = base_top + 20 (with minimum of 150).
+            # We need to ensure the window is tall enough for:
+            # - Everything up to area_canvas (base_height, which includes Auto Read section)
+            # - The regular areas content (content_height)
+            # But we also need to verify the Auto Read section has enough space.
+        
+            # Calculate total height: base_height already includes space up to area_canvas
+            # However, base_height might not account for the actual Auto Read canvas height if it grew,
+            # so we need to ensure we have enough space for Auto Read + regular areas
+        
+            # Get the actual position of area_canvas to calculate properly
+            # base_height = max(150, base_top + 20) ensures minimum, but base_top should reflect Auto Read growth
+            # If Auto Read canvas exists and has height, ensure we account for it
+            if hasattr(self, 'auto_read_canvas') and auto_read_canvas_height > 0:
+                # Get position of Auto Read section
+                try:
+                    auto_read_top = self.auto_read_outer_frame.winfo_rooty() - self.root.winfo_rooty()
+                except Exception:
+                    auto_read_top = 0
+            
+                if auto_read_top > 0:
+                    # Calculate: space to Auto Read + Auto Read height + space to regular areas + regular areas
+                    # space_to_regular = base_top - (auto_read_top + auto_read_canvas_height)
+                    # But base_top might not be accurate yet, so use base_height as fallback
+                    # Total = auto_read_top + auto_read_canvas_height + space_between + content_height + margin
+                    # Where space_between includes separator and button
+                    auto_read_bottom = auto_read_top + auto_read_canvas_height
+                    if base_top > auto_read_bottom:
+                        space_between = base_top - auto_read_bottom
+                    else:
+                        # base_top might not be updated yet, use a reasonable estimate
+                        space_between = 30  # separator + button area
+                    space_between = max(30, space_between)  # Ensure minimum space
+                    total_height_unconstrained = auto_read_top + auto_read_canvas_height + space_between + content_height + 20
+                else:
+                    # Fallback: use base_height which should account for Auto Read
+                    total_height_unconstrained = base_height + content_height
+            else:
+                # No Auto Read or no height yet, use base_height
+                total_height_unconstrained = base_height + content_height
+        
+            # Add separator height to total (separator is after area_outer_frame)
+            separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+            total_height_unconstrained += separator_height_estimate
+        
+            # Ensure total_height is always positive and reasonable
+            # If calculation resulted in invalid value, use safe fallback
+            if total_height_unconstrained < 250:
+                # Something went wrong with the calculation, use safe defaults
+                total_height = max(base_height + content_height + auto_read_canvas_height + 20, 250)
+            else:
+                total_height = total_height_unconstrained
+            # Screen-constrained maximum height
+            try:
+                screen_h = self.root.winfo_screenheight()
+            except Exception:
+                screen_h = 1000
+            vertical_margin = 140  # Keep some space from screen edges
+            max_allowed_height = max(300, screen_h - vertical_margin)
+            # Decide if scrollbar should be shown either due to screen limit or explicit row limit (>9)
+            show_scroll_due_to_count = num_scroll_areas > 5
+            show_scroll_due_to_screen = total_height_unconstrained > max_allowed_height
+            show_scroll = show_scroll_due_to_count or show_scroll_due_to_screen
+
+            # Compute target height of the window
+            # Note: separator height is already included in total_height_unconstrained
+            if show_scroll_due_to_count:
+                # Cap visible rows to 5 when there are more than 9 areas
+                visible_rows = 5
+                # Do not grow the window further when crossing the threshold; keep current height or smaller cap
+                cur_h_for_cap = self.root.winfo_height()
+                # Include separator height estimate in the calculation
+                separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
+                desired_height_cap = min(base_height + visible_rows * area_row_height + separator_height_estimate, max_allowed_height)
+                target_height = min(cur_h_for_cap, desired_height_cap)
+            else:
+                # Otherwise try to fit all content within the screen
+                # total_height_unconstrained already includes separator height
+                target_height = min(total_height_unconstrained, max_allowed_height)
+        
+            # Determine the widest area
+            widest = min_width
+            for area in self.areas:
+                frame = area[0]
+                frame.update_idletasks()
+                frame_left = frame.winfo_rootx()
+                farthest_right = frame_left
+                for child in frame.winfo_children():
+                    child.update_idletasks()
+                    child_right = child.winfo_rootx() + child.winfo_width()
+                    if child_right > farthest_right:
+                        farthest_right = child_right
+                area_width = farthest_right - frame_left
+                if area_width > widest:
+                    widest = area_width
+            widest += 60
+                                                                        
+                 
+            window_width = max(min_width, min(max_width, widest))        
+        
+            # Apply scrollbar logic based on whether all content fits vertically
+            if hasattr(self, 'area_scrollbar') and hasattr(self, 'area_canvas'):
+                if show_scroll:
+                    # Need scrolling
+                    self.area_scrollbar.pack(side='right', fill='y')
+                    self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
+                    if show_scroll_due_to_count:
+                        canvas_height = max(100, min(target_height - base_height, 5 * area_row_height))
+                    else:
+                        canvas_height = max(100, target_height - base_height)
+                    self.area_canvas.config(height=canvas_height)
+                    # Add extra height to ensure separator is visible when scrollbar appears
+                    if hasattr(self, 'area_separator'):
+                        self.area_separator.lift()
+                        # Increase target_height by 10px to ensure separator is visible
+                        target_height = min(target_height + 5, max_allowed_height)
+                else:
+                    # All content fits; no scrollbar
+                    self.area_scrollbar.pack_forget()
+                    # Expand canvas to show all content when it fits
+                    self.area_canvas.config(height=area_frame_height)
+                    # Ensure separator is visible
+                    if hasattr(self, 'area_separator'):
+                        self.area_separator.lift()
+        
+            # Handle Auto Read area scrolling - show scrollbar when there are more than 4 Auto Read areas
+            # Reuse the values calculated above to ensure consistency
+            if hasattr(self, 'auto_read_scrollbar') and hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
+                # Recalculate frame height to ensure it's current
                 self.auto_read_frame.update_idletasks()
                 auto_read_frame_height = self.auto_read_frame.winfo_height()
-                
+            
+                # Recalculate scroll status and canvas height
                 auto_read_show_scroll = auto_read_count >= 4
-                
+            
                 if auto_read_show_scroll:
+                    # Need scrolling for Auto Read areas
+                    self.auto_read_scrollbar.pack(side='right', fill='y')
+                    self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
                     # Show exactly 4 rows when scrolling is active
-                    # Use actual measured height per row if available, otherwise use estimate
                     if auto_read_frame_height > 0 and auto_read_count > 0:
                         # Calculate actual height per row
                         actual_row_height = auto_read_frame_height / auto_read_count
                         # Use 4 rows
-                        auto_read_canvas_height = int(4 * actual_row_height)
+                        calculated_height = int(4 * actual_row_height)
                     else:
                         # Fallback: use 4 rows estimate
-                        auto_read_canvas_height = 4 * auto_read_row_height
+                        calculated_height = 4 * auto_read_row_height
+                    self.auto_read_canvas.config(height=calculated_height)
+                    auto_read_canvas_height = calculated_height  # Update for consistency
+                    # Update scroll region and ensure inner frame width matches canvas
+                    self.root.update_idletasks()
+                    canvas_width = self.auto_read_canvas.winfo_width()
+                    if canvas_width > 1:
+                        self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                    self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
                 else:
-                    # All Auto Read content fits
+                    # All Auto Read content fits; no scrollbar
+                    self.auto_read_scrollbar.pack_forget()
+                    # Expand canvas to show all content when it fits
+                    # Use the same calculated height from above for consistency
                     if auto_read_frame_height > 0:
-                        auto_read_canvas_height = max(auto_read_frame_height, auto_read_row_height)
+                        calculated_height = max(auto_read_frame_height, auto_read_row_height)
                     else:
-                        auto_read_canvas_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
-            except Exception:
-                auto_read_canvas_height = 0
+                        calculated_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
+                    self.auto_read_canvas.config(height=calculated_height)
+                    auto_read_canvas_height = calculated_height  # Update for consistency
+                    # Update scroll region and ensure inner frame width matches canvas
+                    self.root.update_idletasks()
+                    canvas_width = self.auto_read_canvas.winfo_width()
+                    if canvas_width > 1:
+                        self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
+                    self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
         
-        # base_top is the Y position of area_canvas, which already accounts for everything above it
-        # including the Auto Read section. base_height = base_top + 20 (with minimum of 150).
-        # We need to ensure the window is tall enough for:
-        # - Everything up to area_canvas (base_height, which includes Auto Read section)
-        # - The regular areas content (content_height)
-        # But we also need to verify the Auto Read section has enough space.
+            # Set minimums (use a constant min width so user can resize horizontally).
+            # Ensure minimum width is sufficient to keep the single-line options from truncating.
+            min_required_width = max(min_width, 1155) #Main Window Size
+            self.root.minsize(min_required_width, 290)
         
-        # Calculate total height: base_height already includes space up to area_canvas
-        # However, base_height might not account for the actual Auto Read canvas height if it grew,
-        # so we need to ensure we have enough space for Auto Read + regular areas
-        
-        # Get the actual position of area_canvas to calculate properly
-        # base_height = max(150, base_top + 20) ensures minimum, but base_top should reflect Auto Read growth
-        # If Auto Read canvas exists and has height, ensure we account for it
-        if hasattr(self, 'auto_read_canvas') and auto_read_canvas_height > 0:
-            # Get position of Auto Read section
-            try:
-                auto_read_top = self.auto_read_outer_frame.winfo_rooty() - self.root.winfo_rooty()
-            except Exception:
-                auto_read_top = 0
-            
-            if auto_read_top > 0:
-                # Calculate: space to Auto Read + Auto Read height + space to regular areas + regular areas
-                # space_to_regular = base_top - (auto_read_top + auto_read_canvas_height)
-                # But base_top might not be accurate yet, so use base_height as fallback
-                # Total = auto_read_top + auto_read_canvas_height + space_between + content_height + margin
-                # Where space_between includes separator and button
-                auto_read_bottom = auto_read_top + auto_read_canvas_height
-                if base_top > auto_read_bottom:
-                    space_between = base_top - auto_read_bottom
-                else:
-                    # base_top might not be updated yet, use a reasonable estimate
-                    space_between = 30  # separator + button area
-                space_between = max(30, space_between)  # Ensure minimum space
-                total_height_unconstrained = auto_read_top + auto_read_canvas_height + space_between + content_height + 20
-            else:
-                # Fallback: use base_height which should account for Auto Read
-                total_height_unconstrained = base_height + content_height
-        else:
-            # No Auto Read or no height yet, use base_height
-            total_height_unconstrained = base_height + content_height
-        
-        # Add separator height to total (separator is after area_outer_frame)
-        separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
-        total_height_unconstrained += separator_height_estimate
-        
-        # Ensure total_height is always positive and reasonable
-        # If calculation resulted in invalid value, use safe fallback
-        if total_height_unconstrained < 250:
-            # Something went wrong with the calculation, use safe defaults
-            total_height = max(base_height + content_height + auto_read_canvas_height + 20, 250)
-        else:
-            total_height = total_height_unconstrained
-        # Screen-constrained maximum height
-        try:
-            screen_h = self.root.winfo_screenheight()
-        except Exception:
-            screen_h = 1000
-        vertical_margin = 140  # Keep some space from screen edges
-        max_allowed_height = max(300, screen_h - vertical_margin)
-        # Decide if scrollbar should be shown either due to screen limit or explicit row limit (>9)
-        show_scroll_due_to_count = num_scroll_areas > 5
-        show_scroll_due_to_screen = total_height_unconstrained > max_allowed_height
-        show_scroll = show_scroll_due_to_count or show_scroll_due_to_screen
-
-        # Compute target height of the window
-        # Note: separator height is already included in total_height_unconstrained
-        if show_scroll_due_to_count:
-            # Cap visible rows to 5 when there are more than 9 areas
-            visible_rows = 5
-            # Do not grow the window further when crossing the threshold; keep current height or smaller cap
-            cur_h_for_cap = self.root.winfo_height()
-            # Include separator height estimate in the calculation
-            separator_height_estimate = 19  # 2px top + 15px bottom + ~2px line
-            desired_height_cap = min(base_height + visible_rows * area_row_height + separator_height_estimate, max_allowed_height)
-            target_height = min(cur_h_for_cap, desired_height_cap)
-        else:
-            # Otherwise try to fit all content within the screen
-            # total_height_unconstrained already includes separator height
-            target_height = min(total_height_unconstrained, max_allowed_height)
-        
-        # Determine the widest area
-        widest = min_width
-        for area in self.areas:
-            frame = area[0]
-            frame.update_idletasks()
-            frame_left = frame.winfo_rootx()
-            farthest_right = frame_left
-            for child in frame.winfo_children():
-                child.update_idletasks()
-                child_right = child.winfo_rootx() + child.winfo_width()
-                if child_right > farthest_right:
-                    farthest_right = child_right
-            area_width = farthest_right - frame_left
-            if area_width > widest:
-                widest = area_width
-        widest += 60
-                                                                        
-                 
-        window_width = max(min_width, min(max_width, widest))        
-        
-        # Apply scrollbar logic based on whether all content fits vertically
-        if hasattr(self, 'area_scrollbar') and hasattr(self, 'area_canvas'):
-            if show_scroll:
-                # Need scrolling
-                self.area_scrollbar.pack(side='right', fill='y')
-                self.area_canvas.configure(yscrollcommand=self.area_scrollbar.set)
-                if show_scroll_due_to_count:
-                    canvas_height = max(100, min(target_height - base_height, 5 * area_row_height))
-                else:
-                    canvas_height = max(100, target_height - base_height)
-                self.area_canvas.config(height=canvas_height)
-                # Add extra height to ensure separator is visible when scrollbar appears
-                if hasattr(self, 'area_separator'):
-                    self.area_separator.lift()
-                    # Increase target_height by 10px to ensure separator is visible
-                    target_height = min(target_height + 5, max_allowed_height)
-            else:
-                # All content fits; no scrollbar
-                self.area_scrollbar.pack_forget()
-                # Expand canvas to show all content when it fits
-                self.area_canvas.config(height=area_frame_height)
-                # Ensure separator is visible
-                if hasattr(self, 'area_separator'):
-                    self.area_separator.lift()
-        
-        # Handle Auto Read area scrolling - show scrollbar when there are more than 4 Auto Read areas
-        # Reuse the values calculated above to ensure consistency
-        if hasattr(self, 'auto_read_scrollbar') and hasattr(self, 'auto_read_canvas') and hasattr(self, 'auto_read_frame'):
-            # Recalculate frame height to ensure it's current
-            self.auto_read_frame.update_idletasks()
-            auto_read_frame_height = self.auto_read_frame.winfo_height()
-            
-            # Recalculate scroll status and canvas height
-            auto_read_show_scroll = auto_read_count >= 4
-            
-            if auto_read_show_scroll:
-                # Need scrolling for Auto Read areas
-                self.auto_read_scrollbar.pack(side='right', fill='y')
-                self.auto_read_canvas.configure(yscrollcommand=self.auto_read_scrollbar.set)
-                # Show exactly 4 rows when scrolling is active
-                if auto_read_frame_height > 0 and auto_read_count > 0:
-                    # Calculate actual height per row
-                    actual_row_height = auto_read_frame_height / auto_read_count
-                    # Use 4 rows
-                    calculated_height = int(4 * actual_row_height)
-                else:
-                    # Fallback: use 4 rows estimate
-                    calculated_height = 4 * auto_read_row_height
-                self.auto_read_canvas.config(height=calculated_height)
-                auto_read_canvas_height = calculated_height  # Update for consistency
-                # Update scroll region and ensure inner frame width matches canvas
+            # Optionally force window geometry (used when loading a layout)
+            cur_width = self.root.winfo_width()
+            cur_height = self.root.winfo_height()
+            if force:
+                # To ensure Tk applies the new size reliably even when shrinking, call geometry twice
+                self.root.geometry(f"{window_width}x{target_height}")
                 self.root.update_idletasks()
-                canvas_width = self.auto_read_canvas.winfo_width()
-                if canvas_width > 1:
-                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
-                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
-            else:
-                # All Auto Read content fits; no scrollbar
-                self.auto_read_scrollbar.pack_forget()
-                # Expand canvas to show all content when it fits
-                # Use the same calculated height from above for consistency
-                if auto_read_frame_height > 0:
-                    calculated_height = max(auto_read_frame_height, auto_read_row_height)
-                else:
-                    calculated_height = max(auto_read_count * auto_read_row_height, auto_read_row_height)
-                self.auto_read_canvas.config(height=calculated_height)
-                auto_read_canvas_height = calculated_height  # Update for consistency
-                # Update scroll region and ensure inner frame width matches canvas
-                self.root.update_idletasks()
-                canvas_width = self.auto_read_canvas.winfo_width()
-                if canvas_width > 1:
-                    self.auto_read_canvas.itemconfig(self.auto_read_window, width=canvas_width)
-                self.auto_read_canvas.configure(scrollregion=self.auto_read_canvas.bbox('all'))
-        
-        # Set minimums (use a constant min width so user can resize horizontally).
-        # Ensure minimum width is sufficient to keep the single-line options from truncating.
-        min_required_width = max(min_width, 1155) #Main Window Size
-        self.root.minsize(min_required_width, 290)
-        
-        # Optionally force window geometry (used when loading a layout)
-        cur_width = self.root.winfo_width()
-        cur_height = self.root.winfo_height()
-        if force:
-            # To ensure Tk applies the new size reliably even when shrinking, call geometry twice
-            self.root.geometry(f"{window_width}x{target_height}")
-            self.root.update_idletasks()
-            self.root.geometry(f"{window_width}x{target_height}")
+                self.root.geometry(f"{window_width}x{target_height}")
 
-        self.root.update_idletasks()  # Ensure geometry is applied
+            self.root.update_idletasks()  # Ensure geometry is applied
         
-        # Ensure separator is always visible on top
-        if hasattr(self, 'area_separator'):
-            self.area_separator.lift()
+            # Ensure separator is always visible on top
+            if hasattr(self, 'area_separator'):
+                self.area_separator.lift()
         
-        # Ensure window position keeps buttons visible after resize
-        self._ensure_window_position()
+            # Ensure window position keeps buttons visible after resize
+            self._ensure_window_position()
+        finally:
+            self._resize_window_in_progress = False
+            if self._resize_window_pending:
+                pending_force = self._resize_window_pending_force
+                self._resize_window_pending = False
+                self._resize_window_pending_force = False
+                self.root.after_idle(lambda: self.resize_window(force=pending_force))
 
     def edit_areas(self):
         """Open the edit areas screen. Finds the first non-Auto Read area to use for the edit screen."""
@@ -9932,13 +10745,8 @@ class GameTextReader:
         select_area_window.update_idletasks()
         print("GAME_TEXT_READER: Window initialized (withdrawn, alpha=0.0)")
         
-        # Set icon (though overrideredirect means it won't show, set it anyway)
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                select_area_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting selection window icon: {e}")
+        # Set window icon (though overrideredirect means it won't show, set it anyway)
+        set_window_icon(select_area_window)
         
         # Make it transient to prevent root window from being shown/brought to front
         select_area_window.transient(self.root)
@@ -9952,12 +10760,8 @@ class GameTextReader:
         
         select_area_window.protocol("WM_DELETE_WINDOW", on_window_destroy)
         
-        # Get the true multi-monitor dimensions using win32api.GetSystemMetrics
-        # This ensures consistency with capture_screen_area function
-        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        # Get true multi-monitor dimensions using shared helper.
+        min_x, min_y, virtual_width, virtual_height = get_virtual_screen_bounds()
         max_x = min_x + virtual_width
         max_y = min_y + virtual_height
         
@@ -10172,41 +10976,50 @@ class GameTextReader:
                 
                 # Fall back to normal BitBlt method if PrintWindow didn't work or wasn't requested
                 if not use_printwindow or screenshot_image is None:
-                    # Use win32api method to capture entire virtual screen (all monitors)
-                    hwin = win32gui.GetDesktopWindow()
-                    hwindc = win32gui.GetWindowDC(hwin)
-                    memdc = None
-                    bmp = None
-                    try:
-                        srcdc = win32ui.CreateDCFromHandle(hwindc)
-                        memdc = srcdc.CreateCompatibleDC()
-                        
-                        # Create bitmap for entire virtual screen
-                        bmp = win32ui.CreateBitmap()
-                        bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
-                        memdc.SelectObject(bmp)
-                        
-                        # Copy entire virtual screen into bitmap
-                        memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
-                        
-                        # Convert bitmap to PIL Image
-                        bmpinfo = bmp.GetInfo()
-                        bmpstr = bmp.GetBitmapBits(True)
-                        screenshot_image = Image.frombuffer(
-                            'RGB',
-                            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                            bmpstr, 'raw', 'BGRX', 0, 1
-                        )
-                    finally:
-                        # Always clean up resources
+                    if sys.platform.startswith('win'):
+                        # Use win32api method to capture entire virtual screen (all monitors)
+                        hwin = win32gui.GetDesktopWindow()
+                        hwindc = win32gui.GetWindowDC(hwin)
+                        memdc = None
+                        bmp = None
                         try:
-                            if memdc:
-                                memdc.DeleteDC()
-                            if bmp:
-                                win32gui.DeleteObject(bmp.GetHandle())
-                            win32gui.ReleaseDC(hwin, hwindc)
-                        except Exception:
-                            pass
+                            srcdc = win32ui.CreateDCFromHandle(hwindc)
+                            memdc = srcdc.CreateCompatibleDC()
+                            
+                            # Create bitmap for entire virtual screen
+                            bmp = win32ui.CreateBitmap()
+                            bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
+                            memdc.SelectObject(bmp)
+                            
+                            # Copy entire virtual screen into bitmap
+                            memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
+                            
+                            # Convert bitmap to PIL Image
+                            bmpinfo = bmp.GetInfo()
+                            bmpstr = bmp.GetBitmapBits(True)
+                            screenshot_image = Image.frombuffer(
+                                'RGB',
+                                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                                bmpstr, 'raw', 'BGRX', 0, 1
+                            )
+                        finally:
+                            # Always clean up resources
+                            try:
+                                if memdc:
+                                    memdc.DeleteDC()
+                                if bmp:
+                                    win32gui.DeleteObject(bmp.GetHandle())
+                                win32gui.ReleaseDC(hwin, hwindc)
+                            except Exception:
+                                pass
+                    else:
+                        screenshot_image = capture_screen_area(
+                            min_x,
+                            min_y,
+                            min_x + virtual_width,
+                            min_y + virtual_height,
+                            use_printwindow=False,
+                        )
                     
                     print(f"Screenshot captured using BitBlt: {screenshot_image.size}")
                     
@@ -10648,10 +11461,7 @@ class GameTextReader:
         self.hotkeys_disabled_for_selection = True
         
         # Get virtual screen dimensions
-        min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
-        min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
-        virtual_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-        virtual_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+        min_x, min_y, virtual_width, virtual_height = get_virtual_screen_bounds()
         
         # Get primary monitor position and dimensions
         # Use EnumDisplayMonitors to reliably find the primary monitor
@@ -10674,43 +11484,52 @@ class GameTextReader:
         if self.edit_area_screenshot_bg:
             try:
                 print(f"Taking screenshot of all monitors for edit view background: {virtual_width}x{virtual_height} at ({min_x}, {min_y})")
-                
-                # Use win32api method to capture entire virtual screen (all monitors)
-                # This handles negative coordinates properly
-                hwin = win32gui.GetDesktopWindow()
-                hwindc = win32gui.GetWindowDC(hwin)
-                memdc = None
-                bmp = None
-                try:
-                    srcdc = win32ui.CreateDCFromHandle(hwindc)
-                    memdc = srcdc.CreateCompatibleDC()
-                    
-                    # Create bitmap for entire virtual screen
-                    bmp = win32ui.CreateBitmap()
-                    bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
-                    memdc.SelectObject(bmp)
-                    
-                    # Copy entire virtual screen into bitmap
-                    memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
-                    
-                    # Convert bitmap to PIL Image
-                    bmpinfo = bmp.GetInfo()
-                    bmpstr = bmp.GetBitmapBits(True)
-                    screenshot_image = Image.frombuffer(
-                        'RGB',
-                        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                        bmpstr, 'raw', 'BGRX', 0, 1
-                    )
-                finally:
-                    # Always clean up resources
+
+                if sys.platform.startswith('win'):
+                    # Use win32api method to capture entire virtual screen (all monitors)
+                    # This handles negative coordinates properly
+                    hwin = win32gui.GetDesktopWindow()
+                    hwindc = win32gui.GetWindowDC(hwin)
+                    memdc = None
+                    bmp = None
                     try:
-                        if memdc:
-                            memdc.DeleteDC()
-                        if bmp:
-                            win32gui.DeleteObject(bmp.GetHandle())
-                        win32gui.ReleaseDC(hwin, hwindc)
-                    except Exception:
-                        pass
+                        srcdc = win32ui.CreateDCFromHandle(hwindc)
+                        memdc = srcdc.CreateCompatibleDC()
+                        
+                        # Create bitmap for entire virtual screen
+                        bmp = win32ui.CreateBitmap()
+                        bmp.CreateCompatibleBitmap(srcdc, virtual_width, virtual_height)
+                        memdc.SelectObject(bmp)
+                        
+                        # Copy entire virtual screen into bitmap
+                        memdc.BitBlt((0, 0), (virtual_width, virtual_height), srcdc, (min_x, min_y), win32con.SRCCOPY)
+                        
+                        # Convert bitmap to PIL Image
+                        bmpinfo = bmp.GetInfo()
+                        bmpstr = bmp.GetBitmapBits(True)
+                        screenshot_image = Image.frombuffer(
+                            'RGB',
+                            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                            bmpstr, 'raw', 'BGRX', 0, 1
+                        )
+                    finally:
+                        # Always clean up resources
+                        try:
+                            if memdc:
+                                memdc.DeleteDC()
+                            if bmp:
+                                win32gui.DeleteObject(bmp.GetHandle())
+                            win32gui.ReleaseDC(hwin, hwindc)
+                        except Exception:
+                            pass
+                else: # Non-Windows platforms
+                    screenshot_image = capture_screen_area(
+                        min_x,
+                        min_y,
+                        min_x + virtual_width,
+                        min_y + virtual_height,
+                        use_printwindow=False,
+                    )
                 
                 print(f"Screenshot captured successfully: {screenshot_image.size}")
             except Exception as e:
@@ -10738,16 +11557,10 @@ class GameTextReader:
         select_area_window.overrideredirect(True)
         select_area_window.withdraw()
         select_area_window.update_idletasks()
-        
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                select_area_window.iconbitmap(icon_path)
-                background_window.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting selection window icon: {e}")
-            import traceback
-            traceback.print_exc()
+
+        # Set window icons for both windows
+        set_window_icon(select_area_window)
+        set_window_icon(background_window)
         
         select_area_window.transient(self.root)
         select_area_window.geometry(f"{virtual_width}x{virtual_height}+{min_x}+{min_y}")
@@ -10923,7 +11736,7 @@ class GameTextReader:
                             preview = match.group(1).strip()
                             return preview if preview else "..."
                     elif "Press" in button_text:
-                        # For "Press any key or combination..." or "Press key: [ ... ]"
+                        # For PRESS_ANY_KEY or "Press key: [ ... ]"
                         match = re.search(r'Press key:\s*\[([^\]]*)\]', button_text)
                         if match:
                             preview = match.group(1).strip()
@@ -11124,7 +11937,7 @@ class GameTextReader:
                                 elif "Press key:" in button_text:
                                     hotkey_text = button_text  # "Press key: [ ... ]"
                                 else:
-                                    hotkey_text = "Press any key or combination..."
+                                    hotkey_text = PRESS_ANY_KEY
                             else:
                                 # If no hotkey, show "click to set hotkey" without "Hotkey:" prefix
                                 if hotkey_display == "Click here to set hotkey":
@@ -12557,12 +13370,7 @@ class GameTextReader:
         apply_window_geometry(dialog, 'area_name_dialog', 250, 120, parent=self.root)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                dialog.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting dialog icon: {e}")
+        set_window_icon(dialog)
         
         # Create and pack the label
         label = tk.Label(dialog, text="Enter a name for this area:", pady=10)
@@ -12656,12 +13464,7 @@ class GameTextReader:
         dialog.minsize(int(150 * _dpi_scale), int(120 * _dpi_scale))
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                dialog.iconbitmap(icon_path)
-        except Exception as e:
-            print(f"Error setting dialog icon: {e}")
+        set_window_icon(dialog)
         
         # Create and pack the label
         label = tk.Label(dialog, text="Enter new area name:", pady=10)
@@ -14048,7 +14851,7 @@ class GameTextReader:
                 delattr(button, 'mouse_hook')
             except Exception as e:
                 print(f"Error cleaning up mouse hook function: {e}")
-        button.config(text="Press any key or combination...")
+        button.config(text=PRESS_ANY_KEY)
         self.root.update_idletasks()  # Force immediate UI update
         
         # Set flag FIRST so existing hotkeys are suppressed (they check this flag and return early)
@@ -14080,7 +14883,7 @@ class GameTextReader:
                 if preview:
                     button.config(text=f"Press key: [ {preview} + ]")
                 else:
-                    button.config(text="Press any key or combination...")
+                    button.config(text=PRESS_ANY_KEY)
                 # Live expand window width if needed
                 self._ensure_window_width()
             except Exception:
@@ -14683,6 +15486,8 @@ class GameTextReader:
         top_level_settings = {}
         if hasattr(automation_window, 'freeze_screen_var'):
             top_level_settings['freeze_screen'] = automation_window.freeze_screen_var.get()
+        if hasattr(automation_window, 'monitor_clipboard_var'):
+            top_level_settings['monitor_clipboard'] = automation_window.monitor_clipboard_var.get()
         if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
             if hasattr(automation_window.set_hotkey_button, 'hotkey') and automation_window.set_hotkey_button.hotkey:
                 top_level_settings['detection_area_hotkey'] = automation_window.set_hotkey_button.hotkey
@@ -14831,236 +15636,245 @@ class GameTextReader:
         except:
             print("Automations window is invalid - cannot load automations")
             return
+
+        # Suppress unsaved-change callbacks while restoring automation state.
+        # Tk variable traces fire during .set(...) and UI construction.
+        # Without this guard, save_layout_auto can run before load is complete.
+        automation_window._suspend_unsaved_tracking = True
+        try:
         
-        # Load top-level settings (freeze screen and hotkey) from layout file
-        top_level_settings = automations_data.get("top_level_settings", {})
-        if top_level_settings:
-            # Restore freeze screen checkbox
-            if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
-                automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
-            
-            # Restore detection area hotkey
-            if 'detection_area_hotkey' in top_level_settings:
-                detection_hotkey = top_level_settings['detection_area_hotkey']
-                
-                # Create a temporary frame for compatibility with hotkey system
-                temp_frame = tk.Frame()
-                temp_frame._is_automation_area_hotkey = True
-                temp_frame._automation_window = automation_window
-                
-                # Create callback for when hotkey is pressed
-                def hotkey_callback():
-                    if hasattr(automation_window.game_text_reader, 'area_selection_in_progress') and automation_window.game_text_reader.area_selection_in_progress:
-                        return
-                    automation_window.start_area_selection_for_automations()
+            # Load top-level settings (freeze screen and hotkey) from layout file
+            top_level_settings = automations_data.get("top_level_settings", {})
+            if top_level_settings:
+                # Restore freeze screen checkbox
+                if 'freeze_screen' in top_level_settings and hasattr(automation_window, 'freeze_screen_var'):
+                    automation_window.freeze_screen_var.set(top_level_settings['freeze_screen'])
+                if 'monitor_clipboard' in top_level_settings and hasattr(automation_window, 'monitor_clipboard_var'):
+                    automation_window.monitor_clipboard_var.set(top_level_settings['monitor_clipboard'])
+
+                # Restore detection area hotkey
+                if 'detection_area_hotkey' in top_level_settings:
+                    detection_hotkey = top_level_settings['detection_area_hotkey']
+
+                    # Create a temporary frame for compatibility with hotkey system
+                    temp_frame = tk.Frame()
+                    temp_frame._is_automation_area_hotkey = True
+                    temp_frame._automation_window = automation_window
+
+                    # Create callback for when hotkey is pressed
+                    def hotkey_callback():
+                        if hasattr(automation_window.game_text_reader, 'area_selection_in_progress') and automation_window.game_text_reader.area_selection_in_progress:
+                            return
+                        automation_window.start_area_selection_for_automations()
+                        if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                            automation_window.set_hotkey_button._automation_callback = hotkey_callback
+
+                    # Store callback on button
                     if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
+                        automation_window.set_hotkey_button.hotkey = detection_hotkey
                         automation_window.set_hotkey_button._automation_callback = hotkey_callback
-                
-                # Store callback on button
-                if hasattr(automation_window, 'set_hotkey_button') and automation_window.set_hotkey_button:
-                    automation_window.set_hotkey_button.hotkey = detection_hotkey
-                    automation_window.set_hotkey_button._automation_callback = hotkey_callback
-                    automation_window.set_hotkey_button._automation_temp_frame = temp_frame
-                    automation_window._area_selection_hotkey_callback = hotkey_callback
-                    automation_window._area_selection_hotkey_button = automation_window.set_hotkey_button
-                    
-                    # Update button display
-                    display_name = detection_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
-                    automation_window.set_hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                    
+                        automation_window.set_hotkey_button._automation_temp_frame = temp_frame
+                        automation_window._area_selection_hotkey_callback = hotkey_callback
+                        automation_window._area_selection_hotkey_button = automation_window.set_hotkey_button
+
+                        # Update button display
+                        display_name = detection_hotkey.replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        automation_window.set_hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+
+                        # Register the hotkey
+                        try:
+                            self.setup_hotkey(automation_window.set_hotkey_button, None)
+                        except Exception:
+                            pass
+
+            # Clear existing automations
+            automation_window.automations = []
+            automation_window.hotkey_combos = []
+
+            # Clear UI - use try/except to handle any widget access errors
+            try:
+                scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
+                if scrollable_frame:
+                    # Get children list first to avoid modification during iteration
+                    children = list(scrollable_frame.winfo_children())
+                    for widget in children:
+                        try:
+                            widget.destroy()
+                        except:
+                            pass  # Widget may already be destroyed
+            except Exception as e:
+                print(f"Error clearing automations UI: {e}")
+                # Continue anyway - we'll recreate the UI
+
+            # Load detection areas
+            detection_areas = automations_data.get("detection_areas", [])
+            for area_data in detection_areas:
+                # Get coordinates from saved data
+                saved_coords = area_data.get('image_area_coords')
+
+                # Create automation with saved data
+                automation = {
+                    'id': area_data.get('id', len(automation_window.automations)),
+                    'name': area_data.get('name', f"Detection Area: {chr(65 + len(automation_window.automations))}"),
+                    'image_area_coords': saved_coords,  # Load coordinates from saved data
+                    'reference_image': None,  # Will load from file
+                    'hotkey': area_data.get('hotkey'),
+                    'hotkey_button': None,
+                    'match_percent': tk.DoubleVar(value=area_data.get('match_percent', 80.0)),
+                    'comparison_method': tk.StringVar(value=area_data.get('comparison_method', 'SSIM')),
+                    'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
+                    'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
+                    'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
+                    'text_color': area_data.get('text_color'),
+                    'color_tolerance': tk.IntVar(value=area_data.get('color_tolerance', 30)),
+                    'timer_active': False,
+                    'timer_start_time': None,
+                    'was_matching': False,
+                    'has_triggered': False,
+                    'frame': None
+                }
+
+                # Load reference image from file
+                if file_path:
+                    layout_name = os.path.splitext(os.path.basename(file_path))[0]
+                    detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
+                    safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
+                    image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
+
+                    if os.path.exists(image_path):
+                        try:
+                            automation['reference_image'] = Image.open(image_path).copy()
+                        except Exception:
+                            pass
+                    else:
+                        pass
+
+                # Debug: Check what was loaded
+                target_area_value = automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else str(automation['target_read_area'])
+
+                automation_window.automations.append(automation)
+                automation_window.create_automation_ui(automation)
+
+                # Update preview if image was loaded
+                if automation.get('reference_image'):
+                    automation_window.update_preview(automation, automation['reference_image'])
+
+                # Update color button if text color was set
+                if automation.get('text_color'):
+                    # Update color button after UI is created
+                    def update_color_button():
+                        if automation.get('color_button'):
+                            automation['color_button'].config(bg=automation['text_color'])
+                    automation_window.root.after(100, update_color_button)
+
+                # Set up hotkey if it exists
+                if automation.get('hotkey'):
+                    automation_window.update_hotkey_display(automation)
+                    # Register the hotkey so it actually works
+                    # Create a temporary frame for compatibility with hotkey system
+                    temp_frame = tk.Frame()
+                    temp_frame._is_automation_hotkey = True
+                    temp_frame._automation_ref = automation
+                    temp_frame._automation_window = automation_window
+
+                    # Create callback for when hotkey is pressed
+                    def hotkey_callback():
+                        # When hotkey is pressed, trigger area selection for this specific automation
+                        # Use the same approach as set_automation_hotkey - trigger area selection
+                        # This will allow the user to set/update the image area for this automation
+                        automation_window.start_area_selection_for_automations()
+
+                    # Store callback in automation
+                    automation['hotkey_callback'] = hotkey_callback
+
+                    # Store callback in registry for persistence (works even when window is closed)
+                    if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
+                        automation_window.automation_callbacks_by_hotkey[automation['hotkey']] = hotkey_callback
+                    else:
+                        pass
+
+                    # Create a mock button for hotkey registration (automations don't have hotkey buttons in UI)
+                    # We'll use a simple object to hold the hotkey
+                    class MockHotkeyButton:
+                        def __init__(self, hotkey):
+                            self.hotkey = hotkey
+                            self._automation_callback = hotkey_callback
+                            self._automation_temp_frame = temp_frame
+                            self._automation_ref = automation
+
+                    mock_button = MockHotkeyButton(automation['hotkey'])
+                    automation['hotkey_button'] = mock_button
+
                     # Register the hotkey
                     try:
-                        self.setup_hotkey(automation_window.set_hotkey_button, None)
-                    except Exception:
-                        pass
-        
-        # Clear existing automations
-        automation_window.automations = []
-        automation_window.hotkey_combos = []
-        
-        # Clear UI - use try/except to handle any widget access errors
-        try:
-            scrollable_frame = getattr(automation_window, 'scrollable_frame_ref', None) or getattr(automation_window, 'scrollable_frame', None)
-            if scrollable_frame:
-                # Get children list first to avoid modification during iteration
-                children = list(scrollable_frame.winfo_children())
-                for widget in children:
-                    try:
-                        widget.destroy()
-                    except:
-                        pass  # Widget may already be destroyed
-        except Exception as e:
-            print(f"Error clearing automations UI: {e}")
-            # Continue anyway - we'll recreate the UI
-        
-        # Load detection areas
-        detection_areas = automations_data.get("detection_areas", [])
-        for area_data in detection_areas:
-            # Get coordinates from saved data
-            saved_coords = area_data.get('image_area_coords')
-            
-            # Create automation with saved data
-            automation = {
-                'id': area_data.get('id', len(automation_window.automations)),
-                'name': area_data.get('name', f"Detection Area: {chr(65 + len(automation_window.automations))}"),
-                'image_area_coords': saved_coords,  # Load coordinates from saved data
-                'reference_image': None,  # Will load from file
-                'hotkey': area_data.get('hotkey'),
-                'hotkey_button': None,
-                'match_percent': tk.DoubleVar(value=area_data.get('match_percent', 80.0)),
-                'comparison_method': tk.StringVar(value=area_data.get('comparison_method', 'SSIM')),
-                'target_read_area': tk.StringVar(value=area_data.get('target_read_area', '')),
-                'only_read_if_text': tk.BooleanVar(value=area_data.get('only_read_if_text', False)),
-                'read_after_ms': tk.IntVar(value=area_data.get('read_after_ms', 0)),
-                'text_color': area_data.get('text_color'),
-                'color_tolerance': tk.IntVar(value=area_data.get('color_tolerance', 30)),
-                'timer_active': False,
-                'timer_start_time': None,
-                'was_matching': False,
-                'has_triggered': False,
-                'frame': None
-            }
-            
-            # Load reference image from file
-            if file_path:
-                layout_name = os.path.splitext(os.path.basename(file_path))[0]
-                detection_images_dir = os.path.join(APP_LAYOUTS_DIR, "detection images", layout_name)
-                safe_name = automation['name'].replace(':', '_').replace('/', '_').replace('\\', '_')
-                image_path = os.path.join(detection_images_dir, f"{safe_name}.png")
-                
-                if os.path.exists(image_path):
-                    try:
-                        automation['reference_image'] = Image.open(image_path).copy()
+                        self.setup_hotkey(mock_button, None)
                     except Exception:
                         pass
                 else:
                     pass
-            
-            # Debug: Check what was loaded
-            target_area_value = automation['target_read_area'].get() if hasattr(automation['target_read_area'], 'get') else str(automation['target_read_area'])
-            
-            automation_window.automations.append(automation)
-            automation_window.create_automation_ui(automation)
-            
-            # Update preview if image was loaded
-            if automation.get('reference_image'):
-                automation_window.update_preview(automation, automation['reference_image'])
-            
-            # Update color button if text color was set
-            if automation.get('text_color'):
-                # Update color button after UI is created
-                def update_color_button():
-                    if automation.get('color_button'):
-                        automation['color_button'].config(bg=automation['text_color'])
-                automation_window.root.after(100, update_color_button)
-            
-            # Set up hotkey if it exists
-            if automation.get('hotkey'):
-                automation_window.update_hotkey_display(automation)
-                # Register the hotkey so it actually works
-                # Create a temporary frame for compatibility with hotkey system
-                temp_frame = tk.Frame()
-                temp_frame._is_automation_hotkey = True
-                temp_frame._automation_ref = automation
-                temp_frame._automation_window = automation_window
-                
-                # Create callback for when hotkey is pressed
-                def hotkey_callback():
-                    # When hotkey is pressed, trigger area selection for this specific automation
-                    # Use the same approach as set_automation_hotkey - trigger area selection
-                    # This will allow the user to set/update the image area for this automation
-                    automation_window.start_area_selection_for_automations()
-                
-                # Store callback in automation
-                automation['hotkey_callback'] = hotkey_callback
-                
-                # Store callback in registry for persistence (works even when window is closed)
-                if hasattr(automation_window, 'automation_callbacks_by_hotkey'):
-                    automation_window.automation_callbacks_by_hotkey[automation['hotkey']] = hotkey_callback
-                else:
-                    pass
-                
-                # Create a mock button for hotkey registration (automations don't have hotkey buttons in UI)
-                # We'll use a simple object to hold the hotkey
-                class MockHotkeyButton:
-                    def __init__(self, hotkey):
-                        self.hotkey = hotkey
-                        self._automation_callback = hotkey_callback
-                        self._automation_temp_frame = temp_frame
-                        self._automation_ref = automation
-                
-                mock_button = MockHotkeyButton(automation['hotkey'])
-                automation['hotkey_button'] = mock_button
-                
-                # Register the hotkey
-                try:
-                    self.setup_hotkey(mock_button, None)
-                except Exception:
-                    pass
-            else:
-                pass
-        
-        # Load hotkey combos
-        hotkey_combos = automations_data.get("hotkey_combos", [])
-        for combo_data in hotkey_combos:
-            combo = {
-                'id': combo_data.get('id', len(automation_window.hotkey_combos)),
-                'name': combo_data.get('name', f"Area Combo: {chr(65 + len(automation_window.hotkey_combos))}"),
-                'hotkey': combo_data.get('hotkey'),
-                'areas': combo_data.get('areas', []),
-                'frame': None,
-                'is_triggering': False,
-                'current_area_index': 0
-            }
-            
-            automation_window.hotkey_combos.append(combo)
-            automation_window.create_hotkey_combo_ui(combo)
-            
-            # Restore areas for the combo
-            if combo.get('areas'):
-                # Clear the areas list since create_hotkey_combo_ui might have initialized it
-                combo['areas'] = []
-                for saved_area_entry in combo_data.get('areas', []):
-                    # Add area to combo (this creates a new entry)
-                    automation_window.add_area_to_combo(combo)
-                    # Get the last added entry and set its values
-                    if combo['areas']:
-                        area_entry = combo['areas'][-1]
-                        area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
-                        area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
-                        # Ensure delay_before field exists before setting it
-                        if 'delay_before' in area_entry and hasattr(area_entry['delay_before'], 'set'):
-                            area_entry['delay_before'].set(saved_area_entry.get('delay_before', False))
-            
-            # Set hotkey if it exists
-            if combo.get('hotkey'):
-                # Find the hotkey button and set it up
-                hotkey_button = combo.get('hotkey_button')
-                if hotkey_button:
-                    hotkey_button.hotkey = combo['hotkey']
-                    # Update button display
-                    display_name = combo['hotkey'].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
-                    hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
-                    # Set up the hotkey through the game_text_reader
-                    # Create a temporary frame for compatibility
-                    temp_frame = tk.Frame()
-                    temp_frame._is_hotkey_combo = True
-                    temp_frame._combo_ref = combo
-                    temp_frame._combo_window = automation_window
-                    hotkey_button._combo_temp_frame = temp_frame
-                    # Set up the hotkey callback
-                    def hotkey_callback():
-                        automation_window.trigger_hotkey_combo(combo)
-                    hotkey_button._combo_callback = hotkey_callback
-                    # Register the callback in the registry
-                    automation_window.combo_callbacks_by_hotkey[combo['hotkey']] = hotkey_callback
-                    # Set up the hotkey
-                    self.setup_hotkey(hotkey_button, None)
-        
-                
-        # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
-        if automation_window:
-            automation_window._has_unsaved_changes = False
+
+            # Load hotkey combos
+            hotkey_combos = automations_data.get("hotkey_combos", [])
+            for combo_data in hotkey_combos:
+                combo = {
+                    'id': combo_data.get('id', len(automation_window.hotkey_combos)),
+                    'name': combo_data.get('name', f"Area Combo: {chr(65 + len(automation_window.hotkey_combos))}"),
+                    'hotkey': combo_data.get('hotkey'),
+                    'areas': combo_data.get('areas', []),
+                    'frame': None,
+                    'is_triggering': False,
+                    'current_area_index': 0
+                }
+
+                automation_window.hotkey_combos.append(combo)
+                automation_window.create_hotkey_combo_ui(combo)
+
+                # Restore areas for the combo
+                if combo.get('areas'):
+                    # Clear the areas list since create_hotkey_combo_ui might have initialized it
+                    combo['areas'] = []
+                    for saved_area_entry in combo_data.get('areas', []):
+                        # Add area to combo (this creates a new entry)
+                        automation_window.add_area_to_combo(combo)
+                        # Get the last added entry and set its values
+                        if combo['areas']:
+                            area_entry = combo['areas'][-1]
+                            area_entry['area_name'].set(saved_area_entry.get('area_name', ''))
+                            area_entry['timer_ms'].set(saved_area_entry.get('timer_ms', 0))
+                            # Ensure delay_before field exists before setting it
+                            if 'delay_before' in area_entry and hasattr(area_entry['delay_before'], 'set'):
+                                area_entry['delay_before'].set(saved_area_entry.get('delay_before', False))
+
+                # Set hotkey if it exists
+                if combo.get('hotkey'):
+                    # Find the hotkey button and set it up
+                    hotkey_button = combo.get('hotkey_button')
+                    if hotkey_button:
+                        hotkey_button.hotkey = combo['hotkey']
+                        # Update button display
+                        display_name = combo['hotkey'].replace('num_', 'num:').replace('multiply', '*').replace('add', '+').replace('subtract', '-').replace('divide', '/')
+                        hotkey_button.config(text=f"Set Hotkey: [ {display_name.upper()} ]")
+                        # Set up the hotkey through the game_text_reader
+                        # Create a temporary frame for compatibility
+                        temp_frame = tk.Frame()
+                        temp_frame._is_hotkey_combo = True
+                        temp_frame._combo_ref = combo
+                        temp_frame._combo_window = automation_window
+                        hotkey_button._combo_temp_frame = temp_frame
+                        # Set up the hotkey callback
+                        def hotkey_callback():
+                            automation_window.trigger_hotkey_combo(combo)
+                        hotkey_button._combo_callback = hotkey_callback
+                        # Register the callback in the registry
+                        automation_window.combo_callbacks_by_hotkey[combo['hotkey']] = hotkey_callback
+                        # Set up the hotkey
+                        self.setup_hotkey(hotkey_button, None)
+
+            # Reset unsaved changes flag after loading (loading shouldn't mark as unsaved)
+            if automation_window:
+                automation_window._has_unsaved_changes = False
+        finally:
+            automation_window._suspend_unsaved_tracking = False
         
         # Mark as loaded for UI
         self._is_layout_actually_loaded = True
@@ -15265,6 +16079,7 @@ class GameTextReader:
             "translation_target": self.translation_target_var.get(),
             "standalone_numbers": getattr(self, 'standalone_numbers_var', tk.BooleanVar(value=False)).get(),
             "letters_only_numbers": getattr(self, 'letters_only_numbers_var', tk.BooleanVar(value=False)).get(),
+            "ocr_backend": getattr(self, 'ocr_backend_var', tk.StringVar(value="tesseract")).get(),
             "tesseract_language": getattr(self, 'tesseract_language_var', tk.StringVar(value="eng")).get(),
             "master_hotkey_sound_enabled": getattr(self, 'master_hotkey_sound_var', tk.BooleanVar(value=True)).get(),
             "master_hotkey_banner_enabled": getattr(self, 'master_hotkey_banner_var', tk.BooleanVar(value=True)).get(),
@@ -15439,6 +16254,7 @@ class GameTextReader:
             "translation_target": self.translation_target_var.get(),
             "standalone_numbers": getattr(self, 'standalone_numbers_var', tk.BooleanVar(value=False)).get(),
             "letters_only_numbers": getattr(self, 'letters_only_numbers_var', tk.BooleanVar(value=False)).get(),
+            "ocr_backend": getattr(self, 'ocr_backend_var', tk.StringVar(value="tesseract")).get(),
             "tesseract_language": getattr(self, 'tesseract_language_var', tk.StringVar(value="eng")).get(),
             "master_hotkey_sound_enabled": getattr(self, 'master_hotkey_sound_var', tk.BooleanVar(value=True)).get(),
             "master_hotkey_banner_enabled": getattr(self, 'master_hotkey_banner_var', tk.BooleanVar(value=True)).get(),
@@ -16005,10 +16821,7 @@ class GameTextReader:
         
         try:
             # Get current virtual screen bounds (all monitors combined)
-            min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
-            min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
-            total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-            total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+            min_x, min_y, total_width, total_height = get_virtual_screen_bounds()
             max_x = min_x + total_width
             max_y = min_y + total_height
             
@@ -16073,8 +16886,10 @@ class GameTextReader:
         """Internal function to load and process layout data from a file."""
         if not self._is_loading_layout:
             print("Loading settings...")
-            
+
         self._is_loading_layout = True
+        self.root.withdraw()  # Hide the main window during loading to prevent flicker
+        self._show_status_banner(f"Loading layout from: {os.path.basename(file_path)}...")
         try:
             # Set loading flag to prevent trace callbacks from marking changes
             self._is_loading_layout = True
@@ -16192,12 +17007,13 @@ class GameTextReader:
             # 1. Load Program Volume
             saved_volume = layout.get("volume", "100")
             self.volume.set(saved_volume)
-            try:
-                self.speaker.Volume = int(saved_volume)
-            except ValueError:
-                print("Invalid volume in save file, defaulting to 100%")
-                self.volume.set("100")
-                self.speaker.Volume = 100
+            if sys.platform.startswith('win'):
+                try:
+                    self.speaker.Volume = int(saved_volume)
+                except ValueError:
+                    print("Invalid volume in save file, defaulting to 100%")
+                    self.volume.set("100")
+                    self.speaker.Volume = 100
             
             # 2. Load Ignore Word list
             self.bad_word_list.set(layout.get("bad_word_list", ""))
@@ -16222,6 +17038,12 @@ class GameTextReader:
                 self.standalone_numbers_var.set(layout.get("standalone_numbers", False))
             if hasattr(self, 'letters_only_numbers_var'):
                 self.letters_only_numbers_var.set(layout.get("letters_only_numbers", False))
+
+            saved_ocr_backend = layout.get("ocr_backend")
+            if saved_ocr_backend and hasattr(self, 'ocr_backend_var'):
+                if saved_ocr_backend == "paddleocr":
+                    saved_ocr_backend = "rapidocr"
+                self.ocr_backend_var.set(saved_ocr_backend)
             
             # Load Tesseract language from layout
             saved_tesseract_lang = layout.get("tesseract_language")
@@ -16521,7 +17343,7 @@ class GameTextReader:
                     # Set preprocessing and voice settings
                     preprocess_var.set(auto_read_info.get("preprocess", False))
                     # Load voice (same logic as regular areas)
-                    if hasattr(self, 'voices') and self.voices:
+                    if hasattr(self, 'voices'):
                         try:
                             saved_voice = auto_read_info.get("voice")
                             if saved_voice and saved_voice != "Select Voice":
@@ -16662,7 +17484,7 @@ class GameTextReader:
                 # Set preprocessing and voice settings
                 preprocess_var.set(area_info.get("preprocess", False))
                 # Check if the saved voice exists in current SAPI voices and convert to display name
-                if hasattr(self, 'voices') and self.voices:
+                if hasattr(self, 'voices'):
                     try:
                         saved_voice = area_info.get("voice")
                         if saved_voice and saved_voice != "Select Voice":
@@ -16732,7 +17554,8 @@ class GameTextReader:
                                             display_name = disp
                                             full_voice_name = saved_voice
                                             break
-
+                            if full_voice_name is None and saved_voice:
+                                print(f"Warning: Voice '{saved_voice}' not found in current SAPI voices or AI voices. Using default voice.")
                             if full_voice_name:
                                 voice_var.set(display_name)
                                 voice_var._full_name = full_voice_name
@@ -16897,6 +17720,7 @@ class GameTextReader:
         finally:
             # Always clear the loading flag, even if an error occurred
             self._is_loading_layout = False
+            self.root.deiconify()
 
     def validate_speed_key(self, event, speed_var):
         """Additional validation for speed entry key presses"""
@@ -18690,7 +19514,7 @@ class GameTextReader:
             print(f"Warning: Attempted to read removed area, ignoring")
             return
 
-        if not hasattr(area_frame, 'area_coords'):
+        if self.get_selected_ocr_backend() != "clipboard" and not hasattr(area_frame, 'area_coords'):
             # Suppress error for Auto Read area
             area_info = None
             for area in self.areas:
@@ -18704,14 +19528,15 @@ class GameTextReader:
                 messagebox.showerror("Error", "No area coordinates set. Click Set Area to set one.")
                 return
 
-        # Ensure speaker is initialized
-        if not self.speaker:
-            try:
-                self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
-                self.speaker.Volume = int(self.volume.get())
-            except Exception as e:
-                print(f"Error initializing speaker: {e}")
-                return
+        if sys.platform.startswith('win'):
+            # Ensure speaker is initialized
+            if not self.speaker:
+                try:
+                    self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                    self.speaker.Volume = int(self.volume.get())
+                except Exception as e:
+                    print(f"Error initializing speaker: {e}")
+                    return
 
         # Get area info first
         area_info = None
@@ -18743,258 +19568,177 @@ class GameTextReader:
         # Show processing feedback
         self.show_processing_feedback(area_name)
 
-        # Capture screenshot
-        x1, y1, x2, y2 = area_frame.area_coords
-        
-        # Apply fullscreen mode refresh if enabled (for forcing screen refresh in fullscreen apps)
-        # Only apply if we're not using a frozen screenshot
-        # Save the game window handle for use in PrintWindow capture
-        game_window_handle = None
-        if fullscreen_mode_enabled and not (hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None):
-            try:
-                # For fullscreen apps, we need to force a screen buffer refresh
-                # The most effective method is to briefly switch focus away and back
-                foreground_hwnd = win32gui.GetForegroundWindow()
-                root_hwnd = self.root.winfo_id()
-                
-                if foreground_hwnd and foreground_hwnd != root_hwnd:
-                    # Save the game window handle BEFORE tabbing out - we'll use this for PrintWindow
-                    game_window_handle = foreground_hwnd
-                    
-                    # Method 1: Briefly bring GameReader to foreground, then restore original
-                    # This forces Windows to update the screen buffer
-                    try:
-                        # Save current foreground window
-                        original_foreground = foreground_hwnd
-                        
-                        # Step 1: Tab out - bring GameReader to foreground
-                        if root_hwnd and self.root.winfo_viewable():
-                            # Make sure window is not minimized
-                            if win32gui.IsIconic(root_hwnd):
-                                win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
-                            
-                            # Bring to foreground
-                            win32gui.SetForegroundWindow(root_hwnd)
-                            self.root.update()
-                            time.sleep(0.02)  # 20ms - minimal delay for tab out
-                            
-                            # Step 2: Tab back in - restore game to foreground
-                            if win32gui.IsWindow(original_foreground):
-                                # Restore if minimized
-                                if win32gui.IsIconic(original_foreground):
-                                    win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
-                                    time.sleep(0.05)  # Wait for restore
-                                
-                                # Bring to foreground
-                                win32gui.SetForegroundWindow(original_foreground)
-                                time.sleep(0.1)  # 100ms - initial delay after setting foreground
-                                
-                                # Step 3: Wait for game to be fully active before screenshot
-                                # Poll to ensure the game window is actually in foreground
-                                max_wait = 30  # Maximum 30 attempts (300ms)
-                                wait_count = 0
-                                while wait_count < max_wait:
-                                    current_foreground = win32gui.GetForegroundWindow()
-                                    if current_foreground == original_foreground:
-                                        # Game is in foreground, wait a bit more to ensure it's fully rendered
-                                        time.sleep(0.15)  # 150ms delay for game to fully render
-                                        # Verify one more time that game is still in foreground
-                                        final_check = win32gui.GetForegroundWindow()
-                                        if final_check == original_foreground:
-                                            print("Fullscreen mode: Game confirmed active and ready for capture")
-                                            break
-                                    time.sleep(0.01)  # 10ms between checks
-                                    wait_count += 1
-                                
-                                # Additional delay to ensure game is fully rendered and screen buffer is updated
-                                time.sleep(0.2)  # 200ms delay for game to fully restore and render
-                    except Exception as e:
-                        print(f"Error in focus switching: {e}")
-                
-                # Method 2: Invalidate desktop and foreground window
-                try:
-                    desktop_hwnd = win32gui.GetDesktopWindow()
-                    if desktop_hwnd:
-                        ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
-                    
-                    if foreground_hwnd and foreground_hwnd != root_hwnd:
-                        ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
-                        win32gui.UpdateWindow(foreground_hwnd)
-                except (OSError, AttributeError, Exception):
-                    # Window handle may be invalid or window may be closed
-                    pass
-                
-                # Final verification delay - ensure everything is ready
-                # Don't add extra delay here since we already waited above
-                print("Fullscreen mode: Screen refresh triggered, ready for capture")
-            except Exception as e:
-                print(f"Error in fullscreen mode screen refresh: {e}")
-                import traceback
-                traceback.print_exc()
-                # Continue with normal capture even if refresh fails
-        
-        # Track if we already processed the frozen screenshot
-        frozen_screenshot_already_processed = False
-        
-        # Check if we have a frozen screenshot to use instead of capturing from live screen
-        if hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None:
-            try:
-                print(f"Using frozen screenshot instead of live screen capture")
-                frozen_img = area_frame.frozen_screenshot
-                frozen_min_x, frozen_min_y, frozen_width, frozen_height = area_frame.frozen_screenshot_bounds
-                
-                # Check if frozen screenshot was already processed during capture
-                # If process_freeze_screen_var is enabled, the screenshot was already processed when captured
-                process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
-                                                self.process_freeze_screen_var.get())
-                
-                if process_freeze_screen_enabled:
-                    # Screenshot was already processed during capture, so it's already processed
-                    frozen_screenshot_already_processed = True
-                    print("Using already-processed frozen screenshot (processed during capture).")
-                elif preprocess and area_name in self.processing_settings:
-                    # Process now if preprocess is enabled but process_freeze_screen_var is not
-                    # (for backward compatibility with old behavior)
-                    settings = self.processing_settings[area_name]
-                    frozen_img = preprocess_image(
-                        frozen_img,
-                        brightness=settings.get('brightness', 1.0),
-                        contrast=settings.get('contrast', 1.0),
-                        saturation=settings.get('saturation', 1.0),
-                        sharpness=settings.get('sharpness', 1.0),
-                        blur=settings.get('blur', 0.0),
-                        threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
-                        hue=settings.get('hue', 0.0),
-                        exposure=settings.get('exposure', 1.0),
-                        color_mask_enabled=settings.get('color_mask_enabled', False),
-                        color_mask_color=settings.get('color_mask_color', '#FF0000'),
-                        color_mask_tolerance=settings.get('color_mask_tolerance', 30),
-                        color_mask_background=settings.get('color_mask_background', 'black'),
-                        color_mask_position=settings.get('color_mask_position', 'after')
-                    )
-                    frozen_screenshot_already_processed = True
-                    print("Image processing applied to frozen screenshot (during read).")
-                
-                # Convert screen coordinates to coordinates relative to the frozen screenshot
-                # The frozen screenshot starts at (frozen_min_x, frozen_min_y)
-                rel_x1 = x1 - frozen_min_x
-                rel_y1 = y1 - frozen_min_y
-                rel_x2 = x2 - frozen_min_x
-                rel_y2 = y2 - frozen_min_y
-                
-                # Ensure coordinates are within bounds
-                rel_x1 = max(0, min(frozen_width, rel_x1))
-                rel_y1 = max(0, min(frozen_height, rel_y1))
-                rel_x2 = max(0, min(frozen_width, rel_x2))
-                rel_y2 = max(0, min(frozen_height, rel_y2))
-                
-                # Ensure valid area
-                crop_x1, crop_x2 = min(rel_x1, rel_x2), max(rel_x1, rel_x2)
-                crop_y1, crop_y2 = min(rel_y1, rel_y2), max(rel_y1, rel_y2)
-                
-                # Extract the region from the frozen screenshot (or processed frozen screenshot)
-                if crop_x2 > crop_x1 and crop_y2 > crop_y1:
-                    screenshot = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                    print(f"Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
-                else:
-                    # Fallback to live capture if crop area is invalid
-                    print(f"Invalid crop area, falling back to live screen capture")
-                    # Use the saved game window handle (captured before tabbing out)
-                    target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-                    screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-                
-                # Clear the frozen screenshot after use
-                delattr(area_frame, 'frozen_screenshot')
-                if hasattr(area_frame, 'frozen_screenshot_bounds'):
-                    delattr(area_frame, 'frozen_screenshot_bounds')
-            except Exception as e:
-                print(f"Error using frozen screenshot: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback to live capture
-                # Use the saved game window handle (captured before tabbing out)
-                target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-                screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-                # Clear frozen screenshot on error
-                if hasattr(area_frame, 'frozen_screenshot'):
-                    delattr(area_frame, 'frozen_screenshot')
-                if hasattr(area_frame, 'frozen_screenshot_bounds'):
-                    delattr(area_frame, 'frozen_screenshot_bounds')
-        else:
-            # Normal capture from live screen
-            # Use the saved game window handle (captured before tabbing out)
-            # If we didn't capture it (no fullscreen mode), get current foreground window
-            if not game_window_handle and fullscreen_mode_enabled:
-                game_window_handle = win32gui.GetForegroundWindow()
-            target_hwnd = game_window_handle if fullscreen_mode_enabled else None
-            screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
-        
-        # Store original or processed image based on settings
-        # Skip processing if we already processed the frozen screenshot
-        if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
-            # Store the original unprocessed image first
-            self._store_image_with_bounds(area_name, screenshot, is_original=True)
-            
-            # Then apply processing for OCR use
-            settings = self.processing_settings[area_name]
-            processed_image = preprocess_image(
-                screenshot,
-                brightness=settings.get('brightness', 1.0),
-                contrast=settings.get('contrast', 1.0),
-                saturation=settings.get('saturation', 1.0),
-                sharpness=settings.get('sharpness', 1.0),
-                blur=settings.get('blur', 0.0),
-                threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
-                hue=settings.get('hue', 0.0),
-                exposure=settings.get('exposure', 1.0),
-                color_mask_enabled=settings.get('color_mask_enabled', False),
-                color_mask_color=settings.get('color_mask_color', '#FF0000'),
-                color_mask_tolerance=settings.get('color_mask_tolerance', 30),
-                color_mask_background=settings.get('color_mask_background', 'black'),
-                color_mask_position=settings.get('color_mask_position', 'after')
-            )
-            # Use processed image for OCR
-            screenshot = processed_image
-            # Store the processed image in latest_images (this is what the image processing window should show)
-            self._store_image_with_bounds(area_name, screenshot, is_original=False)
-        else:
-            # Store with bounds checking to prevent memory leak (no preprocessing)
-            self._store_image_with_bounds(area_name, screenshot, is_original=True)
-        
         # Extract PSM number from selected value (e.g., "3 (Default)" -> "3")
         psm_value = psm_var.get().split()[0] if psm_var.get() else "3"
+
+        if self.get_selected_ocr_backend() == "clipboard":
+            text = self.extract_text_from_image(None, psm_value=psm_value)
+        else:
+            # Capture screenshot
+            x1, y1, x2, y2 = area_frame.area_coords
         
-        # Get Tesseract language and config
-        lang_code = self.tesseract_language_var.get()
-        if " " in lang_code:
-             lang_code = lang_code.split(" ")[0]
-        
-        if not lang_code or not lang_code.strip():
-            lang_code = "eng"
-             
-        config_str = f'--psm {psm_value}'
-        
-        # Check if we have custom tessdata to include (if using a downloaded language)
-        if self.tesseract_manager.is_custom_language(lang_code):
-             tessdata_config = self.tesseract_manager.get_tessdata_dir_param()
-             config_str = f'{tessdata_config} --psm {psm_value}'
-        
-        pass
-        try:
-            text = pytesseract.image_to_string(screenshot, lang=lang_code, config=config_str)
-            pass
-        except Exception as e:
-            print(f"[ERROR] OCR ({lang_code}): {e}")
-            # Fallback to English if specific language fails
-            if lang_code != 'eng':
-                print("[NOTE] OCR: Falling back to English.")
+            # Apply fullscreen mode refresh if enabled (for forcing screen refresh in fullscreen apps)
+            # Only apply if we're not using a frozen screenshot
+            # Save the game window handle for use in PrintWindow capture
+            game_window_handle = None
+            if fullscreen_mode_enabled and not (hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None):
                 try:
-                    text = pytesseract.image_to_string(screenshot, lang='eng', config=f'--psm {psm_value}')
-                except:
-                    text = ""
+                    foreground_hwnd = win32gui.GetForegroundWindow()
+                    root_hwnd = self.root.winfo_id()
+                    
+                    if foreground_hwnd and foreground_hwnd != root_hwnd:
+                        game_window_handle = foreground_hwnd
+                        try:
+                            original_foreground = foreground_hwnd
+                            if root_hwnd and self.root.winfo_viewable():
+                                if win32gui.IsIconic(root_hwnd):
+                                    win32gui.ShowWindow(root_hwnd, win32con.SW_RESTORE)
+                                win32gui.SetForegroundWindow(root_hwnd)
+                                self.root.update()
+                                time.sleep(0.02)
+
+                                if win32gui.IsWindow(original_foreground):
+                                    if win32gui.IsIconic(original_foreground):
+                                        win32gui.ShowWindow(original_foreground, win32con.SW_RESTORE)
+                                        time.sleep(0.05)
+
+                                    win32gui.SetForegroundWindow(original_foreground)
+                                    time.sleep(0.1)
+
+                                    max_wait = 30
+                                    wait_count = 0
+                                    while wait_count < max_wait:
+                                        current_foreground = win32gui.GetForegroundWindow()
+                                        if current_foreground == original_foreground:
+                                            time.sleep(0.15)
+                                            final_check = win32gui.GetForegroundWindow()
+                                            if final_check == original_foreground:
+                                                print("Fullscreen mode: Game confirmed active and ready for capture")
+                                                break
+                                        time.sleep(0.01)
+                                        wait_count += 1
+
+                                    time.sleep(0.2)
+                        except Exception as e:
+                            print(f"Error in focus switching: {e}")
+
+                    try:
+                        desktop_hwnd = win32gui.GetDesktopWindow()
+                        if desktop_hwnd:
+                            ctypes.windll.user32.InvalidateRect(desktop_hwnd, None, True)
+
+                        if foreground_hwnd and foreground_hwnd != root_hwnd:
+                            ctypes.windll.user32.InvalidateRect(foreground_hwnd, None, True)
+                            win32gui.UpdateWindow(foreground_hwnd)
+                    except (OSError, AttributeError, Exception):
+                        pass
+
+                    print("Fullscreen mode: Screen refresh triggered, ready for capture")
+                except Exception as e:
+                    print(f"Error in fullscreen mode screen refresh: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            frozen_screenshot_already_processed = False
+
+            if hasattr(area_frame, 'frozen_screenshot') and area_frame.frozen_screenshot is not None:
+                try:
+                    print(f"Using frozen screenshot instead of live screen capture")
+                    frozen_img = area_frame.frozen_screenshot
+                    frozen_min_x, frozen_min_y, frozen_width, frozen_height = area_frame.frozen_screenshot_bounds
+
+                    process_freeze_screen_enabled = (hasattr(self, 'process_freeze_screen_var') and 
+                                                    self.process_freeze_screen_var.get())
+
+                    if process_freeze_screen_enabled:
+                        frozen_screenshot_already_processed = True
+                        print("Using already-processed frozen screenshot (processed during capture).")
+                    elif preprocess and area_name in self.processing_settings:
+                        settings = self.processing_settings[area_name]
+                        frozen_img = preprocess_image(
+                            frozen_img,
+                            brightness=settings.get('brightness', 1.0),
+                            contrast=settings.get('contrast', 1.0),
+                            saturation=settings.get('saturation', 1.0),
+                            sharpness=settings.get('sharpness', 1.0),
+                            blur=settings.get('blur', 0.0),
+                            threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                            hue=settings.get('hue', 0.0),
+                            exposure=settings.get('exposure', 1.0),
+                            color_mask_enabled=settings.get('color_mask_enabled', False),
+                            color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                            color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                            color_mask_background=settings.get('color_mask_background', 'black'),
+                            color_mask_position=settings.get('color_mask_position', 'after')
+                        )
+                        frozen_screenshot_already_processed = True
+                        print("Image processing applied to frozen screenshot (during read).")
+
+                    rel_x1 = x1 - frozen_min_x
+                    rel_y1 = y1 - frozen_min_y
+                    rel_x2 = x2 - frozen_min_x
+                    rel_y2 = y2 - frozen_min_y
+
+                    rel_x1 = max(0, min(frozen_width, rel_x1))
+                    rel_y1 = max(0, min(frozen_height, rel_y1))
+                    rel_x2 = max(0, min(frozen_width, rel_x2))
+                    rel_y2 = max(0, min(frozen_height, rel_y2))
+
+                    crop_x1, crop_x2 = min(rel_x1, rel_x2), max(rel_x1, rel_x2)
+                    crop_y1, crop_y2 = min(rel_y1, rel_y2), max(rel_y1, rel_y2)
+
+                    if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                        screenshot = frozen_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+                        print(f"Extracted region from frozen screenshot: ({crop_x1}, {crop_y1}, {crop_x2}, {crop_y2})")
+                    else:
+                        print(f"Invalid crop area, falling back to live screen capture")
+                        target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                        screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+
+                    delattr(area_frame, 'frozen_screenshot')
+                    if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                        delattr(area_frame, 'frozen_screenshot_bounds')
+                except Exception as e:
+                    print(f"Error using frozen screenshot: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                    screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+                    if hasattr(area_frame, 'frozen_screenshot'):
+                        delattr(area_frame, 'frozen_screenshot')
+                    if hasattr(area_frame, 'frozen_screenshot_bounds'):
+                        delattr(area_frame, 'frozen_screenshot_bounds')
             else:
-                text = ""
-        pass
+                if not game_window_handle and fullscreen_mode_enabled:
+                    game_window_handle = win32gui.GetForegroundWindow()
+                target_hwnd = game_window_handle if fullscreen_mode_enabled else None
+                screenshot = capture_screen_area(x1, y1, x2, y2, use_printwindow=fullscreen_mode_enabled, target_hwnd=target_hwnd)
+
+            if preprocess and area_name in self.processing_settings and not frozen_screenshot_already_processed:
+                self._store_image_with_bounds(area_name, screenshot, is_original=True)
+                settings = self.processing_settings[area_name]
+                processed_image = preprocess_image(
+                    screenshot,
+                    brightness=settings.get('brightness', 1.0),
+                    contrast=settings.get('contrast', 1.0),
+                    saturation=settings.get('saturation', 1.0),
+                    sharpness=settings.get('sharpness', 1.0),
+                    blur=settings.get('blur', 0.0),
+                    threshold=settings.get('threshold', None) if settings.get('threshold_enabled', False) else None,
+                    hue=settings.get('hue', 0.0),
+                    exposure=settings.get('exposure', 1.0),
+                    color_mask_enabled=settings.get('color_mask_enabled', False),
+                    color_mask_color=settings.get('color_mask_color', '#FF0000'),
+                    color_mask_tolerance=settings.get('color_mask_tolerance', 30),
+                    color_mask_background=settings.get('color_mask_background', 'black'),
+                    color_mask_position=settings.get('color_mask_position', 'after')
+                )
+                screenshot = processed_image
+                self._store_image_with_bounds(area_name, screenshot, is_original=False)
+            else:
+                self._store_image_with_bounds(area_name, screenshot, is_original=True)
+
+            text = self.extract_text_from_image(screenshot, psm_value=psm_value)
 
         import re
         
@@ -20618,253 +21362,93 @@ def get_primary_monitor_info():
         if primary_monitor_info:
             return primary_monitor_info
         else:
-            # Fallback: use GetSystemMetrics
+            # Fallback: use virtual bounds helper
             print("Warning: Could not find primary monitor via EnumDisplayMonitors, using fallback")
-            return (0, 0, 
-                   win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+            _, _, screen_w, screen_h = get_virtual_screen_bounds()
+            return (0, 0, screen_w, screen_h)
     
     except Exception as e:
         print(f"Error detecting primary monitor: {e}, using fallback")
-        # Fallback: use GetSystemMetrics
-        return (0, 0,
-               win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-               win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+        # Fallback: use virtual bounds helper
+        _, _, screen_w, screen_h = get_virtual_screen_bounds()
+        return (0, 0, screen_w, screen_h)
 
-def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None):
-    '''
-    Capture screen area across multiple monitors using win32api.
-    
-    Args:
-        x1, y1, x2, y2: Screen coordinates for the area to capture
-        use_printwindow: If True, try to use PrintWindow API (better for fullscreen apps)
-        target_hwnd: Window handle to capture from (for PrintWindow mode)
-    '''
-    # Get virtual screen bounds
-    min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-    min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-    total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-    total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
-    max_x = min_x + total_width
-    max_y = min_y + total_height
-    
-  #  print(f"Debug: Screenshot capture - Input coords: ({x1}, {y1}, {x2}, {y2})")
-   # print(f"Debug: Virtual screen bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
-
-    # Clamp coordinates to virtual screen bounds
-    x1 = max(min_x, min(max_x, x1))
-    y1 = max(min_y, min(max_y, y1))
-    x2 = max(min_x, min(max_x, x2))
-    y2 = max(min_y, min(max_y, y2))
-    
-    
-
-    # Ensure valid area (swap if necessary and check size)
-    x1, x2 = min(x1, x2), max(x1, x2)
-    y1, y2 = min(y1, y2), max(y1, y2)
-    width = x2 - x1
-    height = y2 - y1
-    if width <= 0 or height <= 0:
-        return Image.new('RGB', (1, 1))  # Return a blank 1x1 image for invalid areas
-
-    # Try PrintWindow method first if requested (better for fullscreen apps)
-    if use_printwindow and target_hwnd:
-        try:
-            # Get window rectangle
-            window_rect = win32gui.GetWindowRect(target_hwnd)
-            window_width = window_rect[2] - window_rect[0]
-            window_height = window_rect[3] - window_rect[1]
-            
-            if window_width > 0 and window_height > 0:
-                # Create a device context for the window
-                hwindc = win32gui.GetWindowDC(target_hwnd)
-                if hwindc:
-                    memdc = None
-                    bmp = None
-                    try:
-                        srcdc = win32ui.CreateDCFromHandle(hwindc)
-                        memdc = srcdc.CreateCompatibleDC()
-                        
-                        # Create bitmap for the window
-                        bmp = win32ui.CreateBitmap()
-                        bmp.CreateCompatibleBitmap(srcdc, window_width, window_height)
-                        memdc.SelectObject(bmp)
-                        
-                        # Use PrintWindow to capture the window's content
-                        # PW_RENDERFULLCONTENT = 0x00000002 (captures even if window is occluded)
-                        PW_RENDERFULLCONTENT = 0x00000002
-                        result = ctypes.windll.user32.PrintWindow(target_hwnd, memdc.GetSafeHdc(), PW_RENDERFULLCONTENT)
-                        
-                        if result:
-                            # Convert bitmap to PIL Image
-                            bmpinfo = bmp.GetInfo()
-                            bmpstr = bmp.GetBitmapBits(True)
-                            full_img = Image.frombuffer(
-                                'RGB',
-                                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                                bmpstr, 'raw', 'BGRX', 0, 1
-                            )
-                            
-                            # Calculate crop coordinates relative to window
-                            # Window position on screen
-                            win_x = window_rect[0]
-                            win_y = window_rect[1]
-                            
-                            # Convert screen coordinates to window-relative coordinates
-                            crop_x1 = max(0, x1 - win_x)
-                            crop_y1 = max(0, y1 - win_y)
-                            crop_x2 = min(window_width, x2 - win_x)
-                            crop_y2 = min(window_height, y2 - win_y)
-                            
-                            # Crop to the requested area
-                            if crop_x2 > crop_x1 and crop_y2 > crop_y1:
-                                img = full_img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-                                
-                                # Clean up before returning
-                                try:
-                                    if memdc:
-                                        memdc.DeleteDC()
-                                    if bmp:
-                                        win32gui.DeleteObject(bmp.GetHandle())
-                                except Exception:
-                                    pass
-                                
-                                print("Fullscreen mode: Captured using PrintWindow API")
-                                return img
-                    except Exception as e:
-                        print(f"PrintWindow capture error: {e}")
-                    finally:
-                        # Always clean up resources
-                        try:
-                            if memdc:
-                                memdc.DeleteDC()
-                            if bmp:
-                                win32gui.DeleteObject(bmp.GetHandle())
-                        except Exception:
-                            pass
-                        try:
-                            win32gui.ReleaseDC(target_hwnd, hwindc)
-                        except Exception:
-                            pass
-        except Exception as e:
-            print(f"Error in PrintWindow capture: {e}")
-            # Fall through to normal BitBlt method
-
-    # Normal BitBlt method (fallback or default)
-    # Get DC from entire virtual screen
-    hwin = win32gui.GetDesktopWindow()
-    hwindc = win32gui.GetWindowDC(hwin)
-    memdc = None
-    bmp = None
+def get_text_of_color(self, image, target_color, tolerance=30):
+    "Extract text of specific color from image using OCR"
     try:
-        srcdc = win32ui.CreateDCFromHandle(hwindc)
-        memdc = srcdc.CreateCompatibleDC()
-
-        # Create bitmap for capture area
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(srcdc, width, height)
-        memdc.SelectObject(bmp)
-
-        # Copy screen into bitmap
-        memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
-
-        # Convert bitmap to PIL Image
-        bmpinfo = bmp.GetInfo()
-        bmpstr = bmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1
-        )
-
-        return img
-    finally:
-        # Always clean up resources
-        try:
-            if memdc:
-                memdc.DeleteDC()
-            if bmp:
-                win32gui.DeleteObject(bmp.GetHandle())
-            win32gui.ReleaseDC(hwin, hwindc)
-        except Exception:
-            pass
-
-    def get_text_of_color(self, image, target_color, tolerance=30):
-        "Extract text of specific color from image using OCR"
-        try:
-            import numpy as np
-            
-            # Convert target_color from hex to RGB if needed
-            if isinstance(target_color, str) and target_color.startswith('#'):
-                target_color = target_color.lstrip('#')
-                target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
-            else:
-                target_rgb = target_color
-            
-            # Get OCR data with bounding boxes
-            import pytesseract
-            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
-            
-            # Convert image to numpy array for color analysis
-            img_array = np.array(image)
-            if len(img_array.shape) == 3:
-                # RGB image
-                height, width = img_array.shape[:2]
-            else:
-                # Grayscale - convert to RGB
-                img_array = np.stack([img_array]*3, axis=-1)
-                height, width = img_array.shape[:2]
-            
-            # Collect text of matching color
-            matching_text = []
-            
-            # Check each detected text region for color match
-            for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 30:  # Only consider confident detections
-                    text = data['text'][i].strip()
-                    if text:  # Non-empty text
-                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+        import numpy as np
+        
+        # Convert target_color from hex to RGB if needed
+        if isinstance(target_color, str) and target_color.startswith('#'):
+            target_color = target_color.lstrip('#')
+            target_rgb = tuple(int(target_color[i:i+2], 16) for i in (0, 2, 4))
+        else:
+            target_rgb = target_color
+        
+        # Get OCR data with bounding boxes
+        import pytesseract
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config='--psm 6')
+        
+        # Convert image to numpy array for color analysis
+        img_array = np.array(image)
+        if len(img_array.shape) == 3:
+            # RGB image
+            height, width = img_array.shape[:2]
+        else:
+            # Grayscale - convert to RGB
+            img_array = np.stack([img_array]*3, axis=-1)
+            height, width = img_array.shape[:2]
+        
+        # Collect text of matching color
+        matching_text = []
+        
+        # Check each detected text region for color match
+        for i in range(len(data['text'])):
+            if int(data['conf'][i]) > 30:  # Only consider confident detections
+                text = data['text'][i].strip()
+                if text:  # Non-empty text
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    
+                    # Ensure coordinates are within image bounds
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    x2 = max(0, min(x + w, width - 1))
+                    y2 = max(0, min(y + h, height - 1))
+                    
+                    if x2 > x and y2 > y:
+                        # Extract text region
+                        text_region = img_array[y:y2, x:x2]
                         
-                        # Ensure coordinates are within image bounds
-                        x = max(0, min(x, width - 1))
-                        y = max(0, min(y, height - 1))
-                        x2 = max(0, min(x + w, width - 1))
-                        y2 = max(0, min(y + h, height - 1))
-                        
-                        if x2 > x and y2 > y:
-                            # Extract text region
-                            text_region = img_array[y:y2, x:x2]
+                        # Sample center area of text region (avoid edges)
+                        if text_region.size > 0:
+                            center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
+                            sample_size = min(3, center_y, center_x)
                             
-                            # Sample center area of text region (avoid edges)
-                            if text_region.size > 0:
-                                center_y, center_x = text_region.shape[0] // 2, text_region.shape[1] // 2
-                                sample_size = min(3, center_y, center_x)
+                            if sample_size > 0:
+                                sample_area = text_region[center_y-sample_size:center_y+sample_size, 
+                                                            center_x-sample_size:center_x+sample_size]
                                 
-                                if sample_size > 0:
-                                    sample_area = text_region[center_y-sample_size:center_y+sample_size, 
-                                                              center_x-sample_size:center_x+sample_size]
-                                    
-                                    # Get average color of sample area
-                                    avg_color = np.mean(sample_area, axis=(0, 1))
-                                    
-                                    # Check if color matches target within tolerance
-                                    if self.color_matches(avg_color, target_rgb, tolerance):
-                                        matching_text.append(text)
-            
-            # Return combined text or None if no matches
-            return ' '.join(matching_text) if matching_text else None
-        except Exception as e:
-            print(f"Error getting text of color: {e}")
-            return None
+                                # Get average color of sample area
+                                avg_color = np.mean(sample_area, axis=(0, 1))
+                                
+                                # Check if color matches target within tolerance
+                                if self.color_matches(avg_color, target_rgb, tolerance):
+                                    matching_text.append(text)
+        
+        # Return combined text or None if no matches
+        return ' '.join(matching_text) if matching_text else None
+    except Exception as e:
+        print(f"Error getting text of color: {e}")
+        return None
 
-    def color_matches(self, color1, color2, tolerance):
-        "Check if two colors match within tolerance"
-        try:
-            diff = abs(int(color1[0]) - int(color2[0])) + \
-                   abs(int(color1[1]) - int(color2[1])) + \
-                   abs(int(color1[2]) - int(color2[2]))
-            return diff <= tolerance * 3  # Multiply by 3 for RGB channels
-        except:
-            return False
+def color_matches(self, color1, color2, tolerance):
+    "Check if two colors match within tolerance"
+    try:
+        diff = abs(int(color1[0]) - int(color2[0])) + \
+                abs(int(color1[1]) - int(color2[1])) + \
+                abs(int(color1[2]) - int(color2[2]))
+        return diff <= tolerance * 3  # Multiply by 3 for RGB channels
+    except:
+        return False
 
     

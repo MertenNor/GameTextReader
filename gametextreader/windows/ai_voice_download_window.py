@@ -1,11 +1,12 @@
 import os
 import json
+import sys
 import threading
 import webbrowser
 import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter import font as tkfont
-
+from .common import set_window_icon
 from ..constants import (APP_AI_VOICES_DIR, APP_PIPER_DIR, APP_PIPER_BIN_DIR,
                           APP_PIPER_PRESETS_DIR, APP_PIPER_VOICES_DIR,
                           APP_KOKORO_DIR, APP_KOKORO_CUSTOM_DIR, APP_SETTINGS_PATH,
@@ -231,12 +232,8 @@ class AIVoiceDownloadWindow:
         apply_window_geometry(self.window, 'voice_manager', 1100, 710)
         self.window.minsize(*[int(v * get_dpi_scale()) for v in (400, 300)])
 
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception:
-            pass
+        # Set window icon
+        set_window_icon(self.window)
 
         os.makedirs(APP_AI_VOICES_DIR, exist_ok=True)
         os.makedirs(APP_PIPER_VOICES_DIR, exist_ok=True)
@@ -477,9 +474,12 @@ class AIVoiceDownloadWindow:
         self._voices_tab_data = []   # list of (label, engine, key) for all voices
         self._selected_voices_data = []  # same structure for selected list
         self._populate_voices_lists()
-        self._start_sapi_worker()
-        self.window.protocol("WM_DELETE_WINDOW",
-                             lambda: (self._sapi_q.put(None), self.window.destroy()))
+        if sys.platform.startswith('win'):
+            self._start_sapi_worker()
+            self.window.protocol("WM_DELETE_WINDOW",
+                                lambda: (self._sapi_q.put(None), self.window.destroy()))
+        else:
+            self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
 
     # Engine types that are user-created custom presets/voices
     _CUSTOM_ENGINES = {"sapi_preset", "piper_preset", "kokoro_custom"}
@@ -490,56 +490,57 @@ class AIVoiceDownloadWindow:
         regular = []
         custom  = []
 
-        # SAPI — try COM first, fall back to winreg if NVDA or another app blocks GetVoices()
-        sapi_names = []
-        try:
-            import win32com.client
-            sapi = win32com.client.Dispatch("SAPI.SpVoice")
-            for token in sapi.GetVoices():
-                try:
-                    sapi_names.append(token.GetDescription())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if not sapi_names:
-            import winreg as _wr
-            for _sub in (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
-                         r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"):
-                try:
-                    _root = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, _sub)
-                    _i = 0
-                    while True:
-                        try:
-                            _tok = _wr.EnumKey(_root, _i); _i += 1
-                        except OSError:
-                            break
-                        _desc = None
-                        try:
-                            _tk = _wr.OpenKey(_root, _tok)
-                            for _s in ("409", ""):
-                                try:
-                                    if _s:
-                                        _sk = _wr.OpenKey(_tk, _s)
-                                        _desc, _ = _wr.QueryValueEx(_sk, ""); _wr.CloseKey(_sk)
-                                    else:
-                                        _desc, _ = _wr.QueryValueEx(_tk, "")
-                                    if _desc: break
-                                except Exception: pass
-                            if not _desc:
-                                try:
-                                    _ak = _wr.OpenKey(_tk, "Attributes")
-                                    _desc, _ = _wr.QueryValueEx(_ak, "Name"); _wr.CloseKey(_ak)
-                                except Exception: pass
-                            _wr.CloseKey(_tk)
-                        except Exception: pass
-                        if _desc and _desc not in sapi_names:
-                            sapi_names.append(_desc)
-                    _wr.CloseKey(_root)
-                except Exception:
-                    pass
-        for name in sapi_names:
-            regular.append((f"[SAPI] {name}", "sapi", name))
+        if sys.platform.startswith('win'):
+            # SAPI — try COM first, fall back to winreg if NVDA or another app blocks GetVoices()
+            sapi_names = []
+            try:
+                import win32com.client
+                sapi = win32com.client.Dispatch("SAPI.SpVoice")
+                for token in sapi.GetVoices():
+                    try:
+                        sapi_names.append(token.GetDescription())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if not sapi_names:
+                import winreg as _wr
+                for _sub in (r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+                            r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"):
+                    try:
+                        _root = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, _sub)
+                        _i = 0
+                        while True:
+                            try:
+                                _tok = _wr.EnumKey(_root, _i); _i += 1
+                            except OSError:
+                                break
+                            _desc = None
+                            try:
+                                _tk = _wr.OpenKey(_root, _tok)
+                                for _s in ("409", ""):
+                                    try:
+                                        if _s:
+                                            _sk = _wr.OpenKey(_tk, _s)
+                                            _desc, _ = _wr.QueryValueEx(_sk, ""); _wr.CloseKey(_sk)
+                                        else:
+                                            _desc, _ = _wr.QueryValueEx(_tk, "")
+                                        if _desc: break
+                                    except Exception: pass
+                                if not _desc:
+                                    try:
+                                        _ak = _wr.OpenKey(_tk, "Attributes")
+                                        _desc, _ = _wr.QueryValueEx(_ak, "Name"); _wr.CloseKey(_ak)
+                                    except Exception: pass
+                                _wr.CloseKey(_tk)
+                            except Exception: pass
+                            if _desc and _desc not in sapi_names:
+                                sapi_names.append(_desc)
+                        _wr.CloseKey(_root)
+                    except Exception:
+                        pass
+            for name in sapi_names:
+                regular.append((f"[SAPI] {name}", "sapi", name))
 
         # Piper — installed .onnx files (only shown when the engine binary is present)
         try:
@@ -2701,24 +2702,30 @@ class AIVoiceDownloadWindow:
                 f.setframerate(sample_rate); f.writeframes(pcm.tobytes())
 
             self.window.after(0, self._switch_pitch_to_stop)
-            _winmm = ctypes.windll.winmm
-            _alias = 'pitchprev'
-            _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
-            ret = _winmm.mciSendStringW(
-                f'open "{wav_path}" type waveaudio alias {_alias}', None, 0, None)
-            if ret == 0:
-                _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
-                buf = ctypes.create_unicode_buffer(256)
-                while self._pitch_preview_playing:
-                    _winmm.mciSendStringW(f'status {_alias} mode', buf, 256, None)
-                    if buf.value in ('stopped', ''):
-                        break
-                    time.sleep(0.05)
-                _winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+            if sys.platform.startswith('win'):
+                _winmm = ctypes.windll.winmm
+                _alias = 'pitchprev'
                 _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                ret = _winmm.mciSendStringW(
+                    f'open "{wav_path}" type waveaudio alias {_alias}', None, 0, None)
+                if ret == 0:
+                    _winmm.mciSendStringW(f'play {_alias}', None, 0, None)
+                    buf = ctypes.create_unicode_buffer(256)
+                    while self._pitch_preview_playing:
+                        _winmm.mciSendStringW(f'status {_alias} mode', buf, 256, None)
+                        if buf.value in ('stopped', ''):
+                            break
+                        time.sleep(0.05)
+                    _winmm.mciSendStringW(f'stop {_alias}', None, 0, None)
+                    _winmm.mciSendStringW(f'close {_alias}', None, 0, None)
+                else:
+                    import winsound
+                    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
             else:
-                import winsound
-                winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+                import pygame
+                pygame.mixer.init()
+                sound_prompt = pygame.mixer.Sound(wav_path)
+                sound_prompt.play()
         except Exception as e:
             self.window.after(0, lambda: messagebox.showerror(
                 "Preview Failed", f"Could not generate pitch preview:\n{e}",

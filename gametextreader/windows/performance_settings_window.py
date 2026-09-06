@@ -6,7 +6,7 @@ import argostranslate.settings
 from ..constants import APP_SETTINGS_PATH
 from ..translation.translation_manager import TranslationManager
 from ..window_geometry import apply_window_geometry
-
+from .common import set_window_icon
 class PerformanceSettingsWindow:
     def __init__(self, game_reader):
         self.game_reader = game_reader
@@ -23,12 +23,7 @@ class PerformanceSettingsWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
 
         # Load current settings
         self.current_settings = self.load_settings()

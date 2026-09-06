@@ -3,11 +3,14 @@ Screen capture functions for capturing game text areas
 """
 import ctypes
 import sys
-from PIL import Image
-import win32api
-import win32con
-import win32gui
-import win32ui
+import time
+import pyautogui
+import pyscreenshot
+from PIL import Image, ImageGrab
+if sys.platform.startswith('win'):
+    import win32con
+    import win32gui
+    import win32ui
 
 from .constants import DEBUG_FORCE_DPI_SCALE
 
@@ -98,23 +101,78 @@ def get_primary_monitor_info():
         if primary_monitor_info:
             return primary_monitor_info
         else:
-            # Fallback: use GetSystemMetrics
+            # Fallback: use pyautogui primary screen size
             print("Warning: Could not find primary monitor via EnumDisplayMonitors, using fallback")
+            screen_w, screen_h = pyautogui.size()
             return (0, 0, 
-                   win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+                   int(screen_w),
+                   int(screen_h))
     
     except Exception as e:
         print(f"Error detecting primary monitor: {e}, using fallback")
-        # Fallback: use GetSystemMetrics
+        # Fallback: use pyautogui primary screen size
+        screen_w, screen_h = pyautogui.size()
         return (0, 0,
-               win32api.GetSystemMetrics(win32con.SM_CXSCREEN),
-               win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+               int(screen_w),
+               int(screen_h))
+
+
+def get_virtual_screen_bounds():
+    """Return virtual desktop bounds as (min_x, min_y, width, height)."""
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ('left', ctypes.c_long),
+                ('top', ctypes.c_long),
+                ('right', ctypes.c_long),
+                ('bottom', ctypes.c_long)
+            ]
+
+        bounds = {'left': None, 'top': None, 'right': None, 'bottom': None}
+
+        def monitor_enum_proc(hmonitor, hdc, lprcMonitor, lParam):
+            del hmonitor, hdc, lParam
+            rect = lprcMonitor.contents
+            if bounds['left'] is None:
+                bounds['left'] = rect.left
+                bounds['top'] = rect.top
+                bounds['right'] = rect.right
+                bounds['bottom'] = rect.bottom
+            else:
+                bounds['left'] = min(bounds['left'], rect.left)
+                bounds['top'] = min(bounds['top'], rect.top)
+                bounds['right'] = max(bounds['right'], rect.right)
+                bounds['bottom'] = max(bounds['bottom'], rect.bottom)
+            return 1
+
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(RECT),
+            ctypes.c_ulong
+        )
+
+        callback = MonitorEnumProc(monitor_enum_proc)
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, callback, 0)
+
+        if bounds['left'] is not None:
+            min_x = int(bounds['left'])
+            min_y = int(bounds['top'])
+            width = int(bounds['right'] - bounds['left'])
+            height = int(bounds['bottom'] - bounds['top'])
+            return min_x, min_y, width, height
+    except Exception:
+        pass
+
+    # Final fallback: primary screen via pyautogui
+    screen_w, screen_h = pyautogui.size()
+    return 0, 0, int(screen_w), int(screen_h)
 
 
 def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None):
     """
-    Capture screen area across multiple monitors using win32api.
+    Capture screen area across multiple monitors.
     
     Args:
         x1, y1, x2, y2: Screen coordinates for the area to capture
@@ -122,10 +180,7 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         target_hwnd: Window handle to capture from (for PrintWindow mode)
     """
     # Get virtual screen bounds
-    min_x = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)  # Leftmost x (can be negative)
-    min_y = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)  # Topmost y (can be negative)
-    total_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-    total_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    min_x, min_y, total_width, total_height = get_virtual_screen_bounds()
     max_x = min_x + total_width
     max_y = min_y + total_height
 
@@ -225,43 +280,73 @@ def capture_screen_area(x1, y1, x2, y2, use_printwindow=False, target_hwnd=None)
         except Exception as e:
             print(f"Error in PrintWindow capture: {e}")
             # Fall through to normal BitBlt method
-
-    # Normal BitBlt method (fallback or default)
-    # Get DC from entire virtual screen
-    hwin = win32gui.GetDesktopWindow()
-    hwindc = win32gui.GetWindowDC(hwin)
-    memdc = None
-    bmp = None
-    try:
-        srcdc = win32ui.CreateDCFromHandle(hwindc)
-        memdc = srcdc.CreateCompatibleDC()
-
-        # Create bitmap for capture area
-        bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(srcdc, width, height)
-        memdc.SelectObject(bmp)
-
-        # Copy screen into bitmap
-        memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
-
-        # Convert bitmap to PIL Image
-        bmpinfo = bmp.GetInfo()
-        bmpstr = bmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            'RGB',
-            (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-            bmpstr, 'raw', 'BGRX', 0, 1
-        )
-
-        return img
-    finally:
-        # Always clean up resources
+    if sys.platform.startswith('win'):
+        # Normal BitBlt method (fallback or default)
+        # Get DC from entire virtual screen
+        hwin = win32gui.GetDesktopWindow()
+        hwindc = win32gui.GetWindowDC(hwin)
+        memdc = None
+        bmp = None
         try:
-            if memdc:
-                memdc.DeleteDC()
-            if bmp:
-                win32gui.DeleteObject(bmp.GetHandle())
-            win32gui.ReleaseDC(hwin, hwindc)
-        except Exception:
-            pass
+            srcdc = win32ui.CreateDCFromHandle(hwindc)
+            memdc = srcdc.CreateCompatibleDC()
 
+            # Create bitmap for capture area
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(srcdc, width, height)
+            memdc.SelectObject(bmp)
+
+            # Copy screen into bitmap
+            memdc.BitBlt((0, 0), (width, height), srcdc, (x1, y1), win32con.SRCCOPY)
+
+            # Convert bitmap to PIL Image
+            bmpinfo = bmp.GetInfo()
+            bmpstr = bmp.GetBitmapBits(True)
+            img = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1
+            )
+
+            return img
+        finally:
+            # Always clean up resources
+            try:
+                if memdc:
+                    memdc.DeleteDC()
+                if bmp:
+                    win32gui.DeleteObject(bmp.GetHandle())
+                win32gui.ReleaseDC(hwin, hwindc)
+            except Exception:
+                pass
+
+    # Attempt cross-platform capture using pyscreenshot
+    try:
+        img = pyscreenshot.grab(
+            bbox=(int(x1), int(y1), int(x2), int(y2))
+        )
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img
+    except Exception as e:
+        print(f"pyscreenshot fallback capture failed: {e}")
+
+    # Fallback to ImageGrab (cross-platform, but slower and less reliable)
+    max_retries = 3
+    while max_retries > 0:
+        try:
+            img = ImageGrab.grab(
+                bbox=(int(x1), int(y1), int(x2), int(y2)),
+                all_screens=True
+            )
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            return img
+        except Exception as e:
+            print(f"ImageGrab fallback capture failed: {e}")
+        max_retries -= 1
+        time.sleep(0.5)
+
+    # Final safety fallback
+    print("Warning: Screen capture failed, returning blank image")
+    return Image.new('RGB', (max(1, width), max(1, height)))

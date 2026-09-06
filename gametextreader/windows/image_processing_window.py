@@ -10,6 +10,7 @@ import time
 
 from ..image_processing import preprocess_image, apply_color_mask
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 
 class ImageProcessingWindow:
@@ -19,12 +20,7 @@ class ImageProcessingWindow:
         self.window.title(f"Image Processing for: {area_name}")
         
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
         
         self.area_name = area_name
         self.latest_images = latest_images
@@ -659,12 +655,7 @@ class ImageProcessingWindow:
             apply_window_geometry(picker_window, 'color_picker', 600, 500)
 
             # Set the window icon
-            try:
-                icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-                if os.path.exists(icon_path):
-                    picker_window.iconbitmap(icon_path)
-            except Exception as e:
-                pass
+            set_window_icon(picker_window)
 
             # Add instruction label
             instruction_label = tk.Label(

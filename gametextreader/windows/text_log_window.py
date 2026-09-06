@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 
 from ..utils import _ensure_uwp_available
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 
 class TextLogWindow:
@@ -26,12 +27,7 @@ class TextLogWindow:
         self.game_text_reader.register_hotkey_disabling_window("Scan History", self.window)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
         
         # Create main frame
         main_frame = tk.Frame(self.window)

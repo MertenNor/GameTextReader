@@ -6,6 +6,7 @@ import os
 import webbrowser
 from ..translation.translation_manager import TranslationManager
 from ..window_geometry import apply_window_geometry
+from .common import set_window_icon
 
 class TranslationWindow:
     def __init__(self, parent):
@@ -17,12 +18,7 @@ class TranslationWindow:
         apply_window_geometry(self.window, 'language_manager', 700, 500)
 
         # Set the window icon
-        try:
-            icon_path = os.path.join(os.path.dirname(__file__), '..', '..', 'Assets', 'icon.ico')
-            if os.path.exists(icon_path):
-                self.window.iconbitmap(icon_path)
-        except Exception as e:
-            pass
+        set_window_icon(self.window)
 
         self.translation_manager = TranslationManager()
         
